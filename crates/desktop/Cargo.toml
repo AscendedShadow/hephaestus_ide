@@ -1,0 +1,19 @@
+[package]
+name = "hephaestus"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+default-run = "hephaestus"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+ide-core.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
