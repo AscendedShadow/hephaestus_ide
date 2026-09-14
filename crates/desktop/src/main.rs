@@ -2,17 +2,18 @@
 
 mod commands;
 mod shell;
+mod terminal_view;
 mod theme;
 
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
-use gpui_component::{Root, Theme, ThemeMode, TitleBar};
+use gpui_component::{Root, ThemeMode, TitleBar};
 use gpui_component_assets::Assets;
 use shell::IdeShell;
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
+        theme::set_mode(ThemeMode::Dark, None, cx);
         commands::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

@@ -151,7 +151,8 @@ impl Document {
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(&path).map_err(|error| error.error)?;
-        self.path = Some(path);
+        // New files use the same canonical form as `open` and the workspace tree.
+        self.path = Some(path.canonicalize().unwrap_or(path));
         self.saved_text = self.text.clone();
         Ok(self)
     }
