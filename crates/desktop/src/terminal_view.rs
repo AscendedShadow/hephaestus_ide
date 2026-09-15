@@ -1,6 +1,3 @@
-//! The Terminal tool panel: draws a [`Terminal`] and forwards keyboard, mouse, and
-//! clipboard input to it.
-
 use std::{ops::Range, path::PathBuf};
 
 use gpui::{
@@ -23,30 +20,23 @@ mod tests;
 
 actions!(terminal, [Copy, Paste]);
 
-/// Key context of a focused terminal; app shortcuts the shell needs are unbound in it.
 pub const KEY_CONTEXT: &str = "Terminal";
 
 const FONT_SIZE: f32 = 13.;
-/// Line height as a multiple of the font size.
 const LINE_HEIGHT: f32 = 1.3;
 
 pub struct TerminalView {
     focus_handle: FocusHandle,
     session: Option<Session>,
-    /// Why the last start failed.
     error: Option<String>,
-    /// Geometry from the last layout, for mapping the mouse and IME to cells.
     layout: Option<Layout>,
-    /// Uncommitted IME composition, drawn at the cursor.
     marked_text: Option<String>,
-    /// Wheel movement not yet amounting to a whole line.
     scroll_remainder: f32,
     selecting: bool,
 }
 
 struct Session {
     terminal: Terminal,
-    /// Reused to restart the shell after it exits.
     options: Options,
     _events: Task<()>,
 }
@@ -100,8 +90,6 @@ impl TerminalView {
             .is_some_and(|session| !session.terminal.exited())
     }
 
-    /// Start the default shell, in the home folder when no directory is given. Does nothing
-    /// once a shell has started; after it exits, Enter restarts it.
     pub fn start(&mut self, working_directory: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.session.is_none() {
             self.spawn(
@@ -115,7 +103,6 @@ impl TerminalView {
     }
 
     fn spawn(&mut self, options: Options, cx: &mut Context<Self>) {
-        // Close the previous shell before starting the next.
         self.session = None;
         let size = self.layout.map(|layout| layout.grid).unwrap_or_default();
         let spawn_options = Options {
@@ -126,7 +113,6 @@ impl TerminalView {
             Ok((terminal, events)) => {
                 let events = cx.spawn(async move |this, cx| {
                     while let Some(event) = events.recv().await {
-                        // Take everything already queued so a burst of output repaints once.
                         let mut batch = vec![event];
                         batch.extend(std::iter::from_fn(|| events.try_recv()));
                         if this
@@ -174,7 +160,6 @@ impl TerminalView {
             }
             return;
         }
-        // Cmd / Windows-key chords stay app shortcuts.
         if keystroke.modifiers.platform {
             return;
         }
@@ -183,8 +168,6 @@ impl TerminalView {
             alt: keystroke.modifiers.alt,
             shift: keystroke.modifiers.shift,
         };
-        // Plain text is left to the platform, which delivers it through the input handler
-        // so that IME composition and dead keys work.
         if let Some(bytes) =
             session
                 .terminal
@@ -260,7 +243,6 @@ impl TerminalView {
         }
     }
 
-    /// Fit the terminal to `bounds` and lay out its screen for painting.
     fn layout_frame(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> Option<Frame> {
         let font = theme::monospace_font();
         let font_size = px(FONT_SIZE);
@@ -322,7 +304,6 @@ impl Render for TerminalView {
                 .text_color(theme::muted())
                 .child(message)
         };
-        // Before a shell starts the notice leads; after one exits it follows the last screen.
         let intro = self.session.is_none().then(|| {
             self.error
                 .clone()
@@ -382,7 +363,6 @@ impl Render for TerminalView {
     }
 }
 
-/// Typed text arrives here from the platform rather than as key events.
 impl EntityInputHandler for TerminalView {
     fn text_for_range(
         &mut self,
@@ -445,7 +425,6 @@ impl EntityInputHandler for TerminalView {
         cx.notify();
     }
 
-    /// Places the IME candidate window at the cursor.
     fn bounds_for_range(
         &mut self,
         _: Range<usize>,
@@ -468,11 +447,9 @@ impl EntityInputHandler for TerminalView {
     }
 }
 
-/// A laid-out screen, ready to paint.
 struct Frame {
     backgrounds: Vec<PaintQuad>,
     text: Vec<(Point<Pixels>, ShapedLine)>,
-    /// Cursor shapes and the IME composition, drawn over the text.
     overlays: Vec<PaintQuad>,
     overlay_text: Option<(Point<Pixels>, ShapedLine)>,
     line_height: Pixels,
@@ -496,7 +473,6 @@ impl Frame {
             let color = hsla(palette.cursor);
             let bar = px(2.);
             match (focused, cursor.shape) {
-                // Drawn by inverting the cell's colors.
                 (true, CursorShape::Block) => {
                     for cell in snapshot.rows[cursor.row]
                         .iter_mut()
@@ -567,8 +543,6 @@ impl Frame {
                 }
             }
 
-            // Runs of same-styled text, each placed at its first column. Wide characters get
-            // their own run so that a fallback font's advance cannot shift what follows.
             let mut column = 0;
             while column < row.len() {
                 let first = &row[column];

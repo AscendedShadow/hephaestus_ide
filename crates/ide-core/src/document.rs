@@ -1,5 +1,3 @@
-//! UTF-8 documents and snapshot-based persistence, independent of the UI.
-
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
@@ -9,7 +7,6 @@ use std::{
 use ropey::Rope;
 use tempfile::NamedTempFile;
 
-/// A bounded first editor implementation; large-file mode can lift this later.
 pub const MAX_OPEN_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,9 +35,7 @@ pub struct Document {
 }
 
 impl Document {
-    /// Blocking: call from a background executor.
     pub fn open(path: &Path) -> io::Result<Self> {
-        // Resolve symlinks so atomic saving updates the target rather than the link.
         let path = path.canonicalize()?;
         let file = File::open(&path)?;
         if !file.metadata()?.is_file() {
@@ -64,7 +59,6 @@ impl Document {
         if text.contains('\0') {
             return Err(io::Error::other("Binary files cannot be edited"));
         }
-        // Internally use LF. Preserve uniform CRLF; mixed endings normalize to LF.
         let crlf = text.matches("\r\n").count();
         let line_ending = if crlf > 0 && crlf == text.matches('\n').count() {
             LineEnding::CrLf
@@ -96,7 +90,6 @@ impl Document {
         &self.text
     }
 
-    /// Rope clones share storage; this does not copy the whole document per edit.
     pub fn set_text(&mut self, text: Rope) {
         self.text = text;
     }
@@ -109,9 +102,6 @@ impl Document {
         self.line_ending
     }
 
-    /// Write a snapshot using a sibling temporary file and atomic replacement.
-    /// The live document is only marked saved after this succeeds.
-    /// Blocking: call from a background executor.
     pub fn save_to(mut self, path: &Path) -> io::Result<Self> {
         let path = if path.exists() {
             path.canonicalize()?
@@ -141,8 +131,6 @@ impl Document {
         if self.utf8_bom {
             file.write_all(b"\xef\xbb\xbf")?;
         }
-        // Clipboard input can contain CRLF even though opened buffers use LF.
-        // Normalize before encoding to avoid turning CRLF into CRCRLF.
         let text = self.text.to_string().replace("\r\n", "\n");
         let text = match self.line_ending {
             LineEnding::Lf => text,
@@ -151,13 +139,11 @@ impl Document {
         file.write_all(text.as_bytes())?;
         file.as_file().sync_all()?;
         file.persist(&path).map_err(|error| error.error)?;
-        // New files use the same canonical form as `open` and the workspace tree.
         self.path = Some(path.canonicalize().unwrap_or(path));
         self.saved_text = self.text.clone();
         Ok(self)
     }
 
-    /// Accept the persisted snapshot without overwriting newer live edits.
     pub fn accept_saved(&mut self, saved: Self) {
         self.path = saved.path;
         self.saved_text = saved.saved_text;

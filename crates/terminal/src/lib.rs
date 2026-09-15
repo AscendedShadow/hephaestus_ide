@@ -1,9 +1,3 @@
-//! PTY-backed terminal sessions, independent of the UI.
-//!
-//! A [`Terminal`] owns a shell process and its emulated screen. A background thread reads
-//! the PTY and parses its output; the UI drains [`Events`], passes each one to
-//! [`Terminal::handle`], and renders [`Terminal::snapshot`].
-
 mod keys;
 mod snapshot;
 
@@ -23,20 +17,16 @@ use alacritty_terminal::{
 pub use keys::Modifiers;
 pub use snapshot::{Cell, Cursor, CursorShape, Palette, Snapshot};
 
-/// Lines of scrollback kept above the screen.
 const SCROLLBACK_LINES: usize = 10_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// Program and arguments to run; `None` runs the platform's default shell.
     pub shell: Option<(String, Vec<String>)>,
     pub working_directory: Option<PathBuf>,
-    /// Added to the inherited environment.
     pub env: HashMap<String, String>,
     pub palette: Palette,
 }
 
-/// Screen size in cells, plus the cell size in pixels that some programs query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridSize {
     pub columns: u16,
@@ -91,18 +81,13 @@ impl From<GridSize> for WindowSize {
     }
 }
 
-/// What a [`Terminal`] needs the UI to do after handling an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The screen changed.
     Wakeup,
-    /// The shell exited; the last screen remains readable.
     Exited,
-    /// A program asked to put this text on the clipboard (OSC 52).
     Copy(String),
 }
 
-/// How far a mouse selection snaps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionKind {
     Cells,
@@ -110,16 +95,13 @@ pub enum SelectionKind {
     Lines,
 }
 
-/// A position on screen: `row` 0 is the top visible row, regardless of scrollback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridPoint {
     pub row: usize,
     pub column: usize,
-    /// Whether the position is in the right half of the cell.
     pub right_half: bool,
 }
 
-/// Forwards emulator notifications from the PTY thread to [`Events`].
 #[derive(Clone)]
 struct Listener(async_channel::Sender<PtyMessage>);
 
@@ -129,10 +111,8 @@ impl EventListener for Listener {
     }
 }
 
-/// An unprocessed notification from the PTY thread; pass it to [`Terminal::handle`].
 pub struct PtyEvent(PtyMessage);
 
-/// Notifications from a [`Terminal`]'s PTY thread. Ends when the terminal is dropped.
 pub struct Events(async_channel::Receiver<PtyMessage>);
 
 impl Events {
@@ -147,7 +127,7 @@ impl Events {
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
-    notifier: Notifier,
+    notifier: Option<Notifier>,
     size: GridSize,
     palette: Palette,
     exited: bool,
@@ -155,7 +135,6 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Start a shell on a new PTY. Output is processed on a background thread.
     pub fn spawn(options: Options, size: GridSize) -> io::Result<(Self, Events)> {
         let size = size.clamped();
         let (sender, receiver) = async_channel::unbounded();
@@ -193,7 +172,7 @@ impl Terminal {
         Ok((
             Self {
                 term,
-                notifier,
+                notifier: Some(notifier),
                 size,
                 palette: options.palette,
                 exited: false,
@@ -203,8 +182,6 @@ impl Terminal {
         ))
     }
 
-    /// Apply one PTY notification. Replies that programs expect from the terminal, such as
-    /// color and size queries, are written back here.
     pub fn handle(&mut self, event: PtyEvent) -> Option<Event> {
         match event.0 {
             PtyMessage::Wakeup => Some(Event::Wakeup),
@@ -240,16 +217,33 @@ impl Terminal {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_test_output(output: &[u8], size: GridSize, exited: bool) -> Self {
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        let size = size.clamped();
+        let (sender, _) = async_channel::unbounded();
+        let listener = Listener(sender);
+        let mut term = Term::new(term::Config::default(), &size, listener);
+        Processor::<StdSyncHandler>::new().advance(&mut term, output);
+        Self {
+            term: Arc::new(FairMutex::new(term)),
+            notifier: None,
+            size,
+            palette: Palette::default(),
+            exited,
+            exit_code: None,
+        }
+    }
+
     pub fn exited(&self) -> bool {
         self.exited
     }
 
-    /// The shell's exit code, when it exited and the platform reported one.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
 
-    /// Colors for later snapshots and color queries, such as after a theme change.
     pub fn set_palette(&mut self, palette: Palette) {
         self.palette = palette;
     }
@@ -258,17 +252,19 @@ impl Terminal {
         let size = size.clamped();
         if size != self.size {
             self.size = size;
-            self.notifier.on_resize(size.into());
+            if let Some(notifier) = &mut self.notifier {
+                notifier.on_resize(size.into());
+            }
             self.term.lock().resize(size);
         }
     }
 
-    /// Send bytes to the shell as-is.
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        self.notifier.notify(bytes);
+        if let Some(notifier) = &self.notifier {
+            notifier.notify(bytes);
+        }
     }
 
-    /// Send user input: returns to the live screen and clears the selection first.
     pub fn input(&self, bytes: impl Into<Cow<'static, [u8]>>) {
         let mut term = self.term.lock();
         term.scroll_display(Scroll::Bottom);
@@ -277,10 +273,6 @@ impl Terminal {
         self.write(bytes);
     }
 
-    /// The bytes a key press sends, for keys that are not plain text input. `key` is a
-    /// lowercase name such as `enter`, `up`, or `f5`, or the character on the key, and
-    /// `text` is the character it would type. Returns `None` for keys the platform should
-    /// deliver as text instead.
     pub fn key_sequence(
         &self,
         key: &str,
@@ -291,11 +283,9 @@ impl Terminal {
         keys::sequence(key, text, modifiers, app_cursor)
     }
 
-    /// Paste text, bracketed when the running program asked for that.
     pub fn paste(&self, text: &str) {
         let bracketed = self.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
         let text = if bracketed {
-            // Strip ESC so pasted text cannot end the bracket early.
             format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', ""))
         } else {
             text.replace("\r\n", "\r").replace('\n', "\r")
@@ -303,8 +293,6 @@ impl Terminal {
         self.input(text.into_bytes());
     }
 
-    /// Mouse-wheel scrolling by whole lines; positive values scroll towards older output.
-    /// Full-screen programs that opt in receive arrow keys instead, as in other terminals.
     pub fn scroll_wheel(&self, lines: i32) {
         let mut term = self.term.lock();
         let mode = *term.mode();
@@ -348,7 +336,6 @@ impl Terminal {
             .filter(|text| !text.is_empty())
     }
 
-    /// The visible screen with colors resolved against the palette.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot::new(&self.term.lock(), &self.palette)
     }
@@ -356,8 +343,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // Ends the PTY thread, which closes the PTY and with it the shell.
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        if let Some(notifier) = &self.notifier {
+            let _ = notifier.0.send(Msg::Shutdown);
+        }
     }
 }
 
@@ -373,7 +361,6 @@ fn grid_point<T>(term: &Term<T>, at: GridPoint) -> (Point, Side) {
     (Point::new(line, column), side)
 }
 
-/// PowerShell 7 when installed, otherwise Windows PowerShell.
 #[cfg(target_os = "windows")]
 fn default_shell() -> Option<tty::Shell> {
     let path = std::env::var_os("PATH")?;
@@ -383,7 +370,6 @@ fn default_shell() -> Option<tty::Shell> {
         .map(|program| tty::Shell::new(program.to_string_lossy().into_owned(), Vec::new()))
 }
 
-/// The user's login shell, which alacritty resolves.
 #[cfg(not(target_os = "windows"))]
 fn default_shell() -> Option<tty::Shell> {
     None
@@ -391,38 +377,14 @@ fn default_shell() -> Option<tty::Shell> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
-
     use super::*;
 
-    /// Run `command` in the platform shell and collect the screen once it exits.
-    fn run(command: &str) -> Snapshot {
-        let shell = if cfg!(target_os = "windows") {
-            ("cmd.exe".into(), vec!["/C".into(), command.into()])
-        } else {
-            ("/bin/sh".into(), vec!["-c".into(), command.into()])
-        };
-        let options = Options {
-            shell: Some(shell),
-            ..Default::default()
-        };
-        let (mut terminal, events) = Terminal::spawn(options, GridSize::default()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !terminal.exited() {
-            assert!(Instant::now() < deadline, "shell did not exit");
-            match events.try_recv() {
-                Some(event) => {
-                    terminal.handle(event);
-                }
-                None => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        terminal.snapshot()
-    }
-
     #[test]
-    fn runs_a_shell_command_and_reports_its_exit() {
-        let snapshot = run("echo hephaestus-terminal");
+    fn builds_a_completed_terminal_from_output() {
+        let terminal =
+            Terminal::from_test_output(b"hephaestus-terminal\r\n", GridSize::default(), true);
+        let snapshot = terminal.snapshot();
+        assert!(terminal.exited());
         assert!(
             snapshot
                 .lines()

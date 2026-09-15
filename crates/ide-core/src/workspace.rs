@@ -1,6 +1,3 @@
-//! Workspace identity and a lazily loaded project file tree.
-//! Filesystem watching will be added here.
-
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -15,7 +12,6 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
-/// One visible row of the flattened project tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeRow {
     pub entry: DirEntry,
@@ -26,13 +22,10 @@ pub struct TreeRow {
 #[derive(Debug, Default)]
 pub struct Workspace {
     root: Option<PathBuf>,
-    /// Listings of expanded directories, keyed by path. A directory is expanded
-    /// exactly when its listing is present; the root is always present.
     listings: HashMap<PathBuf, Vec<DirEntry>>,
 }
 
 impl Workspace {
-    /// Blocking: call from a background executor.
     pub fn open(path: &Path) -> io::Result<Self> {
         let root = path.canonicalize()?;
         if !fs::metadata(&root)?.is_dir() {
@@ -60,9 +53,6 @@ impl Workspace {
         self.listings.contains_key(directory)
     }
 
-    /// Expand `directory` with a fresh listing. Ignored when the directory is no
-    /// longer reachable from an expanded parent, such as after a collapse or
-    /// after another folder was opened while the listing was being read.
     pub fn expand(&mut self, directory: PathBuf, listing: Vec<DirEntry>) -> bool {
         let reachable = self.root() == Some(directory.as_path())
             || directory
@@ -79,7 +69,6 @@ impl Workspace {
         reachable
     }
 
-    /// Collapse `directory` and everything expanded below it. The root stays open.
     pub fn collapse(&mut self, directory: &Path) {
         if self.root() == Some(directory) {
             return;
@@ -87,7 +76,6 @@ impl Workspace {
         self.listings.retain(|path, _| !path.starts_with(directory));
     }
 
-    /// Expanded directories in depth-first display order, flattened to rows.
     pub fn rows(&self) -> Vec<TreeRow> {
         let mut rows = Vec::new();
         if let Some(root) = self.root() {
@@ -111,9 +99,6 @@ impl Workspace {
     }
 }
 
-/// Directories first, then case-insensitive name order.
-/// Symlinks are classified by their target; broken links appear as files.
-/// Blocking: call from a background executor.
 pub fn read_dir(directory: &Path) -> io::Result<Vec<DirEntry>> {
     let mut entries = fs::read_dir(directory)?
         .map(|entry| {
@@ -182,7 +167,6 @@ mod tests {
             ]
         );
 
-        // Collapsing a parent also collapses its expanded descendants.
         workspace.collapse(&src);
         assert!(!workspace.is_expanded(&nested));
         assert_eq!(names(&workspace.rows()), ["empty", "src", "A.txt", "b.txt"]);
@@ -195,7 +179,6 @@ mod tests {
         fs::create_dir_all(root.join("a/b")).unwrap();
         let mut workspace = Workspace::open(root).unwrap();
         let b = workspace.root().unwrap().join("a/b");
-        // Parent `a` is collapsed, so a late listing for `a/b` is discarded.
         assert!(!workspace.expand(b.clone(), Vec::new()));
         assert!(!workspace.is_expanded(&b));
         let outside = tempfile::tempdir().unwrap();

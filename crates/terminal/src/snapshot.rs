@@ -1,5 +1,3 @@
-//! Plain-data copies of the visible screen, with colors resolved for rendering.
-
 use alacritty_terminal::{
     Term,
     event::EventListener,
@@ -11,13 +9,11 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape as TermCursorShape, NamedColor, Rgb},
 };
 
-/// Terminal colors as `0xRRGGBB`. Programs can override them at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Palette {
     pub foreground: u32,
     pub background: u32,
     pub cursor: u32,
-    /// Black, red, green, yellow, blue, magenta, cyan and white, then their bright variants.
     pub ansi: [u32; 16],
 }
 
@@ -42,15 +38,12 @@ const DIM_WHITE: usize = NamedColor::DimWhite as usize;
 const DIM_FOREGROUND: usize = NamedColor::DimForeground as usize;
 
 impl Palette {
-    /// The color at an emulator color index: 0–255 are the 256-color palette, followed
-    /// by the named colors. Colors set by the running program take precedence.
     pub(crate) fn color(&self, index: usize, overrides: &Colors) -> u32 {
         if let Some(rgb) = (index < COUNT).then(|| overrides[index]).flatten() {
             return from_rgb(rgb);
         }
         match index {
             0..=15 => self.ansi[index],
-            // 6 × 6 × 6 color cube.
             16..=231 => {
                 let level = |value: usize| {
                     if value == 0 {
@@ -62,13 +55,11 @@ impl Palette {
                 let cube = index - 16;
                 level(cube / 36) << 16 | level(cube / 6 % 6) << 8 | level(cube % 6)
             }
-            // Grayscale ramp.
             232..=255 => (8 + 10 * (index - 232) as u32) * 0x01_01_01,
             BACKGROUND => self.background,
             CURSOR => self.cursor,
             DIM_BLACK..=DIM_WHITE => dim(self.ansi[index - DIM_BLACK]),
             DIM_FOREGROUND => dim(self.foreground),
-            // Foreground, bright foreground, and anything out of range.
             _ => self.foreground,
         }
     }
@@ -91,7 +82,6 @@ pub(crate) fn to_rgb(color: u32) -> Rgb {
     Rgb { r, g, b }
 }
 
-/// Two-thirds brightness, as alacritty dims text.
 fn dim(color: u32) -> u32 {
     let [_, r, g, b] = color.to_be_bytes();
     let dim = |channel: u8| u32::from(channel) * 2 / 3;
@@ -101,7 +91,6 @@ fn dim(color: u32) -> u32 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
-    /// Combining marks drawn over `ch`.
     pub combining: Vec<char>,
     pub foreground: u32,
     pub background: u32,
@@ -109,7 +98,6 @@ pub struct Cell {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
-    /// Columns the character spans: 2 for wide characters, 0 for the spacer after one.
     pub width: u8,
     pub selected: bool,
 }
@@ -126,15 +114,12 @@ pub struct Cursor {
     pub row: usize,
     pub column: usize,
     pub shape: CursorShape,
-    /// Whether the cursor is on a wide character and spans two columns.
     pub wide: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Visible rows from top to bottom; a cell's index in its row is its column.
     pub rows: Vec<Vec<Cell>>,
-    /// `None` when the program hid the cursor or it is scrolled out of view.
     pub cursor: Option<Cursor>,
 }
 
@@ -202,7 +187,6 @@ impl Snapshot {
         Self { rows, cursor }
     }
 
-    /// Row text without styling, for tests and diagnostics.
     pub fn lines(&self) -> Vec<String> {
         self.rows
             .iter()
@@ -243,7 +227,6 @@ mod tests {
         assert_eq!(snapshot.lines()[0].trim_end(), "red 世");
         assert!(row[0].bold);
         assert_eq!(row[0].foreground, palette.ansi[1]);
-        // Inverse video swaps the default colors.
         assert_eq!(row[2].foreground, palette.background);
         assert_eq!(row[2].background, palette.foreground);
         assert_eq!((row[4].ch, row[4].width, row[5].width), ('世', 2, 0));
@@ -257,7 +240,6 @@ mod tests {
                 wide: false,
             })
         );
-        // A program hiding the cursor removes it from the snapshot.
         assert_eq!(screen(b"\x1b[?25l").cursor, None);
     }
 

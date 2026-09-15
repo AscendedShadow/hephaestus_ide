@@ -1,6 +1,3 @@
-//! Keyboard input encoding, following xterm's conventions.
-
-/// Modifier keys held with a key press.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     pub control: bool,
@@ -8,8 +5,6 @@ pub struct Modifiers {
     pub shift: bool,
 }
 
-/// See [`crate::Terminal::key_sequence`]. `app_cursor` is the mode in which programs such as
-/// full-screen editors ask for SS3-prefixed cursor keys.
 pub(crate) fn sequence(
     key: &str,
     text: Option<&str>,
@@ -21,7 +16,6 @@ pub(crate) fn sequence(
         alt,
         shift,
     } = modifiers;
-    // xterm's modifier parameter: 1 + Shift + 2 × Alt + 4 × Control.
     let parameter = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(control);
     let cursor = |end: char| {
         if parameter > 1 {
@@ -81,9 +75,7 @@ pub(crate) fn sequence(
         "escape" => return Some(meta(b"\x1b")),
         "backspace" if control => return Some(meta(b"\x08")),
         "backspace" => return Some(meta(b"\x7f")),
-        // Control+Alt is also AltGr on Windows, which types characters: leave those as text.
         _ if control && !alt => return control_code(key).map(|code| vec![code]),
-        // macOS Option composes characters rather than acting as Meta.
         _ if alt && !control && !cfg!(target_os = "macos") => {
             return Some(meta(text.unwrap_or(key).as_bytes()));
         }
@@ -92,7 +84,6 @@ pub(crate) fn sequence(
     Some(sequence.into_bytes())
 }
 
-/// The C0 control code a Control chord sends, as in xterm.
 fn control_code(key: &str) -> Option<u8> {
     let [byte] = *key.as_bytes() else {
         return (key == "space").then_some(0);

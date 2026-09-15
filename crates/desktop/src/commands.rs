@@ -1,6 +1,10 @@
 use gpui::{App, KeyBinding, Menu, MenuItem, NoAction, actions};
 
-use crate::terminal_view::{self, KEY_CONTEXT as TERMINAL};
+use crate::{
+    git_panel,
+    terminal_view::{self, KEY_CONTEXT as TERMINAL},
+    vim,
+};
 
 actions!(
     hephaestus,
@@ -10,9 +14,17 @@ actions!(
         OpenFolder,
         SaveFile,
         SaveFileAs,
+        CloseTab,
+        NextTab,
+        PreviousTab,
         CloseWindow,
         OpenSettings,
-        ToggleTerminal
+        ShowFolderPanel,
+        ToggleTerminal,
+        ShowGitPanel,
+        ShowDebugPanel,
+        ToggleVimMode,
+        ToggleFold
     ]
 );
 
@@ -22,7 +34,6 @@ pub fn init(cx: &mut App) {
     } else {
         "ctrl"
     };
-    // Ctrl+C and Ctrl+V belong to the shell, so other platforms add Shift.
     let (copy, paste) = if cfg!(target_os = "macos") {
         ("cmd-c", "cmd-v")
     } else {
@@ -34,24 +45,57 @@ pub fn init(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-k {modifier}-o"), OpenFolder, None),
         KeyBinding::new(&format!("{modifier}-s"), SaveFile, None),
         KeyBinding::new(&format!("{modifier}-shift-s"), SaveFileAs, None),
+        KeyBinding::new(&format!("{modifier}-w"), CloseTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-pagedown", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+        KeyBinding::new("ctrl-pageup", PreviousTab, None),
         KeyBinding::new(&format!("{modifier}-shift-w"), CloseWindow, None),
         KeyBinding::new(&format!("{modifier}-,"), OpenSettings, None),
+        KeyBinding::new(&format!("{modifier}-shift-e"), ShowFolderPanel, None),
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        KeyBinding::new(&format!("{modifier}-shift-g"), ShowGitPanel, None),
+        KeyBinding::new(&format!("{modifier}-shift-d"), ShowDebugPanel, None),
+        KeyBinding::new(&format!("{modifier}-shift-["), ToggleFold, None),
+        KeyBinding::new(
+            "secondary-enter",
+            git_panel::Commit,
+            Some(&format!("{} > Input", git_panel::COMMIT_CONTEXT)),
+        ),
         KeyBinding::new(copy, terminal_view::Copy, Some(TERMINAL)),
         KeyBinding::new(paste, terminal_view::Paste, Some(TERMINAL)),
-        // The shell uses Tab for completion rather than focus navigation.
         KeyBinding::new("tab", NoAction, Some(TERMINAL)),
         KeyBinding::new("shift-tab", NoAction, Some(TERMINAL)),
     ]);
     if !cfg!(target_os = "macos") {
-        // Readline and PSReadLine use these Ctrl chords, so they reach the shell. These
-        // must be bound after the shortcuts they override; the chord is unbound too, or
-        // Ctrl+K would wait for its second key.
         cx.bind_keys(
-            ["ctrl-n", "ctrl-o", "ctrl-k", "ctrl-k ctrl-o"]
+            ["ctrl-n", "ctrl-o", "ctrl-k", "ctrl-k ctrl-o", "ctrl-w"]
                 .map(|keys| KeyBinding::new(keys, NoAction, Some(TERMINAL))),
         );
     }
+    let vim_normal = format!("{} > Input && !SearchPanel", vim::NORMAL_CONTEXT);
+    let vim_insert = format!("{} > Input && !SearchPanel", vim::INSERT_CONTEXT);
+    cx.bind_keys(
+        [
+            "escape",
+            "ctrl-[",
+            "enter",
+            "backspace",
+            "delete",
+            "tab",
+            "shift-tab",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+        ]
+        .map(|keys| KeyBinding::new(keys, NoAction, Some(&vim_normal))),
+    );
+    cx.bind_keys(
+        ["escape", "ctrl-["].map(|keys| KeyBinding::new(keys, NoAction, Some(&vim_insert))),
+    );
 
     let file_menu = Menu {
         name: "File".into(),
@@ -62,24 +106,36 @@ pub fn init(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Save As…", SaveFileAs),
+            MenuItem::separator(),
+            MenuItem::action("Close Tab", CloseTab),
         ],
     };
-    // macOS always titles the first menu with the app name, so File must come second there,
-    // and Settings goes in that app menu as the platform expects.
+    let view_menu = Menu {
+        name: "View".into(),
+        items: vec![MenuItem::action("Toggle Fold", ToggleFold)],
+    };
     let menus = if cfg!(target_os = "macos") {
         vec![
             Menu {
                 name: "Hephaestus".into(),
-                items: vec![MenuItem::action("Settings…", OpenSettings)],
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::action("Toggle Vim Keys", ToggleVimMode),
+                ],
             },
             file_menu,
+            view_menu,
         ]
     } else {
         vec![
             file_menu,
+            view_menu,
             Menu {
                 name: "Settings".into(),
-                items: vec![MenuItem::action("Open Settings…", OpenSettings)],
+                items: vec![
+                    MenuItem::action("Open Settings…", OpenSettings),
+                    MenuItem::action("Toggle Vim Keys", ToggleVimMode),
+                ],
             },
         ]
     };

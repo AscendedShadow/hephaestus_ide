@@ -1,9 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod commands;
+mod folding;
+mod git_panel;
 mod shell;
+mod syntax;
 mod terminal_view;
 mod theme;
+mod vim;
 
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_component::{Root, ThemeMode, TitleBar};
@@ -13,6 +17,7 @@ use shell::IdeShell;
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
+        syntax::init();
         theme::set_mode(ThemeMode::Dark, None, cx);
         commands::init(cx);
         cx.on_window_closed(|cx| {
