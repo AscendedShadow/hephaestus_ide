@@ -10,6 +10,7 @@ gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 ide-core.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 terminal.workspace = true
 tree-sitter-c.workspace = true

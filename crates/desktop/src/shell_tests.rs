@@ -1,7 +1,7 @@
 use super::*;
 use gpui::{
-    EntityInputHandler as _, Modifiers, MouseButton, Point, TestAppContext, VisualTestContext,
-    point, size,
+    Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext,
+    VisualTestContext, point, size,
 };
 use gpui_component::{Root, Theme, ThemeMode};
 use ide_core::vim::Mode;
@@ -149,65 +149,236 @@ fn settings_dialog_toggles_light_mode_and_vim_keys(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|window, cx| assert!(window.has_active_dialog(cx)));
 
-    let toggle = cx.debug_bounds("light-mode").unwrap();
-    let switch = point(toggle.left() + px(12.), toggle.center().y);
-    cx.simulate_click(switch, Modifiers::none());
-    cx.run_until_parked();
+    click_switch(cx, "light-mode");
     cx.read(|cx| {
         assert_eq!(theme::mode(), ThemeMode::Light);
         assert!(!Theme::global(cx).is_dark());
     });
 
-    cx.simulate_click(switch, Modifiers::none());
-    cx.run_until_parked();
+    click_switch(cx, "light-mode");
     cx.read(|cx| {
         assert_eq!(theme::mode(), ThemeMode::Dark);
         assert!(Theme::global(cx).is_dark());
     });
 
-    let toggle = cx.debug_bounds("vim-mode").unwrap();
-    let switch = point(toggle.left() + px(12.), toggle.center().y);
-    cx.simulate_click(switch, Modifiers::none());
-    cx.run_until_parked();
+    click_switch(cx, "vim-mode");
     cx.read(|cx| assert!(shell.read(cx).vim.is_some()));
-    cx.simulate_click(switch, Modifiers::none());
-    cx.run_until_parked();
+    click_switch(cx, "vim-mode");
     cx.read(|cx| assert!(shell.read(cx).vim.is_none()));
 }
 
+fn click_switch(cx: &mut VisualTestContext, selector: &'static str) {
+    let toggle = cx.debug_bounds(selector).unwrap();
+    let switch = point(toggle.left() + px(12.), toggle.center().y);
+    cx.simulate_click(switch, Modifiers::none());
+    cx.run_until_parked();
+}
+
 #[gpui::test]
-fn brace_folding_only_changes_the_editor_projection(cx: &mut TestAppContext) {
+fn settings_file_rebinds_hotkeys_and_recolors_panels(cx: &mut TestAppContext) {
+    use crate::{
+        commands::{Command, Keys},
+        syntax::Token,
+        theme::{Color, Hex},
+    };
+
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("fold.rs");
-    let source = "fn main() {\n  work();\n}\n";
-    std::fs::write(&path, source).unwrap();
-    let document = Document::open(&path).unwrap();
+    let path = directory.path().join("config").join(settings::FILE_NAME);
     let (shell, cx) = setup(cx);
+    cx.update(|_, cx| cx.set_global(settings::SettingsPath(path.clone())));
+    let status = |cx: &mut VisualTestContext| cx.read(|cx| shell.read(cx).status.clone());
+
+    cx.simulate_keystrokes(&primary(","));
+    cx.run_until_parked();
+    let edit = cx.debug_bounds("edit-settings").unwrap();
+    cx.simulate_click(edit.center(), Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    assert_eq!(tabs(&shell, cx), ["*settings.json"]);
+    assert_eq!(Settings::load(&path), Ok(Settings::defaults()));
+
+    let mut custom = Settings::default();
+    custom
+        .keybindings
+        .insert(Command::NewFile, Keys::One("alt-n".into()));
+    let dark = &mut custom.theme.dark;
+    dark.colors.insert(Color::Panel, Hex(rgb(0x102030)));
+    dark.syntax.insert(Token::Keyword, Hex(rgb(0xff0000)));
+    cx.simulate_keystrokes(&primary("a"));
+    cx.simulate_input(&custom.to_json());
+    cx.simulate_keystrokes(&primary("s"));
+    cx.run_until_parked();
+    assert_eq!(Settings::load(&path), Ok(custom));
+    assert_eq!(status(cx), "Settings applied");
+    cx.read(|cx| {
+        assert_eq!(theme::panel(), rgb(0x102030));
+        assert_eq!(Theme::global(cx).colors.sidebar, rgb(0x102030).into());
+        let syntax = &Theme::global(cx).highlight_theme.style.syntax;
+        let keyword = syntax.style("keyword").and_then(|style| style.color);
+        assert_eq!(keyword, Some(rgb(0xff0000).into()));
+    });
+
+    cx.simulate_keystrokes(&primary("n"));
+    assert_eq!(tabs(&shell, cx), ["*settings.json"]);
+    cx.simulate_keystrokes("alt-n");
+    assert_eq!(tabs(&shell, cx), ["settings.json", "*Untitled"]);
+    cx.simulate_input("typing still works");
+    assert_eq!(text(&shell, cx), "typing still works");
+
+    std::fs::write(
+        &path,
+        r#"{ "theme": { "dark": { "colors": { "panel": "blue" } } } }"#,
+    )
+    .unwrap();
+    cx.dispatch_action(ReloadSettings);
+    assert!(
+        status(cx).starts_with("Settings error — settings.json:"),
+        "{}",
+        status(cx)
+    );
+    cx.read(|_| assert_eq!(theme::panel(), rgb(0x102030)));
+
+    std::fs::write(&path, r#"{ "keybindings": { "new_file": "ctrl-nope-n" } }"#).unwrap();
+    cx.dispatch_action(ReloadSettings);
+    assert!(
+        status(cx).starts_with("Settings error — new_file: Invalid keystroke"),
+        "{}",
+        status(cx)
+    );
+    cx.read(|_| assert_eq!(theme::panel(), rgb(0x16171b)));
+    cx.simulate_keystrokes("alt-n");
+    assert_eq!(tabs(&shell, cx), ["settings.json", "*Untitled"]);
+}
+
+const FOLD_SOURCE: &str = "fn main() {\n  if ready {\n    work();\n  }\n}\n";
+const FOLDED_IF: &str = "fn main() {\n  if ready {...}\n}\n";
+
+fn open_fold_source(
+    shell: &Entity<IdeShell>,
+    directory: &Path,
+    cx: &mut VisualTestContext,
+) -> PathBuf {
+    let path = directory.join("fold.rs");
+    std::fs::write(&path, FOLD_SOURCE).unwrap();
+    let document = Document::open(&path).unwrap();
     shell.update_in(cx, |shell, window, cx| {
-        shell.open_document(document, window, cx);
+        shell.open_document(document, window, cx)
+    });
+    cx.run_until_parked();
+    path
+}
+
+fn editor_text(shell: &Entity<IdeShell>, cx: &mut VisualTestContext) -> String {
+    cx.read(|cx| shell.read(cx).editor().read(cx).text().to_string())
+}
+
+fn assert_projection(shell: &Entity<IdeShell>, cx: &mut VisualTestContext, expected: &str) {
+    assert_eq!(editor_text(shell, cx), expected);
+    assert_eq!(text(shell, cx), FOLD_SOURCE);
+    assert!(!dirty(shell, cx));
+}
+
+#[gpui::test]
+fn fold_hotkeys_only_change_the_editor_projection(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let (shell, cx) = setup(cx);
+    open_fold_source(&shell, directory.path(), cx);
+    shell.update_in(cx, |shell, window, cx| {
         shell.editor().update(cx, |editor, cx| {
-            editor.set_cursor_position(Position::new(1, 2), window, cx)
+            editor.set_cursor_position(Position::new(2, 4), window, cx)
         });
     });
 
+    cx.simulate_keystrokes(&format!("{} {}", primary("k"), primary("l")));
+    assert_projection(&shell, cx, FOLDED_IF);
+    cx.simulate_keystrokes(&primary("shift-["));
+    assert_projection(&shell, cx, FOLD_SOURCE);
     cx.dispatch_action(ToggleFold);
-    cx.read(|cx| {
-        let shell = shell.read(cx);
-        assert_eq!(
-            shell.editor().read(cx).text().to_string(),
-            "fn main() {...}\n"
-        );
-        assert_eq!(shell.document().text().to_string(), source);
-        assert!(!shell.buffer().dirty);
-    });
+    assert_projection(&shell, cx, FOLDED_IF);
 
-    cx.dispatch_action(ToggleFold);
-    cx.read(|cx| {
-        let shell = shell.read(cx);
-        assert_eq!(shell.editor().read(cx).text().to_string(), source);
-        assert_eq!(shell.document().text().to_string(), source);
-        assert!(!shell.buffer().dirty);
+    cx.simulate_keystrokes(&primary("z"));
+    assert_projection(&shell, cx, FOLD_SOURCE);
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-shift-z"
+    } else {
+        "ctrl-y"
     });
+    assert_projection(&shell, cx, FOLDED_IF);
+
+    cx.simulate_input("x");
+    assert_eq!(
+        editor_text(&shell, cx),
+        "fn main() {\n  if ready {...x}\n}\n"
+    );
+    assert_eq!(
+        text(&shell, cx),
+        "fn main() {\n  if ready {\n    work();\n  x}\n}\n"
+    );
+}
+
+#[gpui::test]
+fn clicking_a_line_number_toggles_the_block_opening_on_that_line(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    open_fold_source(&shell, directory.path(), cx);
+    let click_line = |line: usize, cx: &mut VisualTestContext| {
+        let gutter = cx.debug_bounds("fold-gutter").unwrap();
+        let y = gutter.top() + px(8. + 20. * line as f32 + 10.);
+        cx.simulate_click(point(gutter.center().x, y), Modifiers::none());
+        cx.run_until_parked();
+    };
+
+    click_line(1, cx);
+    assert_projection(&shell, cx, FOLDED_IF);
+    click_line(0, cx);
+    assert_projection(&shell, cx, "fn main() {...}\n");
+    click_line(0, cx);
+    assert_projection(&shell, cx, FOLD_SOURCE);
+
+    click_line(2, cx);
+    assert_projection(&shell, cx, FOLD_SOURCE);
+    cx.read(|cx| assert_eq!(shell.read(cx).status, "No brace block here"));
+}
+
+#[gpui::test]
+fn brace_guide_geometry_follows_editor_scrolling(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let path = directory.path().join("long.rs");
+    std::fs::write(
+        &path,
+        format!("fn main() {{\n{}}}\n", "    work();\n".repeat(200)),
+    )
+    .unwrap();
+    let document = Document::open(&path).unwrap();
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_document(document, window, cx)
+    });
+    cx.run_until_parked();
+    let geometry = |cx: &mut VisualTestContext| {
+        cx.read(|cx| shell.read(cx).editor().read(cx).text_geometry())
+            .unwrap()
+    };
+
+    let gutter = cx.debug_bounds("fold-gutter").unwrap();
+    let top = geometry(cx);
+    assert!(top.origin.y >= gutter.top());
+    assert!(top.viewport.left() < top.origin.x);
+    assert!(top.viewport.left() > gutter.left());
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(gutter.right() + px(200.), gutter.center().y),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-150.))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let scrolled = geometry(cx);
+    assert_eq!(scrolled.origin.y, top.origin.y - px(150.));
+    assert_eq!(scrolled.origin.x, top.origin.x);
+    assert_eq!(scrolled.line_height, top.line_height);
+    assert_eq!(scrolled.viewport, top.viewport);
 }
 
 #[gpui::test]

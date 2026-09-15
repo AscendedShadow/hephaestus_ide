@@ -1,14 +1,20 @@
-use std::{cell::Cell, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    sync::Arc,
+};
 
 use gpui::{App, Font, FontFallbacks, Hsla, Rgba, Window, font, px, rgb, rgba};
 use gpui_component::{Theme, ThemeMode, highlighter::SyntaxColors};
 use ide_core::git::Change;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::syntax::Token;
 
 thread_local! {
     static MODE: Cell<ThemeMode> = const { Cell::new(ThemeMode::Dark) };
     static MONO_FAMILY: Cell<&'static str> = const { Cell::new(FALLBACK_MONO) };
+    static THEMES: RefCell<Themes> = RefCell::new(Themes::default());
 }
 
 const FALLBACK_MONO: &str = if cfg!(target_os = "windows") {
@@ -27,8 +33,163 @@ const PREFERRED_MONO: [&str; 5] = [
     "DejaVu Sans Mono",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Color {
+    Background,
+    Panel,
+    Chrome,
+    Elevated,
+    Border,
+    BorderStrong,
+    Hover,
+    ActiveRow,
+    ActiveLine,
+    Text,
+    Muted,
+    Subtle,
+    Accent,
+    Selection,
+    Error,
+    GitAdded,
+    GitModified,
+    GitUntracked,
+    GitDeleted,
+    GitConflicted,
+    DiffAdded,
+    DiffRemoved,
+    DiffHunk,
+}
+
+impl Color {
+    pub const ALL: [Self; 23] = [
+        Self::Background,
+        Self::Panel,
+        Self::Chrome,
+        Self::Elevated,
+        Self::Border,
+        Self::BorderStrong,
+        Self::Hover,
+        Self::ActiveRow,
+        Self::ActiveLine,
+        Self::Text,
+        Self::Muted,
+        Self::Subtle,
+        Self::Accent,
+        Self::Selection,
+        Self::Error,
+        Self::GitAdded,
+        Self::GitModified,
+        Self::GitUntracked,
+        Self::GitDeleted,
+        Self::GitConflicted,
+        Self::DiffAdded,
+        Self::DiffRemoved,
+        Self::DiffHunk,
+    ];
+
+    fn defaults(self) -> (u32, u32) {
+        match self {
+            Self::Background => (0x1b1c21, 0xffffff),
+            Self::Panel => (0x16171b, 0xf6f7f9),
+            Self::Chrome => (0x121317, 0xeef0f3),
+            Self::Elevated => (0x222329, 0xffffff),
+            Self::Border => (0x26282e, 0xe3e5ea),
+            Self::BorderStrong => (0x33363d, 0xd3d6dc),
+            Self::Hover => (0x23252b, 0xe8eaee),
+            Self::ActiveRow => (0x243150, 0xdde7ff),
+            Self::ActiveLine => (0x202127, 0xf5f7fb),
+            Self::Text => (0xe3e5ea, 0x1d1f24),
+            Self::Muted => (0x8b8f99, 0x676c78),
+            Self::Subtle => (0x575b64, 0xa3a7b0),
+            Self::Accent => (0x7c9cff, 0x3b6ef5),
+            Self::Selection => (0x2d4270, 0xc7dbff),
+            Self::Error => (0xf07575, 0xc9402f),
+            Self::GitAdded => (0x73c991, 0x2f8a3f),
+            Self::GitModified => (0x6fa8ff, 0x1a64d6),
+            Self::GitUntracked => (0xe0776a, 0xc0392b),
+            Self::GitDeleted => (0x868a93, 0x6c707e),
+            Self::GitConflicted => (0xe8bd62, 0x9d6c00),
+            Self::DiffAdded => (0x1f3a2b, 0xe3f6e5),
+            Self::DiffRemoved => (0x42262a, 0xfde7e7),
+            Self::DiffHunk => (0x1e2436, 0xeef3ff),
+        }
+    }
+}
+
+fn syntax_defaults(token: Token) -> (u32, u32) {
+    match token {
+        Token::Keyword => (0xc792ea, 0x8e3fc9),
+        Token::Declaration => (0x82aaff, 0x2f5fd1),
+        Token::Call => (0xe8c17a, 0x8a6400),
+        Token::Name => (0xf0a3c0, 0xb8306a),
+        Token::Type => (0x5fd4c4, 0x08806f),
+        Token::Constant => (0xf78c6c, 0xc2531c),
+        Token::String => (0xa5d68b, 0x3d8a2e),
+        Token::Comment => (0x676b75, 0x8c8f96),
+        Token::DocComment => (0x6f8f7b, 0x53785d),
+        Token::Attribute => (0xc3bb74, 0x6f7520),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hex(pub Rgba);
+
+impl Serialize for Hex {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let color = hex(self.0);
+        match (self.0.a * 255.).round() as u32 {
+            0xff => serializer.collect_str(&format_args!("#{color:06x}")),
+            alpha => serializer.collect_str(&format_args!("#{color:06x}{alpha:02x}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Hex {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Rgba::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Palette {
+    pub colors: BTreeMap<Color, Hex>,
+    pub syntax: BTreeMap<Token, Hex>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Themes {
+    pub dark: Palette,
+    pub light: Palette,
+}
+
+impl Themes {
+    pub fn defaults() -> Self {
+        let palette = |dark: bool| Palette {
+            colors: Color::ALL
+                .into_iter()
+                .map(|color| (color, Hex(choose(color.defaults(), dark))))
+                .collect(),
+            syntax: Token::ALL
+                .into_iter()
+                .map(|token| (token, Hex(choose(syntax_defaults(token), dark))))
+                .collect(),
+        };
+        Self {
+            dark: palette(true),
+            light: palette(false),
+        }
+    }
+}
+
 pub fn mode() -> ThemeMode {
     MODE.get()
+}
+
+pub fn set_themes(themes: Themes) {
+    THEMES.set(themes);
 }
 
 pub fn set_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
@@ -127,60 +288,78 @@ fn apply_component_theme(theme: &mut Theme) {
     colors.scrollbar_thumb_hover = hsl(rgba(if dark { 0xffff_ff38 } else { 0x0000_0040 }));
 }
 
+fn choose((dark, light): (u32, u32), is_dark: bool) -> Rgba {
+    rgb(if is_dark { dark } else { light })
+}
+
 fn pick(dark: u32, light: u32) -> Rgba {
-    rgb(if mode().is_dark() { dark } else { light })
+    choose((dark, light), mode().is_dark())
+}
+
+fn resolve(lookup: impl FnOnce(&Palette) -> Option<Hex>, defaults: (u32, u32)) -> Rgba {
+    let dark = mode().is_dark();
+    THEMES
+        .with_borrow(|themes| lookup(if dark { &themes.dark } else { &themes.light }))
+        .map_or_else(|| choose(defaults, dark), |hex| hex.0)
+}
+
+pub fn color(color: Color) -> Rgba {
+    resolve(
+        |palette| palette.colors.get(&color).copied(),
+        color.defaults(),
+    )
 }
 
 pub fn background() -> Rgba {
-    pick(0x1b1c21, 0xffffff)
+    color(Color::Background)
 }
 
 pub fn panel() -> Rgba {
-    pick(0x16171b, 0xf6f7f9)
+    color(Color::Panel)
 }
 
 pub fn chrome() -> Rgba {
-    pick(0x121317, 0xeef0f3)
+    color(Color::Chrome)
 }
 
 pub fn elevated() -> Rgba {
-    pick(0x222329, 0xffffff)
+    color(Color::Elevated)
 }
 
 pub fn border() -> Rgba {
-    pick(0x26282e, 0xe3e5ea)
+    color(Color::Border)
 }
 
 pub fn border_strong() -> Rgba {
-    pick(0x33363d, 0xd3d6dc)
+    color(Color::BorderStrong)
 }
 
 pub fn hover() -> Rgba {
-    pick(0x23252b, 0xe8eaee)
+    color(Color::Hover)
 }
 
 pub fn active_row() -> Rgba {
-    pick(0x243150, 0xdde7ff)
+    color(Color::ActiveRow)
 }
 
 pub fn active_line() -> Rgba {
-    pick(0x202127, 0xf5f7fb)
+    color(Color::ActiveLine)
 }
 
 pub fn text() -> Rgba {
-    pick(0xe3e5ea, 0x1d1f24)
+    color(Color::Text)
 }
 
 pub fn muted() -> Rgba {
-    pick(0x8b8f99, 0x676c78)
+    color(Color::Muted)
 }
 
 pub fn subtle() -> Rgba {
-    pick(0x575b64, 0xa3a7b0)
+    color(Color::Subtle)
 }
 
 pub fn accent() -> Rgba {
-    pick(0x7c9cff, 0x3b6ef5)
+    color(Color::Accent)
 }
 
 pub fn accent_wash() -> Hsla {
@@ -188,50 +367,42 @@ pub fn accent_wash() -> Hsla {
 }
 
 pub fn selection() -> Rgba {
-    pick(0x2d4270, 0xc7dbff)
+    color(Color::Selection)
 }
 
 pub fn git_change(change: Change) -> Rgba {
-    match change {
-        Change::Added => pick(0x73c991, 0x2f8a3f),
-        Change::Untracked => pick(0xe0776a, 0xc0392b),
-        Change::Deleted => pick(0x868a93, 0x6c707e),
-        Change::Conflicted => pick(0xe8bd62, 0x9d6c00),
+    color(match change {
+        Change::Added => Color::GitAdded,
+        Change::Untracked => Color::GitUntracked,
+        Change::Deleted => Color::GitDeleted,
+        Change::Conflicted => Color::GitConflicted,
         Change::Modified | Change::Renamed | Change::Copied | Change::TypeChanged => {
-            pick(0x6fa8ff, 0x1a64d6)
+            Color::GitModified
         }
-    }
+    })
 }
 
 pub fn diff_added() -> Rgba {
-    pick(0x1f3a2b, 0xe3f6e5)
+    color(Color::DiffAdded)
 }
 
 pub fn diff_removed() -> Rgba {
-    pick(0x42262a, 0xfde7e7)
+    color(Color::DiffRemoved)
 }
 
 pub fn diff_hunk() -> Rgba {
-    pick(0x1e2436, 0xeef3ff)
+    color(Color::DiffHunk)
 }
 
 pub fn error() -> Rgba {
-    pick(0xf07575, 0xc9402f)
+    color(Color::Error)
 }
 
 pub fn syntax(token: Token) -> Rgba {
-    match token {
-        Token::Keyword => pick(0xc792ea, 0x8e3fc9),
-        Token::Declaration => pick(0x82aaff, 0x2f5fd1),
-        Token::Call => pick(0xe8c17a, 0x8a6400),
-        Token::Name => pick(0xf0a3c0, 0xb8306a),
-        Token::Type => pick(0x5fd4c4, 0x08806f),
-        Token::Constant => pick(0xf78c6c, 0xc2531c),
-        Token::String => pick(0xa5d68b, 0x3d8a2e),
-        Token::Comment => pick(0x676b75, 0x8c8f96),
-        Token::DocComment => pick(0x6f8f7b, 0x53785d),
-        Token::Attribute => pick(0xc3bb74, 0x6f7520),
-    }
+    resolve(
+        |palette| palette.syntax.get(&token).copied(),
+        syntax_defaults(token),
+    )
 }
 
 pub fn syntax_colors() -> SyntaxColors {
@@ -242,8 +413,8 @@ pub fn syntax_colors() -> SyntaxColors {
                 Token::DocComment => "comment_doc",
                 _ => token.capture(),
             };
-            let color = format!("#{:06x}", hex(syntax(token)));
-            (key.to_string(), serde_json::json!({ "color": color }))
+            let style = serde_json::json!({ "color": Hex(syntax(token)) });
+            (key.to_string(), style)
         })
         .collect();
     serde_json::from_value(serde_json::Value::Object(styles))

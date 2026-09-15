@@ -8,8 +8,8 @@ use std::{
 use gpui::{
     Action, App, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler as _, Focusable,
     FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render,
-    Stateful, Subscription, TextRun, UniformListScrollHandle, Window, div, linear_color_stop,
-    linear_gradient, prelude::*, px, rgb, uniform_list,
+    Stateful, Subscription, TextRun, UniformListScrollHandle, Window, canvas, div,
+    linear_color_stop, linear_gradient, prelude::*, px, rgb, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Root, RopeExt as _, Sizable as _, ThemeMode, TitleBar,
@@ -30,10 +30,12 @@ use ide_core::{
 
 use crate::{
     assets::AppIcon,
+    brace_guide::BraceGuide,
     commands::*,
     diff_view::DiffView,
     folding::{self, Fold, Toggle},
     git_panel::{GitPanel, GitPanelEvent},
+    settings::{self, Settings},
     syntax,
     terminal_view::TerminalView,
     theme,
@@ -343,6 +345,10 @@ impl IdeShell {
         shell.buffers.push(buffer);
         shell.activate(0, window, cx);
         shell
+    }
+
+    pub fn set_status(&mut self, status: String) {
+        self.status = status;
     }
 
     fn buffer(&self) -> &Buffer {
@@ -699,6 +705,12 @@ impl IdeShell {
                         }
                         this.refresh_parent(saved_path.as_deref(), cx);
                         this.refresh_git(cx);
+                        if saved_path
+                            .as_deref()
+                            .is_some_and(|path| settings::is_settings_file(path, cx))
+                        {
+                            this.status = this.apply_settings(window, cx);
+                        }
                         let clean = this
                             .buffer_index(id)
                             .is_some_and(|ix| !this.buffers[ix].dirty);
@@ -755,10 +767,14 @@ impl IdeShell {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 let mut failures = Vec::new();
+                let mut settings_saved = false;
                 let saved = results.iter().filter(|(_, result)| result.is_ok()).count();
                 for (id, result) in results {
                     match result {
                         Ok(saved) => {
+                            settings_saved |= saved
+                                .path()
+                                .is_some_and(|path| settings::is_settings_file(path, cx));
                             if let Some(ix) = this.buffer_index(id) {
                                 let buffer = &mut this.buffers[ix];
                                 buffer.document.accept_saved(saved);
@@ -771,11 +787,13 @@ impl IdeShell {
                 if saved > 0 {
                     this.refresh_git(cx);
                 }
+                let settings_status = settings_saved.then(|| this.apply_settings(window, cx));
                 match failures.first() {
                     Some(error) => this.status = format!("Save failed: {error}"),
                     None => {
                         let plural = if saved == 1 { "" } else { "s" };
-                        this.status = format!("Saved {saved} file{plural}");
+                        this.status = settings_status
+                            .unwrap_or_else(|| format!("Saved {saved} file{plural}"));
                         if let Some(action) = then {
                             this.perform(action, window, cx);
                         }
@@ -1103,14 +1121,108 @@ impl IdeShell {
         }
     }
 
+    fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let Some(path) = settings::path(cx) else {
+            return "No settings file is available".into();
+        };
+        let problems = match Settings::load(&path) {
+            Ok(settings) => settings.apply(Some(window), cx),
+            Err(error) => vec![error],
+        };
+        cx.notify();
+        settings::summary(&problems).unwrap_or_else(|| "Settings applied".into())
+    }
+
+    fn reload_settings(&mut self, _: &ReloadSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = self.apply_settings(window, cx);
+    }
+
+    fn edit_settings(&mut self, _: &EditSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked() {
+            return;
+        }
+        let Some(path) = settings::path(cx) else {
+            self.status = "No settings folder is available on this system".into();
+            cx.notify();
+            return;
+        };
+        if let Err(error) = settings::create_if_missing(&path) {
+            self.status = format!("Could not create {}: {error}", path.display());
+            cx.notify();
+            return;
+        }
+        self.open(Some(path), window, cx);
+    }
+
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
         let shell = cx.entity().downgrade();
         let vim_enabled = Rc::new(Cell::new(self.vim.is_some()));
+        let settings_path = settings::path(cx);
         window.open_dialog(cx, move |dialog, _, _| {
             let (shell, vim_enabled) = (shell.clone(), vim_enabled.clone());
+            let settings_file = {
+                let (edit_shell, reload_shell) = (shell.clone(), shell.clone());
+                let location = settings_path
+                    .as_ref()
+                    .map_or("No settings folder is available".into(), |path| {
+                        path.display().to_string()
+                    });
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(settings::FILE_NAME)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::muted())
+                                    .child("Hotkeys, panel colors and syntax colors"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::subtle())
+                                    .truncate()
+                                    .child(location),
+                            ),
+                    )
+                    .child(
+                        Button::new("reload-settings")
+                            .ghost()
+                            .small()
+                            .label("Reload")
+                            .disabled(settings_path.is_none())
+                            .on_click(move |_, window, cx| {
+                                let _ = reload_shell.update(cx, |shell, cx| {
+                                    shell.reload_settings(&ReloadSettings, window, cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        div().debug_selector(|| "edit-settings".into()).child(
+                            Button::new("edit-settings")
+                                .small()
+                                .label("Edit")
+                                .disabled(settings_path.is_none())
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = edit_shell.update(cx, |shell, cx| {
+                                        shell.edit_settings(&EditSettings, window, cx)
+                                    });
+                                }),
+                        ),
+                    )
+            };
             let section = |title: &'static str, setting: Div| {
                 div()
                     .flex()
@@ -1162,7 +1274,8 @@ impl IdeShell {
                                         .update(cx, |shell, cx| shell.set_vim_mode(*enabled, cx));
                                 }),
                         ),
-                    )),
+                    ))
+                    .child(section("CUSTOMIZATION", settings_file)),
             )
         });
     }
@@ -1568,6 +1681,26 @@ impl IdeShell {
         line.width + LINE_NUMBER_PADDING
     }
 
+    fn render_brace_guide(&self, cx: &App) -> impl IntoElement {
+        let editor = self.editor().clone();
+        let state = editor.read(cx);
+        let guide = BraceGuide::find(&state.text().to_string(), state.cursor());
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                if let Some(guide) = guide
+                    && let Some(geometry) = editor.read(cx).text_geometry()
+                {
+                    guide.paint(geometry, bounds, EDITOR_TEXT_SIZE, window);
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
     fn render_editor(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vim_context = self.vim.as_ref().map(VimInput::key_context);
         let area = div()
@@ -1620,6 +1753,7 @@ impl IdeShell {
                         .bg(theme::background())
                         .text_color(theme::text()),
                 )
+                .child(self.render_brace_guide(cx))
                 .child(
                     div()
                         .debug_selector(|| "fold-gutter".into())
@@ -1953,6 +2087,8 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::close_window))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::edit_settings))
+            .on_action(cx.listener(Self::reload_settings))
             .on_action(cx.listener(Self::show_folder_panel))
             .on_action(cx.listener(Self::toggle_terminal))
             .on_action(cx.listener(Self::show_git_panel))
@@ -1983,8 +2119,7 @@ impl Render for IdeShell {
                                     v_resizable("tool-panel-split")
                                         .with_state(&self.tool_panel_split)
                                         .child(
-                                            resizable_panel()
-                                                .child(self.render_editor(window, cx)),
+                                            resizable_panel().child(self.render_editor(window, cx)),
                                         )
                                         .child(
                                             resizable_panel()

@@ -144,7 +144,9 @@ fn insert(folds: &mut Vec<Fold>, range: Range<usize>) {
 fn line_span(text: &str, offset: usize) -> Range<usize> {
     let offset = offset.min(text.len());
     let start = text[..offset].rfind('\n').map_or(0, |ix| ix + 1);
-    let end = text[offset..].find('\n').map_or(text.len(), |ix| offset + ix);
+    let end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |ix| offset + ix);
     start..end
 }
 
@@ -164,10 +166,10 @@ fn display_spans(folds: &[Fold]) -> Vec<(Range<usize>, Range<usize>)> {
 fn display_to_source(folds: &[Fold], offset: usize, end_bias: bool) -> usize {
     let mut adjustment = 0isize;
     for (source, display) in display_spans(folds) {
-        if offset < display.start {
+        if offset <= display.start {
             break;
         }
-        if offset <= display.end {
+        if offset < display.end {
             return if end_bias { source.end } else { source.start };
         }
         adjustment += source.len() as isize - display.len() as isize;
@@ -213,13 +215,21 @@ fn common_suffix(a: &str, b: &str) -> usize {
         .sum()
 }
 
-fn foldable_ranges(source: &str) -> impl Iterator<Item = Range<usize>> + '_ {
-    brace_ranges(source)
+pub fn active_pair(source: &str, cursor: usize) -> Option<(usize, usize)> {
+    brace_pairs(source)
         .into_iter()
+        .filter(|&(open, close)| open <= cursor && cursor <= close + 1)
+        .min_by_key(|&(open, close)| close - open)
+}
+
+fn foldable_ranges(source: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    brace_pairs(source)
+        .into_iter()
+        .map(|(open, close)| open + 1..close)
         .filter(|range| source[range.clone()].contains('\n'))
 }
 
-fn brace_ranges(source: &str) -> Vec<Range<usize>> {
+fn brace_pairs(source: &str) -> Vec<(usize, usize)> {
     #[derive(Clone, Copy)]
     enum State {
         Code,
@@ -231,7 +241,7 @@ fn brace_ranges(source: &str) -> Vec<Range<usize>> {
     let bytes = source.as_bytes();
     let mut state = State::Code;
     let mut stack = Vec::new();
-    let mut ranges = Vec::new();
+    let mut pairs = Vec::new();
     let mut ix = 0;
     while ix < bytes.len() {
         match state {
@@ -263,7 +273,7 @@ fn brace_ranges(source: &str) -> Vec<Range<usize>> {
                 b'{' => stack.push(ix),
                 b'}' => {
                     if let Some(open) = stack.pop() {
-                        ranges.push(open + 1..ix);
+                        pairs.push((open, ix));
                     }
                 }
                 _ => {}
@@ -292,7 +302,7 @@ fn brace_ranges(source: &str) -> Vec<Range<usize>> {
         }
         ix += 1;
     }
-    ranges
+    pairs
 }
 
 #[cfg(test)]
@@ -352,17 +362,17 @@ mod tests {
     fn cursor_toggle_folds_the_innermost_enclosing_block() {
         let mut folds = Vec::new();
         let cursor = SOURCE.find("run").unwrap();
-        let toggle = toggle(SOURCE, &mut folds, cursor).unwrap();
-        assert!(toggle.folded);
+        let folded = toggle(SOURCE, &mut folds, cursor).unwrap();
+        assert!(folded.folded);
         let displayed = projected(SOURCE, &folds);
         assert_eq!(
             displayed,
             "fn main() {\n  if ready {...}\n  let s = S { a: 1 };\n}\n"
         );
-        assert_eq!(toggle.cursor, displayed.find(PLACEHOLDER).unwrap());
+        assert_eq!(folded.cursor, displayed.find(PLACEHOLDER).unwrap());
 
-        let toggle = toggle(SOURCE, &mut folds, toggle.cursor + 1).unwrap();
-        assert!(!toggle.folded);
+        let unfolded = toggle(SOURCE, &mut folds, folded.cursor + 1).unwrap();
+        assert!(!unfolded.folded);
         assert_eq!(projected(SOURCE, &folds), SOURCE);
     }
 
@@ -397,6 +407,19 @@ mod tests {
     }
 
     #[test]
+    fn typing_next_to_a_placeholder_keeps_the_hidden_source() {
+        let source = "a { hidden } z";
+        let mut folds = vec![Fold { range: 3..11 }];
+        let updated = apply_edit(source, &mut folds, "a {...!} z").unwrap();
+        assert_eq!(updated, "a { hidden !} z");
+        assert_eq!(projected(&updated, &folds), "a {...!} z");
+
+        let updated = apply_edit(&updated, &mut folds, "a {?...!} z").unwrap();
+        assert_eq!(updated, "a {? hidden !} z");
+        assert_eq!(projected(&updated, &folds), "a {?...!} z");
+    }
+
+    #[test]
     fn an_edit_through_a_placeholder_unfolds_that_range() {
         let source = "a { hidden } z";
         let mut folds = vec![Fold { range: 3..11 }];
@@ -411,9 +434,54 @@ mod tests {
         let toggle = toggle_line(SOURCE, &mut folds, 0).unwrap();
         let folded = edited(SOURCE, &toggle);
 
-        assert_eq!(apply_edit(SOURCE, &mut folds, SOURCE).as_deref(), Some(SOURCE));
+        assert_eq!(
+            apply_edit(SOURCE, &mut folds, SOURCE).as_deref(),
+            Some(SOURCE)
+        );
         assert!(folds.is_empty());
         assert_eq!(apply_edit(SOURCE, &mut folds, &folded), None);
         assert_eq!(projected(SOURCE, &folds), folded);
+    }
+
+    fn pair_text(source: &str, cursor: usize) -> Option<&str> {
+        active_pair(source, cursor).map(|(open, close)| &source[open..=close])
+    }
+
+    #[test]
+    fn active_pair_is_the_innermost_block_around_the_cursor() {
+        let cursor = SOURCE.find("run").unwrap();
+        assert_eq!(pair_text(SOURCE, cursor), Some("{\n    run();\n  }"));
+        let cursor = SOURCE.find("let").unwrap();
+        assert_eq!(
+            pair_text(SOURCE, cursor),
+            Some(&SOURCE[10..SOURCE.len() - 1])
+        );
+        assert_eq!(pair_text(SOURCE, 0), None);
+    }
+
+    #[test]
+    fn active_pair_includes_braces_touching_the_cursor() {
+        let open = SOURCE.find("{ a").unwrap();
+        let close = SOURCE.find("1 }").unwrap() + 2;
+        assert_eq!(pair_text(SOURCE, open), Some("{ a: 1 }"));
+        assert_eq!(pair_text(SOURCE, open + 1), Some("{ a: 1 }"));
+        assert_eq!(pair_text(SOURCE, close), Some("{ a: 1 }"));
+        assert_eq!(pair_text(SOURCE, close + 1), Some("{ a: 1 }"));
+        assert_eq!(
+            pair_text(SOURCE, SOURCE.len() - 1),
+            Some(&SOURCE[10..SOURCE.len() - 1])
+        );
+        assert_eq!(pair_text(SOURCE, SOURCE.len()), None);
+    }
+
+    #[test]
+    fn active_pair_ignores_braces_in_strings_and_comments() {
+        let source = "fn f() {\n  let text = \"{\"; // }\n  work();\n}";
+        let cursor = source.find("work").unwrap();
+        assert_eq!(pair_text(source, cursor), Some(&source[7..]));
+        assert_eq!(
+            pair_text(source, source.find("\"{").unwrap() + 1),
+            Some(&source[7..])
+        );
     }
 }

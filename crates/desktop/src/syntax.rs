@@ -1,6 +1,7 @@
 use std::{ffi::OsStr, path::Path};
 
 use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 #[path = "syntax_tests.rs"]
@@ -27,7 +28,8 @@ const TSX_HIGHLIGHTS: &str = concat!(
 );
 const ZIG_HIGHLIGHTS: &str = include_str!("syntax/zig.scm");
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Token {
     Keyword,
     Declaration,

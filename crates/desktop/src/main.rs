@@ -1,10 +1,12 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod assets;
+mod brace_guide;
 mod commands;
 mod diff_view;
 mod folding;
 mod git_panel;
+mod settings;
 mod shell;
 mod syntax;
 mod terminal_view;
@@ -14,7 +16,7 @@ mod vim;
 
 use assets::Assets;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
-use gpui_component::{Root, ThemeMode, TitleBar};
+use gpui_component::{Root, TitleBar};
 use shell::IdeShell;
 
 fn main() {
@@ -22,8 +24,7 @@ fn main() {
         gpui_component::init(cx);
         syntax::init();
         theme::init_fonts(cx);
-        theme::set_mode(ThemeMode::Dark, None, cx);
-        commands::init(cx);
+        let settings_status = settings::summary(&settings::init(cx));
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -41,7 +42,13 @@ fn main() {
             },
             |window, cx| {
                 window.set_window_title("Hephaestus");
-                let shell = gpui::AppContext::new(cx, |cx| IdeShell::new(window, cx));
+                let shell = gpui::AppContext::new(cx, |cx| {
+                    let mut shell = IdeShell::new(window, cx);
+                    if let Some(status) = settings_status {
+                        shell.set_status(status);
+                    }
+                    shell
+                });
                 let weak_shell = shell.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     weak_shell
