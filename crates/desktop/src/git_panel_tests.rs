@@ -3,6 +3,7 @@ use std::{fs, process::Command};
 use super::*;
 use gpui::{TestAppContext, VisualTestContext};
 use gpui_component::{Root, ThemeMode};
+use ide_core::git::LineKind;
 
 fn setup(cx: &mut TestAppContext) -> (Entity<GitPanel>, &mut VisualTestContext) {
     cx.update(|cx| {
@@ -81,8 +82,8 @@ fn rows(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) -> Vec<String> {
 }
 
 fn diff_text(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) -> Vec<String> {
-    cx.read(|cx| match &panel.read(cx).diff {
-        Some((_, Ok(diff))) => diff
+    cx.read(|cx| match panel.read(cx).diff_view.read(cx).loaded() {
+        Some(Ok(diff)) => diff
             .lines
             .iter()
             .filter(|line| matches!(line.kind, LineKind::Added | LineKind::Removed))
@@ -95,10 +96,7 @@ fn diff_text(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) -> Vec<String
                 format!("{sign}{}", line.text)
             })
             .collect(),
-        other => panic!(
-            "no diff: {:?}",
-            other.as_ref().map(|(_, diff)| diff.is_ok())
-        ),
+        other => panic!("no diff: {:?}", other.map(Result::is_ok)),
     })
 }
 
@@ -190,7 +188,7 @@ fn lists_changes_shows_diffs_stages_and_commits(cx: &mut TestAppContext) {
     assert!(notice(&panel, cx).unwrap().contains("Call run"));
     cx.read(|cx| assert_eq!(panel.read(cx).commit_message.read(cx).value(), ""));
     assert_eq!(rows(&panel, cx), ["Changes (1)", " U notes.txt"]);
-    cx.read(|cx| assert!(panel.read(cx).diff.is_none()));
+    cx.read(|cx| assert!(panel.read(cx).diff_view.read(cx).target().is_none()));
 }
 
 #[gpui::test]

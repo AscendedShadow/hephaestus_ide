@@ -1,16 +1,11 @@
-//! Small building blocks shared by the shell and its panels.
-
 use gpui::{Div, FontWeight, SharedString, div, prelude::*, px};
 
 use crate::theme;
 
-/// Height of every panel header, so neighbouring panels line up.
 pub const HEADER_HEIGHT: f32 = 34.;
 
-/// Group name for rows whose actions appear on hover.
 pub const ROW_GROUP: &str = "row";
 
-/// A panel header strip: caption on the left, actions on the right.
 pub fn panel_header(caption_text: impl Into<SharedString>) -> Div {
     div()
         .h(px(HEADER_HEIGHT))
@@ -23,7 +18,6 @@ pub fn panel_header(caption_text: impl Into<SharedString>) -> Div {
         .child(caption(caption_text).flex_1().min_w_0().truncate())
 }
 
-/// Small uppercase label for panels and list sections.
 pub fn caption(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(11.))
@@ -32,7 +26,6 @@ pub fn caption(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// Rounded pill showing a count next to a section title.
 pub fn count_badge(count: usize) -> Div {
     div()
         .h(px(16.))
@@ -50,7 +43,6 @@ pub fn count_badge(count: usize) -> Div {
         .child(count.to_string())
 }
 
-/// Centred placeholder for panels with nothing to show yet.
 pub fn empty_state(icon: impl IntoElement, title: impl Into<SharedString>) -> Div {
     div()
         .flex()

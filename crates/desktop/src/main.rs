@@ -2,6 +2,7 @@
 
 mod assets;
 mod commands;
+mod diff_view;
 mod folding;
 mod git_panel;
 mod shell;

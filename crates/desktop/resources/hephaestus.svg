@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b1d21"/>
+      <stop offset="1" stop-color="#0a0b0d"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="40" y1="20" x2="210" y2="236" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f7f8fa"/>
+      <stop offset="0.5" stop-color="#bcc2ca"/>
+      <stop offset="1" stop-color="#7d848e"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <radialGradient id="heat" cx="88" cy="136" r="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="0.75" y="0.75" width="254.5" height="254.5" rx="55.25" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+
+  <g transform="translate(128 132) scale(0.92) translate(-128 -132)">
+  <g fill="url(#bg)" stroke="url(#silver)" stroke-width="4.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M198 100 C210 104 214 116 212 130 C211 138 210 144 210 152 L194 152 C194 142 192 130 188 120 Z"/>
+    <path d="M124 100 C136 90 148 86 160 86 C172 86 184 90 196 100 C204 108 196 118 190 118 C188 130 186 142 186 156 L134 156 C134 142 132 130 130 118 C122 116 116 106 124 100 Z"/>
+    <path d="M190 96 C176 112 150 136 134 150" fill="none"/>
+    <path d="M178 116 L164 130 M186 126 L170 142" fill="none" stroke-width="3"/>
+    <path d="M136 118 C144 126 154 126 160 118" fill="none" stroke-width="3"/>
+    <path d="M128 115 C114 116 100 114 92 110 C85 106 81 100 82 92 C82 82 83 74 84 64 L99 64 C99 72 100 80 104 88 C108 80 122 80 132 94 Z"/>
+    <g transform="rotate(-12 92 58)">
+      <path d="M92 50 V28" fill="none"/>
+      <path d="M68 10 H74 V13 H110 V10 H116 V32 H110 V29 H74 V32 H68 Z"/>
+      <rect x="82" y="48" width="20" height="19" rx="6"/>
+    </g>
+    <path d="M144 56 C144 44 150 38 160 38 C170 38 176 44 176 56 C176 70 170 80 160 80 C150 80 144 70 144 56 Z"/>
+    <path d="M144 58 C144 70 146 84 152 94 C155 99 158 102 160 102 C162 102 165 99 168 94 C174 84 176 70 176 58 C172 64 170 72 166 74 C162 70 158 70 154 74 C150 72 148 64 144 58 Z"/>
+    <path d="M142 60 C136 54 136 44 142 38 C142 30 150 25 156 27 C160 23 168 24 171 29 C178 30 183 38 181 45 C185 50 183 58 178 60 C177 52 172 46 166 46 C162 50 156 50 152 46 C147 48 144 54 142 60 Z"/>
+    <path d="M152 56 L156 56 M164 56 L168 56 M160 58 L160 66" fill="none" stroke-width="3"/>
+    <path d="M152 70 C154 67 158 67 160 69 C162 67 166 67 168 70" fill="none" stroke-width="2.5"/>
+    <path d="M153 84 C154 88 156 91 158 93 M167 84 C166 88 164 91 162 93 M149 76 C149 80 150 84 152 86 M171 76 C171 80 170 84 168 86" fill="none" stroke-width="2.5"/>
+    <rect x="196" y="134" width="22" height="20" rx="7"/>
+    <path d="M70 150 H214 V170 H192 C180 170 176 176 176 186 V194 C176 202 184 206 198 208 V222 H92 V208 C106 206 114 202 114 194 V186 C114 176 108 172 96 172 C72 172 50 164 34 154 C31 152 32 150 36 150 Z"/>
+  </g>
+
+  </g>
+  <rect width="256" height="256" rx="56" fill="url(#heat)"/>
+  <g transform="translate(128 132) scale(0.92) translate(-128 -132)">
+
+  <g transform="translate(-5 0)">
+  <g filter="url(#glow)" stroke="#ffffff" fill="none" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M70 120 C64 120 62 122 62 127 V131 C62 134 60 135 56 135 C60 135 62 136 62 139 V143 C62 146 64 148 70 148"/>
+    <path d="M106 120 C112 120 114 122 114 127 V131 C114 134 116 135 120 135 C116 135 114 136 114 139 V143 C114 146 112 148 106 148"/>
+    <g fill="#ffffff" stroke="none">
+      <circle cx="78" cy="143" r="3.2"/>
+      <circle cx="88" cy="143" r="3.2"/>
+      <circle cx="98" cy="143" r="3.2"/>
+    </g>
+  </g>
+
+  <g stroke="#e9edf2" stroke-width="2.5" stroke-linecap="round">
+    <path d="M76 110 L70 104"/>
+    <path d="M88 108 L88 101"/>
+    <path d="M100 110 L106 104"/>
+    <path d="M64 116 L56 113"/>
+  </g>
+  </g>
+  </g>
+</svg>

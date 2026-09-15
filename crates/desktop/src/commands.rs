@@ -1,7 +1,10 @@
-use gpui::{App, KeyBinding, Menu, MenuItem, NoAction, actions};
+use std::rc::Rc;
+
+use gpui::{App, KeyBinding, KeyBindingContextPredicate, Menu, MenuItem, NoAction, actions};
 
 use crate::{
     git_panel,
+    shell::EDITOR_CONTEXT,
     terminal_view::{self, KEY_CONTEXT as TERMINAL},
     vim,
 };
@@ -39,6 +42,19 @@ pub fn init(cx: &mut App) {
     } else {
         ("ctrl-shift-c", "ctrl-shift-v")
     };
+    let keyboard_mapper = cx.keyboard_mapper().clone();
+    let editor = Rc::new(KeyBindingContextPredicate::parse(EDITOR_CONTEXT).unwrap());
+    let toggle_fold = |keys: String| {
+        KeyBinding::load(
+            &keys,
+            Box::new(ToggleFold),
+            Some(editor.clone()),
+            false,
+            None,
+            keyboard_mapper.as_ref(),
+        )
+        .unwrap()
+    };
     cx.bind_keys([
         KeyBinding::new(&format!("{modifier}-n"), NewFile, None),
         KeyBinding::new(&format!("{modifier}-o"), OpenFile, None),
@@ -56,7 +72,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-`", ToggleTerminal, None),
         KeyBinding::new(&format!("{modifier}-shift-g"), ShowGitPanel, None),
         KeyBinding::new(&format!("{modifier}-shift-d"), ShowDebugPanel, None),
-        KeyBinding::new(&format!("{modifier}-shift-["), ToggleFold, None),
+        toggle_fold(format!("{modifier}-shift-[")),
+        toggle_fold(format!("{modifier}-k {modifier}-l")),
         KeyBinding::new(
             "secondary-enter",
             git_panel::Commit,

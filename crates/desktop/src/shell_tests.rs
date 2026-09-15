@@ -41,14 +41,22 @@ fn dirty(shell: &Entity<IdeShell>, cx: &mut VisualTestContext) -> bool {
 fn tabs(shell: &Entity<IdeShell>, cx: &mut VisualTestContext) -> Vec<String> {
     cx.read(|cx| {
         let shell = shell.read(cx);
+        let marker = |active: bool| if active { "*" } else { "" };
         shell
             .buffers
             .iter()
             .enumerate()
             .map(|(ix, buffer)| {
-                let marker = if ix == shell.active { "*" } else { "" };
-                format!("{marker}{}", shell.tab_title(buffer))
+                let active = ix == shell.active && !shell.show_diff;
+                format!("{}{}", marker(active), shell.tab_title(buffer))
             })
+            .chain(
+                shell
+                    .diff_view
+                    .read(cx)
+                    .title()
+                    .map(|title| format!("{}{title}", marker(shell.show_diff))),
+            )
             .collect()
     })
 }
@@ -455,6 +463,53 @@ fn git_status_colors_the_tree_and_follows_saves(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert_eq!(tabs(&shell, cx), ["main.rs", "*notes.txt"]);
+}
+
+#[gpui::test]
+fn git_changes_open_their_diff_as_an_editor_tab(cx: &mut TestAppContext) {
+    use crate::git_panel::tests::{git, repository};
+
+    let directory = repository();
+    let root = directory.path().canonicalize().unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {\n    run();\n}\n").unwrap();
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let workspace = ide_core::workspace::Workspace::open(&root).unwrap();
+    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    cx.simulate_keystrokes(&primary("shift-g"));
+    cx.run_until_parked();
+    let click_change = |cx: &mut VisualTestContext| {
+        let row = cx.debug_bounds("git-row-1").unwrap();
+        cx.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+    };
+
+    click_change(cx);
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*main.rs (Unstaged)"]);
+    let diff = cx.debug_bounds("git-diff").unwrap();
+    assert!(diff.left() >= cx.debug_bounds("sidebar").unwrap().right());
+    cx.read(|cx| {
+        let diff_view = shell.read(cx).diff_view.read(cx);
+        assert!(matches!(diff_view.loaded(), Some(Ok(diff)) if !diff.lines.is_empty()));
+    });
+
+    cx.simulate_keystrokes("ctrl-tab");
+    assert_eq!(tabs(&shell, cx), ["*Untitled", "main.rs (Unstaged)"]);
+    cx.simulate_keystrokes("ctrl-shift-tab");
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*main.rs (Unstaged)"]);
+    let diff_tab = cx.debug_bounds("diff-tab").unwrap();
+    cx.simulate_click(diff_tab.center(), Modifiers::none());
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*main.rs (Unstaged)"]);
+
+    cx.simulate_keystrokes(&primary("w"));
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
+
+    click_change(cx);
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*main.rs (Unstaged)"]);
+    git(&root, &["commit", "-q", "-am", "Call run"]);
+    shell.update(cx, |shell, cx| shell.refresh_git(cx));
+    cx.run_until_parked();
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
 }
 
 #[gpui::test]

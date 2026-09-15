@@ -9,8 +9,15 @@ pub struct Fold {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Toggle {
+    pub edit: Range<usize>,
+    pub text: String,
     pub cursor: usize,
     pub folded: bool,
+}
+
+enum Change {
+    Fold(Range<usize>),
+    Unfold(usize),
 }
 
 pub fn projected(source: &str, folds: &[Fold]) -> String {
@@ -33,40 +40,15 @@ pub fn projected(source: &str, folds: &[Fold]) -> String {
 }
 
 pub fn toggle(source: &str, folds: &mut Vec<Fold>, display_cursor: usize) -> Option<Toggle> {
-    let spans = display_spans(folds);
-    if let Some((ix, _)) = spans
-        .iter()
-        .enumerate()
-        .find(|(_, (_, display))| display.start <= display_cursor && display_cursor <= display.end)
-    {
-        let cursor = folds[ix].range.start;
-        folds.remove(ix);
-        return Some(Toggle {
-            cursor: source_to_display(folds, cursor),
-            folded: false,
-        });
-    }
+    let change = unfold_at(folds, display_cursor)
+        .or_else(|| line_change(source, folds, display_cursor))
+        .or_else(|| enclosing_fold(source, folds, display_cursor))?;
+    Some(apply(source, folds, display_cursor, change))
+}
 
-    let source_cursor = display_to_source(folds, display_cursor, false);
-    let range = brace_ranges(source)
-        .into_iter()
-        .filter(|range| {
-            range.start.saturating_sub(1) <= source_cursor && source_cursor <= range.end
-        })
-        .min_by_key(Range::len)?;
-    if range.is_empty() {
-        return None;
-    }
-
-    folds.retain(|fold| fold.range.end <= range.start || fold.range.start >= range.end);
-    folds.push(Fold {
-        range: range.clone(),
-    });
-    folds.sort_by_key(|fold| fold.range.start);
-    Some(Toggle {
-        cursor: source_to_display(folds, range.start),
-        folded: true,
-    })
+pub fn toggle_line(source: &str, folds: &mut Vec<Fold>, display_offset: usize) -> Option<Toggle> {
+    let change = line_change(source, folds, display_offset)?;
+    Some(apply(source, folds, display_offset, change))
 }
 
 pub fn apply_edit(source: &str, folds: &mut Vec<Fold>, displayed: &str) -> Option<String> {
@@ -75,12 +57,13 @@ pub fn apply_edit(source: &str, folds: &mut Vec<Fold>, displayed: &str) -> Optio
         return None;
     }
 
-    let prefix = common_prefix(&previous, displayed);
-    let suffix = common_suffix(&previous[prefix..], &displayed[prefix..]);
-    let old_range = prefix..previous.len() - suffix;
-    let replacement = &displayed[prefix..displayed.len() - suffix];
+    let (old_range, replacement) = difference(&previous, displayed);
     let source_range = display_to_source(folds, old_range.start, false)
         ..display_to_source(folds, old_range.end, true);
+    if replacement == PLACEHOLDER && foldable_ranges(source).any(|range| range == source_range) {
+        insert(folds, source_range);
+        return None;
+    }
 
     let mut updated = source.to_string();
     updated.replace_range(source_range.clone(), replacement);
@@ -95,6 +78,74 @@ pub fn apply_edit(source: &str, folds: &mut Vec<Fold>, displayed: &str) -> Optio
         }
     });
     Some(updated)
+}
+
+fn unfold_at(folds: &[Fold], display_cursor: usize) -> Option<Change> {
+    display_spans(folds)
+        .iter()
+        .position(|(_, display)| display.start <= display_cursor && display_cursor <= display.end)
+        .map(Change::Unfold)
+}
+
+fn line_change(source: &str, folds: &[Fold], display_offset: usize) -> Option<Change> {
+    let line = line_span(&projected(source, folds), display_offset);
+    if let Some(ix) = display_spans(folds)
+        .iter()
+        .position(|(_, display)| line.contains(&display.start))
+    {
+        return Some(Change::Unfold(ix));
+    }
+
+    let source_line =
+        display_to_source(folds, line.start, false)..display_to_source(folds, line.end, false);
+    foldable_ranges(source)
+        .filter(|range| source_line.contains(&(range.start - 1)))
+        .min_by_key(|range| range.start)
+        .map(Change::Fold)
+}
+
+fn enclosing_fold(source: &str, folds: &[Fold], display_cursor: usize) -> Option<Change> {
+    let cursor = display_to_source(folds, display_cursor, false);
+    foldable_ranges(source)
+        .filter(|range| range.start <= cursor && cursor <= range.end)
+        .min_by_key(Range::len)
+        .map(Change::Fold)
+}
+
+fn apply(source: &str, folds: &mut Vec<Fold>, display_cursor: usize, change: Change) -> Toggle {
+    let before = projected(source, folds);
+    let cursor = display_to_source(folds, display_cursor, false);
+    let folded = match change {
+        Change::Fold(range) => {
+            insert(folds, range);
+            true
+        }
+        Change::Unfold(ix) => {
+            folds.remove(ix);
+            false
+        }
+    };
+    let after = projected(source, folds);
+    let (edit, text) = difference(&before, &after);
+    Toggle {
+        edit,
+        text: text.to_string(),
+        cursor: source_to_display(folds, cursor),
+        folded,
+    }
+}
+
+fn insert(folds: &mut Vec<Fold>, range: Range<usize>) {
+    folds.retain(|fold| fold.range.end <= range.start || fold.range.start >= range.end);
+    folds.push(Fold { range });
+    folds.sort_by_key(|fold| fold.range.start);
+}
+
+fn line_span(text: &str, offset: usize) -> Range<usize> {
+    let offset = offset.min(text.len());
+    let start = text[..offset].rfind('\n').map_or(0, |ix| ix + 1);
+    let end = text[offset..].find('\n').map_or(text.len(), |ix| offset + ix);
+    start..end
 }
 
 fn display_spans(folds: &[Fold]) -> Vec<(Range<usize>, Range<usize>)> {
@@ -138,6 +189,12 @@ fn source_to_display(folds: &[Fold], offset: usize) -> usize {
     offset.saturating_add_signed(-adjustment)
 }
 
+fn difference<'a>(old: &str, new: &'a str) -> (Range<usize>, &'a str) {
+    let prefix = common_prefix(old, new);
+    let suffix = common_suffix(&old[prefix..], &new[prefix..]);
+    (prefix..old.len() - suffix, &new[prefix..new.len() - suffix])
+}
+
 fn common_prefix(a: &str, b: &str) -> usize {
     a.char_indices()
         .zip(b.char_indices())
@@ -154,6 +211,12 @@ fn common_suffix(a: &str, b: &str) -> usize {
         .take_while(|(a, b)| a == b)
         .map(|(ch, _)| ch.len_utf8())
         .sum()
+}
+
+fn foldable_ranges(source: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    brace_ranges(source)
+        .into_iter()
+        .filter(|range| source[range.clone()].contains('\n'))
 }
 
 fn brace_ranges(source: &str) -> Vec<Range<usize>> {
@@ -236,25 +299,86 @@ fn brace_ranges(source: &str) -> Vec<Range<usize>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn toggles_the_innermost_brace_body() {
-        let source = "fn main() {\n  if ready { run(); }\n}\n";
-        let mut folds = Vec::new();
-        let cursor = source.find("run").unwrap();
-        assert!(toggle(source, &mut folds, cursor).unwrap().folded);
-        assert_eq!(
-            projected(source, &folds),
-            "fn main() {\n  if ready {...}\n}\n"
-        );
+    const SOURCE: &str = "fn main() {\n  if ready {\n    run();\n  }\n  let s = S { a: 1 };\n}\n";
 
-        let dots = projected(source, &folds).find(PLACEHOLDER).unwrap() + 1;
-        assert!(!toggle(source, &mut folds, dots).unwrap().folded);
-        assert_eq!(projected(source, &folds), source);
+    fn line_start(text: &str, line: usize) -> usize {
+        text.split_inclusive('\n').take(line).map(str::len).sum()
+    }
+
+    fn edited(before: &str, toggle: &Toggle) -> String {
+        let mut text = before.to_string();
+        text.replace_range(toggle.edit.clone(), &toggle.text);
+        text
+    }
+
+    #[test]
+    fn line_toggle_folds_the_block_that_opens_on_that_line() {
+        let mut folds = Vec::new();
+        let toggle = toggle_line(SOURCE, &mut folds, line_start(SOURCE, 1)).unwrap();
+        assert!(toggle.folded);
+        let displayed = projected(SOURCE, &folds);
+        assert_eq!(
+            displayed,
+            "fn main() {\n  if ready {...}\n  let s = S { a: 1 };\n}\n"
+        );
+        assert_eq!(edited(SOURCE, &toggle), displayed);
+        assert_eq!(toggle.cursor, line_start(&displayed, 1));
+
+        let toggle = toggle_line(SOURCE, &mut folds, line_start(&displayed, 1)).unwrap();
+        assert!(!toggle.folded);
+        assert_eq!(edited(&displayed, &toggle), SOURCE);
+        assert!(folds.is_empty());
+    }
+
+    #[test]
+    fn line_toggle_needs_a_multi_line_block_on_that_line() {
+        let mut folds = Vec::new();
+        assert!(toggle_line(SOURCE, &mut folds, line_start(SOURCE, 2)).is_none());
+        assert!(toggle_line(SOURCE, &mut folds, line_start(SOURCE, 4)).is_none());
+        assert!(folds.is_empty());
+    }
+
+    #[test]
+    fn folding_an_outer_block_replaces_nested_folds() {
+        let mut folds = Vec::new();
+        toggle_line(SOURCE, &mut folds, line_start(SOURCE, 1)).unwrap();
+        toggle_line(SOURCE, &mut folds, 0).unwrap();
+        assert_eq!(projected(SOURCE, &folds), "fn main() {...}\n");
+        toggle_line(SOURCE, &mut folds, 0).unwrap();
+        assert_eq!(projected(SOURCE, &folds), SOURCE);
+    }
+
+    #[test]
+    fn cursor_toggle_folds_the_innermost_enclosing_block() {
+        let mut folds = Vec::new();
+        let cursor = SOURCE.find("run").unwrap();
+        let toggle = toggle(SOURCE, &mut folds, cursor).unwrap();
+        assert!(toggle.folded);
+        let displayed = projected(SOURCE, &folds);
+        assert_eq!(
+            displayed,
+            "fn main() {\n  if ready {...}\n  let s = S { a: 1 };\n}\n"
+        );
+        assert_eq!(toggle.cursor, displayed.find(PLACEHOLDER).unwrap());
+
+        let toggle = toggle(SOURCE, &mut folds, toggle.cursor + 1).unwrap();
+        assert!(!toggle.folded);
+        assert_eq!(projected(SOURCE, &folds), SOURCE);
+    }
+
+    #[test]
+    fn cursor_toggle_prefers_the_block_opening_on_the_cursor_line() {
+        let mut folds = Vec::new();
+        toggle(SOURCE, &mut folds, SOURCE.find("ready").unwrap()).unwrap();
+        assert_eq!(
+            projected(SOURCE, &folds),
+            "fn main() {\n  if ready {...}\n  let s = S { a: 1 };\n}\n"
+        );
     }
 
     #[test]
     fn ignores_braces_in_strings_and_comments() {
-        let source = "fn f() { let text = \"}\"; /* { */ work(); }";
+        let source = "fn f() {\n  let text = \"}\"; /* { */\n  work();\n}";
         let mut folds = Vec::new();
         toggle(source, &mut folds, source.find("work").unwrap()).unwrap();
         assert_eq!(projected(source, &folds), "fn f() {...}");
@@ -279,5 +403,17 @@ mod tests {
         let updated = apply_edit(source, &mut folds, "a {new} z").unwrap();
         assert_eq!(updated, "a {new} z");
         assert!(folds.is_empty());
+    }
+
+    #[test]
+    fn undoing_and_redoing_a_fold_keeps_the_source() {
+        let mut folds = Vec::new();
+        let toggle = toggle_line(SOURCE, &mut folds, 0).unwrap();
+        let folded = edited(SOURCE, &toggle);
+
+        assert_eq!(apply_edit(SOURCE, &mut folds, SOURCE).as_deref(), Some(SOURCE));
+        assert!(folds.is_empty());
+        assert_eq!(apply_edit(SOURCE, &mut folds, &folded), None);
+        assert_eq!(projected(SOURCE, &folds), folded);
     }
 }

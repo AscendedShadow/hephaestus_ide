@@ -6,20 +6,19 @@ use std::{
 };
 
 use gpui::{
-    Context, Div, Entity, EventEmitter, FontWeight, IntoElement, ListHorizontalSizingBehavior,
-    Render, SharedString, Stateful, Task, UniformListScrollHandle, Window, actions, div,
-    prelude::*, px, uniform_list,
+    Context, Div, Entity, EventEmitter, FontWeight, IntoElement, Render, Stateful, Task,
+    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
-    resizable::{ResizableState, resizable_panel, v_resizable},
 };
-use ide_core::git::{self, Change, Diff, DiffLine, FileStatus, LineKind, Repository, Status};
+use ide_core::git::{self, Change, FileStatus, Repository, Status};
 
 use crate::{
     assets::AppIcon,
+    diff_view::DiffView,
     theme,
     ui::{self, ROW_GROUP},
 };
@@ -33,16 +32,16 @@ actions!(git, [Commit]);
 pub const COMMIT_CONTEXT: &str = "GitCommit";
 
 const ROW_HEIGHT: f32 = 24.;
-const DIFF_ROW_HEIGHT: f32 = 20.;
 
 pub enum GitPanelEvent {
     OpenFile(PathBuf),
+    ShowDiff,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Selection {
-    relative: String,
-    staged: bool,
+pub(crate) struct Selection {
+    pub(crate) relative: String,
+    pub(crate) staged: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -67,16 +66,12 @@ pub struct GitPanel {
     staged_count: usize,
     unstaged_count: usize,
     selected: Option<Selection>,
-    diff: Option<(Selection, Result<Diff, String>)>,
-    widest_line: usize,
+    diff_view: Entity<DiffView>,
     notice: Option<Notice>,
     busy: bool,
     commit_message: Entity<InputState>,
-    split: Entity<ResizableState>,
     list_scroll: UniformListScrollHandle,
-    diff_scroll: UniformListScrollHandle,
     refresh_task: Option<Task<()>>,
-    diff_task: Option<Task<()>>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -98,8 +93,7 @@ impl GitPanel {
             staged_count: 0,
             unstaged_count: 0,
             selected: None,
-            diff: None,
-            widest_line: 0,
+            diff_view: cx.new(DiffView::new),
             notice: None,
             busy: false,
             commit_message: cx.new(|cx| {
@@ -107,12 +101,13 @@ impl GitPanel {
                     .auto_grow(1, 6)
                     .placeholder("Commit message")
             }),
-            split: cx.new(|_| ResizableState::default()),
             list_scroll: UniformListScrollHandle::new(),
-            diff_scroll: UniformListScrollHandle::new(),
             refresh_task: None,
-            diff_task: None,
         }
+    }
+
+    pub fn diff_view(&self) -> &Entity<DiffView> {
+        &self.diff_view
     }
 
     pub fn branch(&self) -> Option<String> {
@@ -235,8 +230,15 @@ impl GitPanel {
             .collect()
     }
 
-    fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
+    pub(crate) fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
         self.selected = Some(selection);
+        self.load_diff(cx);
+        cx.emit(GitPanelEvent::ShowDiff);
+        cx.notify();
+    }
+
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected = None;
         self.load_diff(cx);
         cx.notify();
     }
@@ -246,38 +248,16 @@ impl GitPanel {
             .selected
             .as_ref()
             .and_then(|selection| self.file(selection));
-        let (Some(repository), Some(selection), Some(file)) = (
+        match (
             self.repository.clone(),
             self.selected.clone(),
             file.cloned(),
-        ) else {
-            self.diff_task = None;
-            self.diff = None;
-            return;
-        };
-        let executor = cx.background_executor().clone();
-        self.diff_task = Some(cx.spawn(async move |this, cx| {
-            let staged = selection.staged;
-            let diff = executor
-                .spawn(async move { repository.diff(&file, staged) })
-                .await
-                .map_err(|error| error.to_string());
-            let _ = this.update(cx, |this, cx| {
-                let widest = diff.as_ref().ok().and_then(|diff| {
-                    (0..diff.lines.len()).max_by_key(|&ix| diff.lines[ix].text.chars().count())
-                });
-                if this
-                    .diff
-                    .as_ref()
-                    .is_none_or(|(shown, _)| *shown != selection)
-                {
-                    this.diff_scroll = UniformListScrollHandle::new();
-                }
-                this.widest_line = widest.unwrap_or(0);
-                this.diff = Some((selection, diff));
-                cx.notify();
-            });
-        }));
+        ) {
+            (Some(repository), Some(selection), Some(file)) => self
+                .diff_view
+                .update(cx, |view, cx| view.load(repository, selection, file, cx)),
+            _ => self.diff_view.update(cx, |view, cx| view.clear(cx)),
+        }
     }
 
     fn run<T: Send + 'static>(
@@ -486,7 +466,6 @@ impl GitPanel {
             .gap_2()
             .pr_1()
             .rounded_md();
-        // Row actions stay out of the way until the row is hovered or selected.
         let on_hover = |button: Button, shown: bool| {
             div()
                 .flex_shrink_0()
@@ -553,7 +532,8 @@ impl GitPanel {
                 let relative = file.relative.clone();
                 let moved = file.clone();
                 let color = theme::git_change(change);
-                row.pl_3()
+                row.debug_selector(move || format!("git-row-{ix}"))
+                    .pl_3()
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::hover()))
                     .when(selected, |row| row.bg(theme::active_row()))
@@ -621,150 +601,6 @@ impl GitPanel {
             }
         }
     }
-
-    fn render_diff(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let shown = match (&self.selected, &self.diff) {
-            (Some(selected), Some((shown, diff))) if selected == shown => Some(diff),
-            _ => None,
-        };
-        let message = |text: SharedString| {
-            div()
-                .p_3()
-                .text_xs()
-                .text_color(theme::muted())
-                .child(text)
-                .into_any_element()
-        };
-        let body = match shown {
-            None if self.selected.is_none() => message("Select a file to see its changes.".into()),
-            None => message("Loading diff…".into()),
-            Some(Err(error)) => div()
-                .p_3()
-                .text_color(theme::error())
-                .child(error.clone())
-                .into_any_element(),
-            Some(Ok(diff)) if diff.lines.is_empty() => message("No changes to show.".into()),
-            Some(Ok(diff)) => div()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    uniform_list(
-                        "git-diff",
-                        diff.lines.len(),
-                        cx.processor(|this, range: Range<usize>, _, _| {
-                            let Some((_, Ok(diff))) = &this.diff else {
-                                return Vec::new();
-                            };
-                            range
-                                .filter_map(|ix| diff.lines.get(ix))
-                                .map(render_diff_line)
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .size_full()
-                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                    .with_width_from_item(Some(self.widest_line))
-                    .track_scroll(self.diff_scroll.clone()),
-                )
-                .into_any_element(),
-        };
-        div()
-            .debug_selector(|| "git-diff".into())
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme::background())
-            .when_some(self.selected.as_ref(), |view, selection| {
-                view.child(
-                    div()
-                        .h(px(30.))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .border_b_1()
-                        .border_color(theme::border())
-                        .text_xs()
-                        .child(
-                            Icon::new(IconName::File)
-                                .size(px(14.))
-                                .flex_shrink_0()
-                                .text_color(theme::subtle()),
-                        )
-                        .child(div().min_w_0().truncate().child(selection.relative.clone()))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .px_1p5()
-                                .rounded_sm()
-                                .bg(theme::accent_wash())
-                                .text_color(theme::accent())
-                                .text_size(px(10.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(if selection.staged {
-                                    "STAGED"
-                                } else {
-                                    "UNSTAGED"
-                                }),
-                        ),
-                )
-            })
-            .child(body)
-    }
-}
-
-fn render_diff_line(line: &DiffLine) -> Div {
-    let (background, sign, color, sign_color) = match line.kind {
-        LineKind::Added => (
-            Some(theme::diff_added()),
-            "+",
-            theme::text(),
-            theme::git_change(Change::Added),
-        ),
-        LineKind::Removed => (
-            Some(theme::diff_removed()),
-            "-",
-            theme::text(),
-            theme::git_change(Change::Untracked),
-        ),
-        LineKind::Hunk => (
-            Some(theme::diff_hunk()),
-            "",
-            theme::accent(),
-            theme::accent(),
-        ),
-        LineKind::Context => (None, "", theme::text(), theme::text()),
-        LineKind::Meta | LineKind::Note => (None, "", theme::muted(), theme::muted()),
-    };
-    let number = |number: Option<u32>| {
-        div()
-            .w(px(44.))
-            .flex_shrink_0()
-            .pr_2()
-            .text_right()
-            .text_color(theme::subtle())
-            .child(number.map(|number| number.to_string()).unwrap_or_default())
-    };
-    div()
-        .w_full()
-        .h(px(DIFF_ROW_HEIGHT))
-        .flex()
-        .items_center()
-        .whitespace_nowrap()
-        .font(theme::monospace_font())
-        .text_size(px(13.))
-        .when_some(background, |row, background| row.bg(background))
-        .child(number(line.old_line))
-        .child(number(line.new_line))
-        .child(
-            div()
-                .w(px(16.))
-                .flex_shrink_0()
-                .text_color(sign_color)
-                .child(sign),
-        )
-        .child(div().pr_4().text_color(color).child(line.text.clone()))
 }
 
 impl Render for GitPanel {
@@ -813,16 +649,7 @@ impl Render for GitPanel {
             })
             .into_any_element()
         } else {
-            v_resizable("git-split")
-                .with_state(&self.split)
-                .child(
-                    resizable_panel()
-                        .size(px(320.))
-                        .size_range(px(160.)..px(640.))
-                        .child(self.render_changes(cx)),
-                )
-                .child(resizable_panel().child(self.render_diff(cx)))
-                .into_any_element()
+            self.render_changes(cx).into_any_element()
         };
         let has_repository = self.repository.is_some();
         div()

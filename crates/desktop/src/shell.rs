@@ -6,13 +6,14 @@ use std::{
 };
 
 use gpui::{
-    Action, App, ClickEvent, Context, Div, Entity, Focusable, FontWeight, IntoElement,
-    KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render, Stateful, Subscription,
-    UniformListScrollHandle, Window, div, linear_color_stop, linear_gradient, prelude::*, px, rgb,
-    uniform_list,
+    Action, App, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler as _, Focusable,
+    FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render,
+    Stateful, Subscription, TextRun, UniformListScrollHandle, Window, div, linear_color_stop,
+    linear_gradient, prelude::*, px, rgb, uniform_list,
 };
 use gpui_component::{
-    Disableable as _, Icon, IconName, Root, Sizable as _, ThemeMode, TitleBar, WindowExt as _,
+    Disableable as _, Icon, IconName, Root, RopeExt as _, Sizable as _, ThemeMode, TitleBar,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, Position, TabSize},
     menu::AppMenuBar,
@@ -30,7 +31,8 @@ use ide_core::{
 use crate::{
     assets::AppIcon,
     commands::*,
-    folding::{self, Fold},
+    diff_view::DiffView,
+    folding::{self, Fold, Toggle},
     git_panel::{GitPanel, GitPanelEvent},
     syntax,
     terminal_view::TerminalView,
@@ -43,7 +45,11 @@ use crate::{
 #[path = "shell_tests.rs"]
 mod tests;
 
+pub const EDITOR_CONTEXT: &str = "Editor";
 const INDENT_WIDTH: usize = 2;
+const EDITOR_TEXT_SIZE: Pixels = px(14.);
+const EDITOR_PADDING_LEFT: Pixels = px(12.);
+const LINE_NUMBER_PADDING: Pixels = px(6.);
 
 fn position_at(text: &str, offset: usize) -> Position {
     let offset = offset.min(text.len());
@@ -89,7 +95,6 @@ impl ToolPanel {
 const ACTIVITY_BAR_WIDTH: f32 = 44.;
 const TAB_GROUP: &str = "tab";
 
-/// Square icon button for the activity bar, with an accent rail when active.
 fn activity_item(
     id: &'static str,
     icon: Icon,
@@ -131,7 +136,6 @@ fn activity_item(
         .on_click(on_click)
 }
 
-/// Compact clickable item in the status bar.
 fn status_item(id: &'static str, active: bool) -> Stateful<Div> {
     div()
         .id(id)
@@ -152,7 +156,63 @@ fn status_item(id: &'static str, active: bool) -> Stateful<Div> {
         .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
 }
 
-/// The app mark: a small ember-coloured tile, after the god of the forge.
+fn editor_tab(id: impl Into<ElementId>, active: bool, icon: Icon, title: String) -> Stateful<Div> {
+    div()
+        .id(id)
+        .group(TAB_GROUP)
+        .relative()
+        .h_full()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap_2()
+        .pl_3()
+        .pr_1p5()
+        .border_r_1()
+        .border_color(theme::border())
+        .cursor_pointer()
+        .map(|tab| {
+            if active {
+                tab.bg(theme::background()).text_color(theme::text()).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.))
+                        .bg(theme::accent()),
+                )
+            } else {
+                tab.text_color(theme::muted())
+                    .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+            }
+        })
+        .child(icon.size(px(14.)).flex_shrink_0().text_color(if active {
+            theme::accent()
+        } else {
+            theme::subtle()
+        }))
+        .child(title)
+}
+
+fn tab_close_button(id: impl Into<ElementId>, hidden: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .text_color(theme::muted())
+        .when(hidden, |close| {
+            close
+                .invisible()
+                .group_hover(TAB_GROUP, |style| style.visible())
+        })
+        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+        .child(Icon::new(IconName::Close).size(px(12.)))
+}
+
 fn logo() -> Div {
     div()
         .size(px(18.))
@@ -166,10 +226,8 @@ fn logo() -> Div {
             linear_color_stop(rgb(0xffb057), 0.),
             linear_color_stop(rgb(0xf0523a), 1.),
         ))
-        .text_size(px(11.))
-        .font_weight(FontWeight::BOLD)
         .text_color(rgb(0xffffff))
-        .child("H")
+        .child(Icon::new(AppIcon::Anvil).size(px(14.)))
 }
 
 type BufferId = u64;
@@ -215,6 +273,8 @@ pub struct IdeShell {
     active_panel: ToolPanel,
     terminal: Entity<TerminalView>,
     git: Entity<GitPanel>,
+    diff_view: Entity<DiffView>,
+    show_diff: bool,
     pending: Option<PendingAction>,
     busy: bool,
     vim: Option<VimInput>,
@@ -224,6 +284,8 @@ pub struct IdeShell {
 
 impl IdeShell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let git = cx.new(|cx| GitPanel::new(window, cx));
+        let diff_view = git.read(cx).diff_view().clone();
         let mut shell = Self {
             buffers: Vec::new(),
             active: 0,
@@ -237,7 +299,9 @@ impl IdeShell {
             active_sidebar: SidebarPanel::default(),
             active_panel: ToolPanel::default(),
             terminal: cx.new(TerminalView::new),
-            git: cx.new(|cx| GitPanel::new(window, cx)),
+            git,
+            diff_view,
+            show_diff: false,
             pending: None,
             busy: false,
             vim: None,
@@ -254,9 +318,21 @@ impl IdeShell {
                             this.open(Some(path.clone()), window, cx);
                         }
                     }
+                    GitPanelEvent::ShowDiff => {
+                        if !this.blocked() {
+                            this.focus_diff(window, cx);
+                        }
+                    }
                 },
             ),
             cx.observe(&shell.git, |_, _, cx| cx.notify()),
+            cx.observe_in(&shell.diff_view, window, |this, diff_view, window, cx| {
+                if this.show_diff && diff_view.read(cx).target().is_none() {
+                    this.show_diff = false;
+                    this.focus_editor(window, cx);
+                }
+                cx.notify();
+            }),
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_git(cx);
@@ -340,6 +416,7 @@ impl IdeShell {
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = ix;
+        self.show_diff = false;
         let editor = self.editor().clone();
         editor.update(cx, |editor, cx| editor.focus(window, cx));
         if let Some(vim) = &mut self.vim {
@@ -414,7 +491,24 @@ impl IdeShell {
         } else {
             self.active.min(self.buffers.len() - 1)
         };
+        let show_diff = self.show_diff;
         self.activate(active, window, cx);
+        if show_diff {
+            self.focus_diff(window, cx);
+        }
+    }
+
+    fn focus_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_diff = true;
+        window.focus(&self.diff_view.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn close_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_diff = false;
+        self.git.update(cx, |git, cx| git.clear_selection(cx));
+        self.focus_editor(window, cx);
+        cx.notify();
     }
 
     pub fn can_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -835,16 +929,29 @@ impl IdeShell {
     }
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.request(PendingAction::CloseBuffer(self.buffer().id), window, cx);
+        if self.show_diff {
+            if !self.blocked() {
+                self.close_diff(window, cx);
+            }
+        } else {
+            self.request(PendingAction::CloseBuffer(self.buffer().id), window, cx);
+        }
     }
 
     fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.blocked() {
             return;
         }
-        let len = self.buffers.len() as isize;
-        let ix = (self.active as isize + step).rem_euclid(len) as usize;
-        self.activate(ix, window, cx);
+        let files = self.buffers.len();
+        let has_diff = self.diff_view.read(cx).target().is_some();
+        let current = if self.show_diff { files } else { self.active };
+        let len = (files + usize::from(has_diff)) as isize;
+        let ix = (current as isize + step).rem_euclid(len) as usize;
+        if ix == files {
+            self.focus_diff(window, cx);
+        } else {
+            self.activate(ix, window, cx);
+        }
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -864,21 +971,40 @@ impl IdeShell {
     }
 
     fn toggle_fold(&mut self, _: &ToggleFold, window: &mut Window, cx: &mut Context<Self>) {
-        if self.blocked() {
+        self.apply_fold(folding::toggle, window, cx);
+    }
+
+    fn fold_clicked_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor().read(cx);
+        if editor.focus_handle(cx).is_focused(window) && editor.cursor_position().character == 0 {
+            self.apply_fold(folding::toggle_line, window, cx);
+        }
+    }
+
+    fn apply_fold(
+        &mut self,
+        toggle: fn(&str, &mut Vec<Fold>, usize) -> Option<Toggle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.blocked() || self.show_diff {
             return;
         }
-        let cursor = self.editor().read(cx).cursor();
-        let active = self.active;
-        let source = self.buffers[active].document.text().to_string();
-        let Some(toggle) = folding::toggle(&source, &mut self.buffers[active].folds, cursor) else {
-            self.status = "No brace block at cursor".into();
+        let editor = self.editor().clone();
+        let cursor = editor.read(cx).cursor();
+        let buffer = &mut self.buffers[self.active];
+        let source = buffer.document.text().to_string();
+        let Some(toggle) = toggle(&source, &mut buffer.folds, cursor) else {
+            self.status = "No brace block here".into();
             cx.notify();
             return;
         };
-        let displayed = folding::projected(&source, &self.buffers[active].folds);
-        let position = position_at(&displayed, toggle.cursor);
-        self.editor().update(cx, |editor, cx| {
-            editor.set_value(displayed, window, cx);
+        let position = position_at(&folding::projected(&source, &buffer.folds), toggle.cursor);
+        editor.update(cx, |editor, cx| {
+            let text = editor.text();
+            let range =
+                text.byte_to_utf16_idx(toggle.edit.start)..text.byte_to_utf16_idx(toggle.edit.end);
+            editor.replace_text_in_range(Some(range), &toggle.text, window, cx);
             editor.set_cursor_position(position, window, cx);
         });
         self.status = if toggle.folded {
@@ -1334,167 +1460,183 @@ impl IdeShell {
                     .enumerate()
                     .map(|(ix, buffer)| self.render_tab(ix, buffer, cx)),
             )
+            .when_some(self.diff_view.read(cx).title(), |tabs, title| {
+                tabs.child(self.render_diff_tab(title, cx))
+            })
     }
 
     fn render_tab(&self, ix: usize, buffer: &Buffer, cx: &mut Context<Self>) -> Stateful<Div> {
         let id = buffer.id;
-        let active = ix == self.active;
+        let active = ix == self.active && !self.show_diff;
         let dirty = buffer.dirty;
-        // The close button stays hidden until hovered, except on a clean
-        // active tab; a dirty tab shows its dot in the same spot instead.
         let close_hidden = dirty || !active;
-        div()
-            .id(("tab", id))
-            .group(TAB_GROUP)
-            .relative()
-            .h_full()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap_2()
-            .pl_3()
-            .pr_1p5()
-            .border_r_1()
-            .border_color(theme::border())
-            .cursor_pointer()
-            .map(|tab| {
-                if active {
-                    tab.bg(theme::background()).text_color(theme::text()).child(
+        editor_tab(
+            ("tab", id),
+            active,
+            Icon::new(IconName::File),
+            self.tab_title(buffer),
+        )
+        .child(
+            div()
+                .relative()
+                .size(px(18.))
+                .flex_shrink_0()
+                .when(dirty, |slot| {
+                    slot.child(
                         div()
                             .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .h(px(2.))
-                            .bg(theme::accent()),
-                    )
-                } else {
-                    tab.text_color(theme::muted())
-                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-                }
-            })
-            .child(
-                Icon::new(IconName::File)
-                    .size(px(14.))
-                    .flex_shrink_0()
-                    .text_color(if active {
-                        theme::accent()
-                    } else {
-                        theme::subtle()
-                    }),
-            )
-            .child(self.tab_title(buffer))
-            .child(
-                div()
-                    .relative()
-                    .size(px(18.))
-                    .flex_shrink_0()
-                    .when(dirty, |slot| {
-                        slot.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .group_hover(TAB_GROUP, |style| style.invisible())
-                                .child(div().size(px(8.)).rounded_full().bg(theme::accent())),
-                        )
-                    })
-                    .child(
-                        div()
-                            .id(("close-tab", id))
-                            .size_full()
+                            .inset_0()
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_sm()
-                            .text_color(theme::muted())
-                            .when(close_hidden, |close| {
-                                close
-                                    .invisible()
-                                    .group_hover(TAB_GROUP, |style| style.visible())
-                            })
-                            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-                            .child(Icon::new(IconName::Close).size(px(12.)))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.request(PendingAction::CloseBuffer(id), window, cx);
-                            })),
-                    ),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if !this.blocked()
-                    && let Some(ix) = this.buffer_index(id)
-                {
-                    this.activate(ix, window, cx);
+                            .group_hover(TAB_GROUP, |style| style.invisible())
+                            .child(div().size(px(8.)).rounded_full().bg(theme::accent())),
+                    )
+                })
+                .child(
+                    tab_close_button(("close-tab", id), close_hidden).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.request(PendingAction::CloseBuffer(id), window, cx);
+                        },
+                    )),
+                ),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if !this.blocked()
+                && let Some(ix) = this.buffer_index(id)
+            {
+                this.activate(ix, window, cx);
+            }
+        }))
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |this, _, window, cx| {
+                this.request(PendingAction::CloseBuffer(id), window, cx)
+            }),
+        )
+    }
+
+    fn render_diff_tab(&self, title: String, cx: &mut Context<Self>) -> Stateful<Div> {
+        let active = self.show_diff;
+        editor_tab("diff-tab", active, Icon::new(AppIcon::GitBranch), title)
+            .debug_selector(|| "diff-tab".into())
+            .child(div().size(px(18.)).flex_shrink_0().child(
+                tab_close_button("close-diff-tab", !active).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if !this.blocked() {
+                            this.close_diff(window, cx);
+                        }
+                    },
+                )),
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if !this.blocked() {
+                    this.focus_diff(window, cx);
                 }
             }))
             .on_mouse_down(
                 MouseButton::Middle,
-                cx.listener(move |this, _, window, cx| {
-                    this.request(PendingAction::CloseBuffer(id), window, cx)
+                cx.listener(|this, _, window, cx| {
+                    if !this.blocked() {
+                        this.close_diff(window, cx);
+                    }
                 }),
             )
     }
 
-    fn render_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn line_number_width(&self, window: &Window, cx: &App) -> Pixels {
+        let digits = match self.editor().read(cx).text().lines_len() {
+            0..=9999 => 5,
+            10000..=99999 => 6,
+            100000..=999999 => 7,
+            _ => 8,
+        };
+        let sample = "+".repeat(digits);
+        let run = TextRun {
+            len: sample.len(),
+            font: theme::monospace_font(),
+            color: theme::text().into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .shape_line(sample.into(), EDITOR_TEXT_SIZE, &[run], None);
+        line.width + LINE_NUMBER_PADDING
+    }
+
+    fn render_editor(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vim_context = self.vim.as_ref().map(VimInput::key_context);
-        div()
+        let area = div()
+            .key_context(EDITOR_CONTEXT)
             .size_full()
             .min_w_0()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(self.render_tabs(cx))
-            .child(
-                div()
-                    .h(px(28.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .pl_4()
-                    .pr_2()
-                    .bg(theme::background())
-                    .text_xs()
-                    .text_color(theme::muted())
-                    .child(self.render_breadcrumbs())
-                    .child(
-                        Button::new("toggle-fold")
-                            .label("Fold")
-                            .xsmall()
-                            .ghost()
-                            .disabled(self.blocked())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_fold(&ToggleFold, window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .when_some(vim_context, |editor, context| {
-                        editor
-                            .key_context(context)
-                            .capture_key_down(cx.listener(Self::editor_key_down))
-                    })
-                    .child(
-                        Input::new(self.editor())
-                            .h_full()
-                            .w_full()
-                            .bordered(false)
-                            .focus_bordered(false)
-                            .appearance(false)
-                            .disabled(self.blocked())
-                            .font_family(theme::mono_family())
-                            .text_size(px(14.))
-                            .bg(theme::background())
-                            .text_color(theme::text()),
-                    ),
-            )
+            .child(self.render_tabs(cx));
+        if self.show_diff {
+            return area.child(div().flex_1().min_h_0().child(self.diff_view.clone()));
+        }
+        area.child(
+            div()
+                .h(px(28.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl_4()
+                .pr_2()
+                .bg(theme::background())
+                .text_xs()
+                .text_color(theme::muted())
+                .child(self.render_breadcrumbs()),
+        )
+        .child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .when_some(vim_context, |editor, context| {
+                    editor
+                        .key_context(context)
+                        .capture_key_down(cx.listener(Self::editor_key_down))
+                })
+                .child(
+                    Input::new(self.editor())
+                        .h_full()
+                        .w_full()
+                        .pl(EDITOR_PADDING_LEFT)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .appearance(false)
+                        .disabled(self.blocked())
+                        .font_family(theme::mono_family())
+                        .text_size(EDITOR_TEXT_SIZE)
+                        .bg(theme::background())
+                        .text_color(theme::text()),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "fold-gutter".into())
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(EDITOR_PADDING_LEFT)
+                        .w(self.line_number_width(window, cx))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, window, cx| {
+                                cx.defer_in(window, Self::fold_clicked_line);
+                            }),
+                        ),
+                ),
+        )
     }
 
     fn toggle_terminal(&mut self, _: &ToggleTerminal, window: &mut Window, cx: &mut Context<Self>) {
@@ -1588,8 +1730,15 @@ impl IdeShell {
 }
 
 impl IdeShell {
+    fn active_tab(&self, cx: &App) -> (String, bool) {
+        match self.diff_view.read(cx).title() {
+            Some(title) if self.show_diff => (title, false),
+            _ => (self.document().name(), self.buffer().dirty),
+        }
+    }
+
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let buffer = self.buffer();
+        let (name, dirty) = self.active_tab(cx);
         TitleBar::new()
             .text_color(theme::text())
             .child(
@@ -1614,12 +1763,8 @@ impl IdeShell {
                     .text_xs()
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(buffer.document.name()),
-                    )
-                    .when(buffer.dirty, |title| {
+                    .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                    .when(dirty, |title| {
                         title.child(div().size(px(6.)).rounded_full().bg(theme::accent()))
                     })
                     .when(self.workspace.root().is_some(), |title| {
@@ -1756,39 +1901,37 @@ impl IdeShell {
                         this.show_debug_panel(&ShowDebugPanel, window, cx)
                     })),
             )
-            .child(divider())
-            .child(div().flex_shrink_0().px_1p5().child("UTF-8"))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px_1p5()
-                    .child(self.document().line_ending().label()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap_1p5()
-                    .px_1p5()
-                    .child(div().size(px(6.)).rounded_full().bg(if dirty {
-                        theme::accent()
-                    } else {
-                        theme::git_change(Change::Added)
-                    }))
-                    .child(if dirty { "Modified" } else { "Saved" }),
-            )
+            .when(!self.show_diff, |bar| {
+                bar.child(divider())
+                    .child(div().flex_shrink_0().px_1p5().child("UTF-8"))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_1p5()
+                            .child(self.document().line_ending().label()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1p5()
+                            .px_1p5()
+                            .child(div().size(px(6.)).rounded_full().bg(if dirty {
+                                theme::accent()
+                            } else {
+                                theme::git_change(Change::Added)
+                            }))
+                            .child(if dirty { "Modified" } else { "Saved" }),
+                    )
+            })
     }
 }
 
 impl Render for IdeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let buffer = self.buffer();
-        let name = format!(
-            "{}{}",
-            buffer.document.name(),
-            if buffer.dirty { " •" } else { "" }
-        );
+        let (name, dirty) = self.active_tab(cx);
+        let name = format!("{name}{}", if dirty { " •" } else { "" });
         window.set_window_title(&match self.workspace.root() {
             Some(_) => format!("{name} — {} — Hephaestus", self.workspace.display_name()),
             None => format!("{name} — Hephaestus"),
@@ -1839,7 +1982,10 @@ impl Render for IdeShell {
                                 .child(
                                     v_resizable("tool-panel-split")
                                         .with_state(&self.tool_panel_split)
-                                        .child(resizable_panel().child(self.render_editor(cx)))
+                                        .child(
+                                            resizable_panel()
+                                                .child(self.render_editor(window, cx)),
+                                        )
                                         .child(
                                             resizable_panel()
                                                 .size(px(200.))

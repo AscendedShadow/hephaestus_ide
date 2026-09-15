@@ -3,9 +3,9 @@ use std::borrow::Cow;
 use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
 
-/// Icons gpui-component does not bundle, served next to its own set.
 #[derive(Clone, Copy)]
 pub enum AppIcon {
+    Anvil,
     Bug,
     Files,
     GitBranch,
@@ -13,10 +13,17 @@ pub enum AppIcon {
 }
 
 impl AppIcon {
-    const ALL: [Self; 4] = [Self::Bug, Self::Files, Self::GitBranch, Self::Refresh];
+    const ALL: [Self; 5] = [
+        Self::Anvil,
+        Self::Bug,
+        Self::Files,
+        Self::GitBranch,
+        Self::Refresh,
+    ];
 
     fn svg(self) -> &'static str {
         match self {
+            Self::Anvil => include_str!("icons/anvil.svg"),
             Self::Bug => include_str!("icons/bug.svg"),
             Self::Files => include_str!("icons/files.svg"),
             Self::GitBranch => include_str!("icons/git-branch.svg"),
@@ -28,6 +35,7 @@ impl AppIcon {
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
         match self {
+            Self::Anvil => "icons/app/anvil.svg",
             Self::Bug => "icons/app/bug.svg",
             Self::Files => "icons/app/files.svg",
             Self::GitBranch => "icons/app/git-branch.svg",

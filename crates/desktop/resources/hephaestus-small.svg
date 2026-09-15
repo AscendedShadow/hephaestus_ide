@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b1d21"/>
+      <stop offset="1" stop-color="#0a0b0d"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="40" y1="20" x2="210" y2="236" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f7f8fa"/>
+      <stop offset="0.5" stop-color="#bcc2ca"/>
+      <stop offset="1" stop-color="#8a919b"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <radialGradient id="heat" cx="134" cy="84" r="110" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect width="256" height="256" rx="56" fill="url(#heat)"/>
+  <rect x="0.75" y="0.75" width="254.5" height="254.5" rx="55.25" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+  <path fill="url(#bg)" stroke="url(#silver)" stroke-width="15" stroke-linejoin="round" transform="matrix(0.92 0 0 0.92 11 42)" d="
+    M92 90 H216 V122 H192
+    C178 122 174 132 174 144 V156
+    C174 164 182 168 198 170 V194
+    H106 V170
+    C122 168 130 164 130 156 V144
+    C130 132 124 124 108 124
+    C84 124 58 112 38 96
+    C35 94 36 90 40 90
+    C60 90 78 90 92 90 Z"/>
+  <g stroke="#ffffff" fill="none" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M98 34 C88 34 84 38 84 48 V60 C84 66 80 70 70 70 C80 70 84 74 84 80 V92 C84 102 88 106 98 106"/>
+    <path d="M170 34 C180 34 184 38 184 48 V60 C184 66 188 70 198 70 C188 70 184 74 184 80 V92 C184 102 180 106 170 106"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="114" cy="96" r="8"/>
+    <circle cx="134" cy="96" r="8"/>
+    <circle cx="154" cy="96" r="8"/>
+  </g>
+</svg>

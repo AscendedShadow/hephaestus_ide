@@ -21,6 +21,9 @@ tree-sitter-rust.workspace = true
 tree-sitter-typescript.workspace = true
 tree-sitter-zig.workspace = true
 
+[build-dependencies]
+embed-resource.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 ropey.workspace = true

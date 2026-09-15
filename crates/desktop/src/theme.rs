@@ -19,7 +19,6 @@ const FALLBACK_MONO: &str = if cfg!(target_os = "windows") {
     "monospace"
 };
 
-/// Preferred code fonts, most modern first. The first one installed wins.
 const PREFERRED_MONO: [&str; 5] = [
     "Cascadia Mono",
     "JetBrains Mono",
@@ -48,7 +47,6 @@ pub fn set_mode(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
     theme.highlight_theme = Arc::new(highlight);
 }
 
-/// Picks the code font once the platform's font list is available.
 pub fn init_fonts(cx: &App) {
     let installed = cx.text_system().all_font_names();
     if let Some(family) = PREFERRED_MONO
@@ -59,8 +57,6 @@ pub fn init_fonts(cx: &App) {
     }
 }
 
-/// Repaints gpui-component's widgets (buttons, inputs, menus, dialogs,
-/// scrollbars) with the IDE palette so they match the hand-drawn chrome.
 fn apply_component_theme(theme: &mut Theme) {
     let dark = mode().is_dark();
     theme.radius = px(6.);
@@ -135,22 +131,18 @@ fn pick(dark: u32, light: u32) -> Rgba {
     rgb(if mode().is_dark() { dark } else { light })
 }
 
-/// Editor and terminal surface.
 pub fn background() -> Rgba {
     pick(0x1b1c21, 0xffffff)
 }
 
-/// Sidebars, the tab strip and tool panel headers.
 pub fn panel() -> Rgba {
     pick(0x16171b, 0xf6f7f9)
 }
 
-/// Outermost chrome: title bar, activity bar and status bar.
 pub fn chrome() -> Rgba {
     pick(0x121317, 0xeef0f3)
 }
 
-/// Menus, dialogs and other floating surfaces.
 pub fn elevated() -> Rgba {
     pick(0x222329, 0xffffff)
 }
@@ -183,7 +175,6 @@ pub fn muted() -> Rgba {
     pick(0x8b8f99, 0x676c78)
 }
 
-/// Quietest text: line numbers, separators, placeholder hints.
 pub fn subtle() -> Rgba {
     pick(0x575b64, 0xa3a7b0)
 }
@@ -192,7 +183,6 @@ pub fn accent() -> Rgba {
     pick(0x7c9cff, 0x3b6ef5)
 }
 
-/// Translucent accent wash for badges and highlighted banners.
 pub fn accent_wash() -> Hsla {
     Hsla::from(accent()).opacity(if mode().is_dark() { 0.14 } else { 0.1 })
 }
