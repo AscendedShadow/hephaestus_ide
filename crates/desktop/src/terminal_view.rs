@@ -337,7 +337,7 @@ impl Render for TerminalView {
             .on_scroll_wheel(cx.listener(Self::scroll_wheel))
             .children(intro.map(notice))
             .child(
-                div().flex_1().min_h_0().pl_2().pt_1().child(
+                div().flex_1().min_h_0().pl_3().pt_2().child(
                     canvas(
                         {
                             let view = view.clone();

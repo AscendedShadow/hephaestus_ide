@@ -6,19 +6,23 @@ use std::{
 };
 
 use gpui::{
-    Context, Div, Entity, EventEmitter, IntoElement, ListHorizontalSizingBehavior, Render,
-    SharedString, Stateful, Task, UniformListScrollHandle, Window, actions, div, prelude::*, px,
-    uniform_list,
+    Context, Div, Entity, EventEmitter, FontWeight, IntoElement, ListHorizontalSizingBehavior,
+    Render, SharedString, Stateful, Task, UniformListScrollHandle, Window, actions, div,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    Disableable as _, IconName, Sizable as _,
+    Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     resizable::{ResizableState, resizable_panel, v_resizable},
 };
 use ide_core::git::{self, Change, Diff, DiffLine, FileStatus, LineKind, Repository, Status};
 
-use crate::theme;
+use crate::{
+    assets::AppIcon,
+    theme,
+    ui::{self, ROW_GROUP},
+};
 
 #[cfg(test)]
 #[path = "git_panel_tests.rs"]
@@ -396,43 +400,17 @@ impl GitPanel {
             .flex_col()
             .child(
                 div()
-                    .h(px(28.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .child(
-                        div()
-                            .debug_selector(|| "git-branch".into())
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme::accent())
-                            .child(self.status.branch.label()),
-                    )
-                    .child(
-                        Button::new("git-refresh")
-                            .ghost()
-                            .xsmall()
-                            .label("Refresh")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    ),
-            )
-            .child(
-                div()
                     .key_context(COMMIT_CONTEXT)
                     .on_action(cx.listener(Self::commit))
                     .flex_shrink_0()
                     .flex()
-                    .items_start()
+                    .flex_col()
                     .gap_2()
-                    .px_2()
-                    .pb_2()
+                    .px_3()
+                    .pb_3()
                     .child(
                         div()
                             .debug_selector(|| "git-commit-message".into())
-                            .flex_1()
                             .min_w_0()
                             .child(Input::new(&self.commit_message).small()),
                     )
@@ -440,7 +418,13 @@ impl GitPanel {
                         Button::new("git-commit")
                             .primary()
                             .small()
-                            .label("Commit")
+                            .w_full()
+                            .icon(IconName::Check)
+                            .label(if self.staged_count > 0 {
+                                format!("Commit {} staged", self.staged_count)
+                            } else {
+                                "Commit".into()
+                            })
                             .tooltip(if cfg!(target_os = "macos") {
                                 "Commit staged changes (Cmd+Enter)"
                             } else {
@@ -460,17 +444,16 @@ impl GitPanel {
                 column.child(
                     div()
                         .flex_shrink_0()
-                        .px_2()
-                        .pb_1()
+                        .px_3()
+                        .pb_2()
+                        .text_xs()
                         .text_color(color)
                         .child(message.clone()),
                 )
             })
             .child(if self.rows.is_empty() {
-                div()
-                    .px_2()
-                    .text_color(theme::muted())
-                    .child("No changes")
+                ui::empty_state(Icon::new(IconName::CircleCheck).size(px(24.)), "No changes")
+                    .pt_4()
                     .into_any_element()
             } else {
                 div()
@@ -485,6 +468,7 @@ impl GitPanel {
                             }),
                         )
                         .size_full()
+                        .px_1p5()
                         .track_scroll(self.list_scroll.clone()),
                     )
                     .into_any_element()
@@ -494,28 +478,41 @@ impl GitPanel {
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         let row = div()
             .id(ix)
+            .group(ROW_GROUP)
             .w_full()
             .h(px(ROW_HEIGHT))
             .flex()
             .items_center()
             .gap_2()
-            .pr_2();
+            .pr_1()
+            .rounded_md();
+        // Row actions stay out of the way until the row is hovered or selected.
+        let on_hover = |button: Button, shown: bool| {
+            div()
+                .flex_shrink_0()
+                .when(!shown, |slot| {
+                    slot.invisible()
+                        .group_hover(ROW_GROUP, |style| style.visible())
+                })
+                .child(button)
+        };
         match self.rows[ix] {
             Row::Header { staged } => {
                 let (title, count, icon, tooltip) = if staged {
                     (
-                        "Staged Changes",
+                        "STAGED CHANGES",
                         self.staged_count,
                         IconName::Minus,
                         "Unstage all",
                     )
                 } else {
-                    ("Changes", self.unstaged_count, IconName::Plus, "Stage all")
+                    ("CHANGES", self.unstaged_count, IconName::Plus, "Stage all")
                 };
                 row.pl_2()
-                    .text_color(theme::muted())
-                    .child(div().flex_1().child(format!("{title} ({count})")))
-                    .child(
+                    .child(ui::caption(title))
+                    .child(ui::count_badge(count))
+                    .child(div().flex_1())
+                    .child(on_hover(
                         Button::new(("git-move-all", ix))
                             .ghost()
                             .xsmall()
@@ -526,7 +523,8 @@ impl GitPanel {
                                 let files = this.files(staged);
                                 this.move_files(files, staged, window, cx);
                             })),
-                    )
+                        false,
+                    ))
             }
             Row::File {
                 ix: file_ix,
@@ -554,22 +552,23 @@ impl GitPanel {
                 };
                 let relative = file.relative.clone();
                 let moved = file.clone();
-                row.pl(px(20.))
+                let color = theme::git_change(change);
+                row.pl_3()
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::border()))
-                    .when(selected, |row| row.bg(theme::border()))
+                    .hover(|style| style.bg(theme::hover()))
+                    .when(selected, |row| row.bg(theme::active_row()))
                     .child(
-                        div()
-                            .w(px(12.))
+                        Icon::new(IconName::File)
+                            .size(px(14.))
                             .flex_shrink_0()
-                            .text_color(theme::git_change(change))
-                            .child(change.letter()),
+                            .text_color(theme::subtle()),
                     )
                     .child(
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme::git_change(change))
+                            .text_color(color)
+                            .when(change == Change::Deleted, |name| name.line_through())
                             .child(name.to_string()),
                     )
                     .child(
@@ -577,11 +576,12 @@ impl GitPanel {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme::muted())
+                            .text_xs()
+                            .text_color(theme::subtle())
                             .child(detail),
                     )
                     .when(change != Change::Deleted, |row| {
-                        row.child(
+                        row.child(on_hover(
                             Button::new(("git-open", ix))
                                 .ghost()
                                 .xsmall()
@@ -591,9 +591,10 @@ impl GitPanel {
                                     cx.stop_propagation();
                                     this.open_file(&relative, cx);
                                 })),
-                        )
+                            selected,
+                        ))
                     })
-                    .child(
+                    .child(on_hover(
                         Button::new(("git-move", ix))
                             .ghost()
                             .xsmall()
@@ -604,6 +605,17 @@ impl GitPanel {
                                 cx.stop_propagation();
                                 this.move_files(vec![moved.clone()], staged, window, cx);
                             })),
+                        selected,
+                    ))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_shrink_0()
+                            .text_center()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(change.letter()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| this.select(selection.clone(), cx)))
             }
@@ -611,14 +623,6 @@ impl GitPanel {
     }
 
     fn render_diff(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.selected.as_ref().map(|selection| {
-            let side = if selection.staged {
-                "Staged"
-            } else {
-                "Unstaged"
-            };
-            format!("{} — {side}", selection.relative)
-        });
         let shown = match (&self.selected, &self.diff) {
             (Some(selected), Some((shown, diff))) if selected == shown => Some(diff),
             _ => None,
@@ -626,6 +630,7 @@ impl GitPanel {
         let message = |text: SharedString| {
             div()
                 .p_3()
+                .text_xs()
                 .text_color(theme::muted())
                 .child(text)
                 .into_any_element()
@@ -669,18 +674,40 @@ impl GitPanel {
             .flex()
             .flex_col()
             .bg(theme::background())
-            .when_some(title, |view, title| {
+            .when_some(self.selected.as_ref(), |view, selection| {
                 view.child(
                     div()
-                        .h(px(28.))
+                        .h(px(30.))
                         .flex_shrink_0()
                         .flex()
                         .items_center()
+                        .gap_2()
                         .px_3()
                         .border_b_1()
                         .border_color(theme::border())
-                        .text_color(theme::muted())
-                        .child(div().min_w_0().truncate().child(title)),
+                        .text_xs()
+                        .child(
+                            Icon::new(IconName::File)
+                                .size(px(14.))
+                                .flex_shrink_0()
+                                .text_color(theme::subtle()),
+                        )
+                        .child(div().min_w_0().truncate().child(selection.relative.clone()))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1p5()
+                                .rounded_sm()
+                                .bg(theme::accent_wash())
+                                .text_color(theme::accent())
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(if selection.staged {
+                                    "STAGED"
+                                } else {
+                                    "UNSTAGED"
+                                }),
+                        ),
                 )
             })
             .child(body)
@@ -688,12 +715,27 @@ impl GitPanel {
 }
 
 fn render_diff_line(line: &DiffLine) -> Div {
-    let (background, sign, color) = match line.kind {
-        LineKind::Added => (Some(theme::diff_added()), "+", theme::text()),
-        LineKind::Removed => (Some(theme::diff_removed()), "-", theme::text()),
-        LineKind::Hunk => (Some(theme::panel()), "", theme::accent()),
-        LineKind::Context => (None, "", theme::text()),
-        LineKind::Meta | LineKind::Note => (None, "", theme::muted()),
+    let (background, sign, color, sign_color) = match line.kind {
+        LineKind::Added => (
+            Some(theme::diff_added()),
+            "+",
+            theme::text(),
+            theme::git_change(Change::Added),
+        ),
+        LineKind::Removed => (
+            Some(theme::diff_removed()),
+            "-",
+            theme::text(),
+            theme::git_change(Change::Untracked),
+        ),
+        LineKind::Hunk => (
+            Some(theme::diff_hunk()),
+            "",
+            theme::accent(),
+            theme::accent(),
+        ),
+        LineKind::Context => (None, "", theme::text(), theme::text()),
+        LineKind::Meta | LineKind::Note => (None, "", theme::muted(), theme::muted()),
     };
     let number = |number: Option<u32>| {
         div()
@@ -701,7 +743,7 @@ fn render_diff_line(line: &DiffLine) -> Div {
             .flex_shrink_0()
             .pr_2()
             .text_right()
-            .text_color(theme::muted())
+            .text_color(theme::subtle())
             .child(number.map(|number| number.to_string()).unwrap_or_default())
     };
     div()
@@ -719,7 +761,7 @@ fn render_diff_line(line: &DiffLine) -> Div {
             div()
                 .w(px(16.))
                 .flex_shrink_0()
-                .text_color(color)
+                .text_color(sign_color)
                 .child(sign),
         )
         .child(div().pr_4().text_color(color).child(line.text.clone()))
@@ -727,39 +769,49 @@ fn render_diff_line(line: &DiffLine) -> Div {
 
 impl Render for GitPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let message = |text: String| div().p_3().text_color(theme::muted()).child(text);
+        let message = |text: String| div().px_4().py_2().text_color(theme::muted()).child(text);
         let body = if self.directory.is_none() {
-            message("Open a folder to see its Git changes.".into()).into_any_element()
+            ui::empty_state(
+                Icon::new(AppIcon::GitBranch).size(px(28.)),
+                "Open a folder to see its Git changes.",
+            )
+            .into_any_element()
         } else if let Some(error) = &self.load_error {
             div()
-                .p_3()
+                .px_4()
+                .py_2()
                 .text_color(theme::error())
                 .child(format!("Could not read the Git repository: {error}"))
                 .into_any_element()
         } else if !self.loaded {
             message("Loading…".into()).into_any_element()
         } else if self.repository.is_none() {
-            div()
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap_2()
-                .child(message("This folder is not in a Git repository.".into()))
-                .child(
-                    div().px_3().child(
-                        Button::new("git-init")
-                            .label("Initialize Repository")
-                            .disabled(self.busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.init_repository(window, cx)),
-                            ),
-                    ),
+            ui::empty_state(
+                Icon::new(AppIcon::GitBranch).size(px(28.)),
+                "This folder is not in a Git repository.",
+            )
+            .child(
+                div().pt_2().child(
+                    Button::new("git-init")
+                        .primary()
+                        .small()
+                        .label("Initialize Repository")
+                        .disabled(self.busy)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.init_repository(window, cx)),
+                        ),
+                ),
+            )
+            .when_some(self.notice.as_ref(), |view, notice| {
+                let (Notice::Info(text) | Notice::Error(text)) = notice;
+                view.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::muted())
+                        .child(text.clone()),
                 )
-                .when_some(self.notice.as_ref(), |view, notice| {
-                    let (Notice::Info(text) | Notice::Error(text)) = notice;
-                    view.child(message(text.clone()))
-                })
-                .into_any_element()
+            })
+            .into_any_element()
         } else {
             v_resizable("git-split")
                 .with_state(&self.split)
@@ -772,11 +824,47 @@ impl Render for GitPanel {
                 .child(resizable_panel().child(self.render_diff(cx)))
                 .into_any_element()
         };
+        let has_repository = self.repository.is_some();
         div()
             .debug_selector(|| "git-panel".into())
             .size_full()
             .overflow_hidden()
+            .flex()
+            .flex_col()
             .bg(theme::panel())
-            .child(body)
+            .child(
+                ui::panel_header("SOURCE CONTROL").when(has_repository, |header| {
+                    header
+                        .child(
+                            div()
+                                .debug_selector(|| "git-branch".into())
+                                .max_w(px(140.))
+                                .flex()
+                                .flex_shrink()
+                                .min_w_0()
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .h(px(20.))
+                                .rounded_sm()
+                                .bg(theme::accent_wash())
+                                .text_xs()
+                                .text_color(theme::accent())
+                                .child(Icon::new(AppIcon::GitBranch).size(px(12.)).flex_shrink_0())
+                                .child(
+                                    div().min_w_0().truncate().child(self.status.branch.label()),
+                                ),
+                        )
+                        .child(
+                            Button::new("git-refresh")
+                                .ghost()
+                                .xsmall()
+                                .icon(AppIcon::Refresh)
+                                .tooltip("Refresh")
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                        )
+                }),
+            )
+            .child(div().flex_1().min_h_0().child(body))
     }
 }
