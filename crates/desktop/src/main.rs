@@ -6,6 +6,7 @@ mod commands;
 mod diff_view;
 mod folding;
 mod git_panel;
+mod navigation;
 mod settings;
 mod shell;
 mod syntax;

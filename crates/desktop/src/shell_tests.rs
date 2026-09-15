@@ -1,7 +1,7 @@
 use super::*;
 use gpui::{
     Modifiers, MouseButton, Point, ScrollDelta, ScrollWheelEvent, TestAppContext,
-    VisualTestContext, point, size,
+    VisualTestContext, point, rgb, size,
 };
 use gpui_component::{Root, Theme, ThemeMode};
 use ide_core::vim::Mode;
@@ -341,6 +341,75 @@ fn clicking_a_line_number_toggles_the_block_opening_on_that_line(cx: &mut TestAp
     cx.read(|cx| assert_eq!(shell.read(cx).status, "No brace block here"));
 }
 
+const JUMP_SOURCE: &str = "mod inner {\n    pub fn deep() {}\n}\n\nfn helper() {}\n\nfn main() {\nhelper();\ndeep();\nCircle::new();\n}\n";
+
+fn shift_click_line(shell: &Entity<IdeShell>, line: usize, cx: &mut VisualTestContext) {
+    let geometry = cx
+        .read(|cx| shell.read(cx).editor().read(cx).text_geometry())
+        .unwrap();
+    let y = geometry.origin.y + geometry.line_height * (line as f32 + 0.5);
+    cx.simulate_click(point(geometry.origin.x + px(1.), y), Modifiers::shift());
+    cx.run_until_parked();
+}
+
+fn cursor(shell: &Entity<IdeShell>, cx: &mut VisualTestContext) -> Position {
+    cx.read(|cx| shell.read(cx).editor().read(cx).cursor_position())
+}
+
+#[gpui::test]
+fn shift_click_jumps_to_declarations_in_the_file_and_the_workspace(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let src = root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("main.rs"), JUMP_SOURCE).unwrap();
+    std::fs::write(
+        src.join("shapes.rs"),
+        "pub struct Circle;\n\nimpl Circle {\n    pub fn new() -> Self { Circle }\n}\n",
+    )
+    .unwrap();
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let workspace = Workspace::open(&root).unwrap();
+    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    let document = Document::open(&src.join("main.rs")).unwrap();
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_document(document, window, cx)
+    });
+    cx.run_until_parked();
+    let status = |cx: &mut VisualTestContext| cx.read(|cx| shell.read(cx).status.clone());
+
+    shift_click_line(&shell, 10, cx);
+    let selection = shell.update_in(cx, |shell, window, cx| {
+        shell.editor().update(cx, |editor, cx| {
+            editor.selected_text_range(false, window, cx)
+        })
+    });
+    assert_eq!(selection.unwrap().range, 0..JUMP_SOURCE.rfind('}').unwrap());
+
+    shift_click_line(&shell, 7, cx);
+    assert_eq!(cursor(&shell, cx), Position::new(4, 3));
+    assert_eq!(status(cx), "Declaration of helper — main.rs:5");
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.editor().update(cx, |editor, cx| {
+            editor.set_cursor_position(Position::new(0, 0), window, cx)
+        });
+    });
+    cx.dispatch_action(ToggleFold);
+    assert!(editor_text(&shell, cx).starts_with("mod inner {...}\n"));
+    shift_click_line(&shell, 6, cx);
+    assert_eq!(editor_text(&shell, cx), JUMP_SOURCE);
+    assert_eq!(text(&shell, cx), JUMP_SOURCE);
+    assert!(!dirty(&shell, cx));
+    assert_eq!(cursor(&shell, cx), Position::new(1, 11));
+
+    shift_click_line(&shell, 9, cx);
+    assert_eq!(tabs(&shell, cx), ["main.rs", "*shapes.rs"]);
+    assert_eq!(cursor(&shell, cx), Position::new(0, 11));
+    assert_eq!(status(cx), "Declaration of Circle — shapes.rs:1");
+}
+
 #[gpui::test]
 fn brace_guide_geometry_follows_editor_scrolling(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
@@ -580,6 +649,111 @@ fn terminal_shortcut_moves_focus_and_shell_keys_skip_app_shortcuts(cx: &mut Test
     assert!(!terminal_focused(cx));
     cx.simulate_keystrokes(&primary("n"));
     assert_eq!(tabs(&shell, cx), ["Untitled", "*Untitled"]);
+}
+
+#[gpui::test]
+fn clone_repository_asks_for_a_url_then_opens_the_clone(cx: &mut TestAppContext) {
+    use crate::git_panel::tests::repository;
+
+    let source = repository();
+    let parent = tempfile::tempdir().unwrap();
+    let url = source.path().to_string_lossy().into_owned();
+    let name = ide_core::git::clone_folder_name(&url).unwrap();
+    let (shell, cx) = setup(cx);
+    let dialog_open =
+        |cx: &mut VisualTestContext| cx.update(|window, cx| window.has_active_dialog(cx));
+    let status = |cx: &mut VisualTestContext| cx.read(|cx| shell.read(cx).status.clone());
+
+    cx.dispatch_action(CloneRepository);
+    cx.run_until_parked();
+    assert!(dialog_open(cx));
+    cx.simulate_keystrokes("enter");
+    assert!(dialog_open(cx));
+    cx.simulate_input("   ");
+    cx.simulate_keystrokes("enter");
+    assert!(dialog_open(cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!dialog_open(cx));
+    assert_eq!(text(&shell, cx), "");
+    cx.read(|cx| assert!(!shell.read(cx).busy));
+
+    shell.update(cx, |shell, cx| {
+        shell.clone_into(url.clone(), parent.path().to_path_buf(), cx)
+    });
+    cx.read(|cx| assert!(shell.read(cx).cloning));
+    assert_eq!(status(cx), format!("Cloning {url}…"));
+    cx.run_until_parked();
+    let destination = parent.path().join(&name).canonicalize().unwrap();
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(!shell.cloning);
+        assert_eq!(shell.workspace.root(), Some(destination.as_path()));
+        assert_eq!(shell.git.read(cx).branch().as_deref(), Some("main"));
+    });
+    assert_eq!(status(cx), format!("Cloned {name}"));
+    assert_eq!(tree_names(&shell, cx), [".git", "src"]);
+
+    shell.update(cx, |shell, cx| {
+        shell.clone_into(url.clone(), parent.path().to_path_buf(), cx)
+    });
+    cx.run_until_parked();
+    assert!(status(cx).starts_with("Clone failed:"), "{}", status(cx));
+    cx.read(|cx| assert_eq!(shell.read(cx).workspace.root(), Some(destination.as_path())));
+}
+
+#[gpui::test]
+fn git_hotkeys_work_anywhere_and_can_be_rebound(cx: &mut TestAppContext) {
+    use crate::{
+        commands::{Command, Keys},
+        git_panel::tests::{repository, with_remote},
+    };
+
+    let directory = repository();
+    let root = directory.path().canonicalize().unwrap();
+    let _remote = with_remote(&root);
+    std::fs::write(root.join("notes.txt"), "todo\n").unwrap();
+    let (shell, cx) = setup(cx);
+    let status = |cx: &mut VisualTestContext| cx.read(|cx| shell.read(cx).status.clone());
+
+    cx.simulate_keystrokes(&primary("shift-k"));
+    assert_eq!(status(cx), "Open a folder in a Git repository first");
+
+    let workspace = ide_core::workspace::Workspace::open(&root).unwrap();
+    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    cx.run_until_parked();
+    cx.read(|cx| assert!(shell.read(cx).active_sidebar == SidebarPanel::Folder));
+
+    cx.simulate_keystrokes(&primary("shift-a"));
+    cx.run_until_parked();
+    let staged = crate::git_panel::tests::git(&root, &["diff", "--cached", "--name-only"]);
+    assert_eq!(staged.trim(), "notes.txt");
+    crate::git_panel::tests::git(&root, &["commit", "-q", "-m", "Notes"]);
+
+    cx.simulate_keystrokes(&primary("shift-k"));
+    cx.run_until_parked();
+    assert_eq!(status(cx), "Pushed main to origin");
+
+    cx.simulate_keystrokes(&primary("shift-l"));
+    cx.run_until_parked();
+    assert_eq!(status(cx), "Already up to date");
+
+    let mut custom = Settings::default();
+    custom
+        .keybindings
+        .insert(Command::Fetch, Keys::One("alt-f".into()));
+    cx.update(|window, cx| assert!(custom.apply(Some(window), cx).is_empty()));
+    cx.simulate_keystrokes(&primary("shift-j"));
+    cx.run_until_parked();
+    assert_eq!(status(cx), "Already up to date");
+    cx.simulate_keystrokes("alt-f");
+    cx.run_until_parked();
+    assert_eq!(status(cx), "Fetched from all remotes");
+
+    crate::git_panel::tests::git(&root, &["remote", "remove", "origin"]);
+    cx.simulate_keystrokes("alt-f");
+    cx.run_until_parked();
+    assert_eq!(status(cx), "Fetch failed: This repository has no remotes");
 }
 
 #[gpui::test]

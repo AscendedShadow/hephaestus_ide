@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -7,14 +8,15 @@ use std::{
 
 use gpui::{
     Action, App, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler as _, Focusable,
-    FontWeight, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Render,
-    Stateful, Subscription, TextRun, UniformListScrollHandle, Window, canvas, div,
-    linear_color_stop, linear_gradient, prelude::*, px, rgb, uniform_list,
+    FontWeight, Img, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    PathPromptOptions, Pixels, Render, Stateful, Subscription, Task, TextRun,
+    UniformListScrollHandle, Window, canvas, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Root, RopeExt as _, Sizable as _, ThemeMode, TitleBar,
     WindowExt as _,
     button::{Button, ButtonVariants as _},
+    dialog::DialogButtonProps,
     input::{Input, InputEvent, InputState, Position, TabSize},
     menu::AppMenuBar,
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
@@ -23,18 +25,19 @@ use gpui_component::{
 };
 use ide_core::{
     document::Document,
-    git::Change,
+    git::{self, Change, Repository},
     vim::Command as VimCommand,
     workspace::{self, TreeRow, Workspace},
 };
 
 use crate::{
-    assets::AppIcon,
+    assets::{self, AppIcon},
     brace_guide::BraceGuide,
     commands::*,
     diff_view::DiffView,
     folding::{self, Fold, Toggle},
     git_panel::{GitPanel, GitPanelEvent},
+    navigation::{self, Hit, Lookup, Search},
     settings::{self, Settings},
     syntax,
     terminal_view::TerminalView,
@@ -215,21 +218,8 @@ fn tab_close_button(id: impl Into<ElementId>, hidden: bool) -> Stateful<Div> {
         .child(Icon::new(IconName::Close).size(px(12.)))
 }
 
-fn logo() -> Div {
-    div()
-        .size(px(18.))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(5.))
-        .bg(linear_gradient(
-            135.,
-            linear_color_stop(rgb(0xffb057), 0.),
-            linear_color_stop(rgb(0xf0523a), 1.),
-        ))
-        .text_color(rgb(0xffffff))
-        .child(Icon::new(AppIcon::Anvil).size(px(14.)))
+fn logo() -> Img {
+    img(assets::logo()).size(px(18.)).flex_shrink_0()
 }
 
 type BufferId = u64;
@@ -279,8 +269,10 @@ pub struct IdeShell {
     show_diff: bool,
     pending: Option<PendingAction>,
     busy: bool,
+    cloning: bool,
     vim: Option<VimInput>,
     status: String,
+    declaration_search: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -306,8 +298,10 @@ impl IdeShell {
             show_diff: false,
             pending: None,
             busy: false,
+            cloning: false,
             vim: None,
             status: "Ready — open a file or start typing".into(),
+            declaration_search: Task::ready(()),
             _subscriptions: Vec::new(),
         };
         shell._subscriptions = vec![
@@ -324,6 +318,10 @@ impl IdeShell {
                         if !this.blocked() {
                             this.focus_diff(window, cx);
                         }
+                    }
+                    GitPanelEvent::Status(status) => {
+                        this.status = status.clone();
+                        cx.notify();
                     }
                 },
             ),
@@ -459,6 +457,15 @@ impl IdeShell {
         self.active_sidebar = SidebarPanel::Git;
         self.refresh_git(cx);
         cx.notify();
+    }
+
+    fn forward_to_git<A: Action>(
+        handler: fn(&mut GitPanel, &A, &mut Window, &mut Context<GitPanel>),
+    ) -> impl Fn(&mut Self, &A, &mut Window, &mut Context<Self>) {
+        move |this, action, window, cx| {
+            this.git
+                .update(cx, |git, cx| handler(git, action, window, cx))
+        }
     }
 
     fn show_debug_panel(&mut self, _: &ShowDebugPanel, _: &mut Window, cx: &mut Context<Self>) {
@@ -860,6 +867,117 @@ impl IdeShell {
         .detach();
     }
 
+    fn clone_repository(
+        &mut self,
+        _: &CloneRepository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.blocked() || self.cloning || window.has_active_dialog(cx) {
+            return;
+        }
+        let shell = cx.entity().downgrade();
+        let url = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("https://github.com/owner/repository.git")
+        });
+        window.open_dialog(cx, {
+            let url = url.clone();
+            move |dialog, _, _| {
+                let (shell, url) = (shell.clone(), url.clone());
+                dialog
+                    .title("Clone Repository")
+                    .w(px(440.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .pb_1()
+                            .child(ui::caption("REPOSITORY URL"))
+                            .child(Input::new(&url))
+                            .child(div().text_xs().text_color(theme::muted()).child(
+                                "Next, choose the folder to clone into. \
+                                 The repository opens once it has been cloned.",
+                            )),
+                    )
+                    .confirm()
+                    .button_props(DialogButtonProps::default().ok_text("Clone"))
+                    .on_ok(move |_, window, cx| {
+                        let url = url.read(cx).value().trim().to_string();
+                        if git::clone_folder_name(&url).is_none() {
+                            return false;
+                        }
+                        let _ = shell
+                            .update(cx, |shell, cx| shell.choose_clone_location(url, window, cx));
+                        true
+                    })
+            }
+        });
+        url.update(cx, |url, cx| url.focus(window, cx));
+    }
+
+    fn choose_clone_location(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked() || self.cloning {
+            return;
+        }
+        self.busy = true;
+        self.status = "Choose a folder to clone into…".into();
+        cx.notify();
+        let picker = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Clone here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let parent = picker
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|selected| selected.map_err(|e| e.to_string()))
+                .map(|selected| selected.and_then(|paths| paths.into_iter().next()));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match parent {
+                    Ok(Some(parent)) => this.clone_into(url, parent, cx),
+                    Ok(None) => this.status = "Clone cancelled".into(),
+                    Err(error) => this.status = format!("Clone failed: {error}"),
+                }
+                this.focus_editor(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn clone_into(&mut self, url: String, parent: PathBuf, cx: &mut Context<Self>) {
+        self.cloning = true;
+        self.status = format!("Cloning {url}…");
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move {
+                    Repository::clone_remote(&url, &parent)
+                        .and_then(|repository| Workspace::open(repository.root()))
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.cloning = false;
+                match result {
+                    Ok(workspace) => {
+                        this.set_workspace(workspace, cx);
+                        this.active_sidebar = SidebarPanel::Folder;
+                        this.status = format!("Cloned {}", this.workspace.display_name());
+                    }
+                    Err(error) => this.status = format!("Clone failed: {error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn set_workspace(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
         self.status = format!("Opened folder {}", workspace.display_name());
         self.workspace = workspace;
@@ -1031,6 +1149,168 @@ impl IdeShell {
             "Expanded brace block"
         }
         .into();
+        cx.notify();
+    }
+
+    fn editor_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left
+            || event.modifiers != Modifiers::shift()
+            || self.blocked()
+        {
+            return;
+        }
+        let editor = self.editor().read(cx);
+        if !editor
+            .text_geometry()
+            .is_some_and(|geometry| geometry.viewport.contains(&event.position))
+        {
+            return;
+        }
+        let offset = editor.index_for_mouse_position(event.position);
+        if self.go_to_declaration(offset, window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    fn go_to_declaration(
+        &mut self,
+        display_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let buffer = self.buffer();
+        let source = buffer.document.text().to_string();
+        let offset = folding::display_to_source(&buffer.folds, display_offset, false);
+        let language = syntax::language(buffer.document.path());
+        let Some(lookup) = navigation::lookup(language, &source, offset) else {
+            return false;
+        };
+        self.declaration_search = Task::ready(());
+        match lookup {
+            Lookup::Found(name) => {
+                self.reveal_declaration(self.active, name, window, cx);
+                true
+            }
+            Lookup::Search(search) => self.search_declaration(search, language, window, cx),
+        }
+    }
+
+    fn search_declaration(
+        &mut self,
+        search: Search,
+        language: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(root) = self.project_directory().map(Path::to_path_buf) else {
+            let Some(fallback) = search.fallback else {
+                return false;
+            };
+            self.reveal_declaration(self.active, fallback, window, cx);
+            return true;
+        };
+        let origin = self.buffer().id;
+        let path = self.document().path().map(Path::to_path_buf);
+        let open: HashMap<PathBuf, String> = self
+            .buffers
+            .iter()
+            .filter_map(|buffer| {
+                let path = buffer.document.path()?.to_path_buf();
+                Some((path, buffer.document.text().to_string()))
+            })
+            .collect();
+        self.status = format!("Looking for the declaration of {}…", search.name);
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        self.declaration_search = cx.spawn_in(window, async move |this, cx| {
+            let hit = executor
+                .spawn({
+                    let search = search.clone();
+                    async move {
+                        navigation::search_workspace(
+                            &root,
+                            path.as_deref(),
+                            language,
+                            &search,
+                            &open,
+                        )
+                    }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.open_declaration(origin, search, hit, window, cx)
+            });
+        });
+        true
+    }
+
+    fn open_declaration(
+        &mut self,
+        origin: BufferId,
+        search: Search,
+        hit: Option<Hit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.blocked() {
+            return;
+        }
+        let Search { name, fallback, .. } = search;
+        let target = hit
+            .and_then(|hit| {
+                match self.buffer_for_path(&hit.path) {
+                    Some(ix) => self.activate(ix, window, cx),
+                    None => self.open_document(hit.document?, window, cx),
+                }
+                Some((self.active, hit.name))
+            })
+            .or_else(|| Some((self.buffer_index(origin)?, fallback?)));
+        match target {
+            Some((ix, declaration)) => {
+                if ix != self.active {
+                    self.activate(ix, window, cx);
+                }
+                self.reveal_declaration(ix, declaration, window, cx);
+            }
+            None => {
+                self.status = format!("No declaration found for {name}");
+                cx.notify();
+            }
+        }
+    }
+
+    fn reveal_declaration(
+        &mut self,
+        ix: usize,
+        declaration: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let buffer = &mut self.buffers[ix];
+        let source = buffer.document.text().to_string();
+        let offset = declaration.start.min(source.len());
+        let editor = buffer.editor.clone();
+        let display = match folding::reveal(&source, &mut buffer.folds, offset) {
+            Some(toggle) => {
+                editor.update(cx, |editor, cx| {
+                    let text = editor.text();
+                    let range = text.byte_to_utf16_idx(toggle.edit.start)
+                        ..text.byte_to_utf16_idx(toggle.edit.end);
+                    editor.replace_text_in_range(Some(range), &toggle.text, window, cx);
+                });
+                toggle.cursor
+            }
+            None => folding::source_to_display(&buffer.folds, offset),
+        };
+        let name = source.get(declaration).unwrap_or_default();
+        let line = position_at(&source, offset).line + 1;
+        self.status = format!("Declaration of {name} — {}:{line}", buffer.document.name());
+        editor.update(cx, |editor, cx| editor.reveal(display, window, cx));
         cx.notify();
     }
 
@@ -1410,16 +1690,35 @@ impl IdeShell {
                                 .child("Open a folder to browse and edit its files."),
                         )
                         .child(
-                            div().pt_2().child(
-                                Button::new("open-folder")
-                                    .primary()
-                                    .small()
-                                    .label("Open Folder…")
-                                    .disabled(self.blocked())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_folder(&OpenFolder, window, cx)
-                                    })),
-                            ),
+                            div()
+                                .pt_2()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    Button::new("open-folder")
+                                        .primary()
+                                        .small()
+                                        .label("Open Folder…")
+                                        .disabled(self.blocked())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_folder(&OpenFolder, window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("clone-repository")
+                                        .small()
+                                        .label(if self.cloning {
+                                            "Cloning…"
+                                        } else {
+                                            "Clone Repository…"
+                                        })
+                                        .loading(self.cloning)
+                                        .disabled(self.blocked() || self.cloning)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.clone_repository(&CloneRepository, window, cx)
+                                        })),
+                                ),
                         ),
                     )
                 }
@@ -1734,6 +2033,7 @@ impl IdeShell {
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
+                .capture_any_mouse_down(cx.listener(Self::editor_mouse_down))
                 .when_some(vim_context, |editor, context| {
                     editor
                         .key_context(context)
@@ -2080,6 +2380,7 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::clone_repository))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::save_file_as))
             .on_action(cx.listener(Self::close_tab))
@@ -2095,6 +2396,10 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::show_debug_panel))
             .on_action(cx.listener(Self::toggle_vim_mode))
             .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::forward_to_git(GitPanel::stage_all)))
+            .on_action(cx.listener(Self::forward_to_git(GitPanel::pull)))
+            .on_action(cx.listener(Self::forward_to_git(GitPanel::push)))
+            .on_action(cx.listener(Self::forward_to_git(GitPanel::fetch)))
             .child(self.render_title_bar(cx))
             .when(self.pending.is_some(), |view| {
                 view.child(self.render_save_prompt(cx))

@@ -73,34 +73,45 @@ impl Token {
     }
 }
 
+const HIGHLIGHTS: [(&str, &str); 10] = [
+    ("c", C_HIGHLIGHTS),
+    ("c_sharp", C_SHARP_HIGHLIGHTS),
+    ("go", GO_HIGHLIGHTS),
+    ("java", JAVA_HIGHLIGHTS),
+    ("javascript", JAVASCRIPT_HIGHLIGHTS),
+    ("jsx", JSX_HIGHLIGHTS),
+    ("rust", RUST_HIGHLIGHTS),
+    ("typescript", TYPESCRIPT_HIGHLIGHTS),
+    ("tsx", TSX_HIGHLIGHTS),
+    ("zig", ZIG_HIGHLIGHTS),
+];
+
 pub fn init() {
     let registry = LanguageRegistry::singleton();
-    let languages = [
-        ("c", tree_sitter_c::LANGUAGE, C_HIGHLIGHTS),
-        ("c_sharp", tree_sitter_c_sharp::LANGUAGE, C_SHARP_HIGHLIGHTS),
-        ("go", tree_sitter_go::LANGUAGE, GO_HIGHLIGHTS),
-        ("java", tree_sitter_java::LANGUAGE, JAVA_HIGHLIGHTS),
-        (
-            "javascript",
-            tree_sitter_javascript::LANGUAGE,
-            JAVASCRIPT_HIGHLIGHTS,
-        ),
-        ("jsx", tree_sitter_javascript::LANGUAGE, JSX_HIGHLIGHTS),
-        ("rust", tree_sitter_rust::LANGUAGE, RUST_HIGHLIGHTS),
-        (
-            "typescript",
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-            TYPESCRIPT_HIGHLIGHTS,
-        ),
-        ("tsx", tree_sitter_typescript::LANGUAGE_TSX, TSX_HIGHLIGHTS),
-        ("zig", tree_sitter_zig::LANGUAGE, ZIG_HIGHLIGHTS),
-    ];
-    for (name, grammar, highlights) in languages {
-        registry.register(
-            name,
-            &LanguageConfig::new(name, grammar.into(), Vec::new(), highlights, "", ""),
-        );
+    for (name, highlights) in HIGHLIGHTS {
+        if let Some(grammar) = grammar(name) {
+            registry.register(
+                name,
+                &LanguageConfig::new(name, grammar, Vec::new(), highlights, "", ""),
+            );
+        }
     }
+}
+
+pub fn grammar(language: &str) -> Option<tree_sitter::Language> {
+    let grammar = match language {
+        "c" => tree_sitter_c::LANGUAGE,
+        "c_sharp" => tree_sitter_c_sharp::LANGUAGE,
+        "go" => tree_sitter_go::LANGUAGE,
+        "java" => tree_sitter_java::LANGUAGE,
+        "javascript" | "jsx" => tree_sitter_javascript::LANGUAGE,
+        "rust" => tree_sitter_rust::LANGUAGE,
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
+        "zig" => tree_sitter_zig::LANGUAGE,
+        _ => return None,
+    };
+    Some(grammar.into())
 }
 
 pub fn language(path: Option<&Path>) -> &'static str {

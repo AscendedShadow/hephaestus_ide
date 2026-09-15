@@ -79,6 +79,26 @@ fn rejects_malformed_status() {
 }
 
 #[test]
+fn clone_folder_names_follow_the_last_url_segment() {
+    let cases = [
+        ("https://github.com/owner/repo.git", Some("repo")),
+        ("https://github.com/owner/repo/", Some("repo")),
+        ("  git@github.com:owner/repo.git  ", Some("repo")),
+        ("git@host:repo.git", Some("repo")),
+        ("ssh://git@host:22/team/tool.git/", Some("tool")),
+        ("C:\\src\\project\\.git", Some("project")),
+        ("/srv/git/project.git", Some("project")),
+        ("", None),
+        ("   ", None),
+        ("https://host/..", None),
+        ("C:\\", None),
+    ];
+    for (url, name) in cases {
+        assert_eq!(clone_folder_name(url).as_deref(), name, "{url:?}");
+    }
+}
+
+#[test]
 fn folders_show_their_most_important_change() {
     let root = Path::new("/repo");
     let status = Status {
@@ -324,4 +344,117 @@ fn stages_diffs_commits_and_unstages_in_a_real_repository() {
 
     let error = repository.commit("Nothing staged").unwrap_err();
     assert!(!error.to_string().is_empty());
+}
+
+#[test]
+fn clones_into_a_new_folder_named_after_the_repository() {
+    let (source, repository) = repository();
+    fs::write(source.path().join("README.md"), "hello\n").unwrap();
+    let status = repository.status().unwrap();
+    repository
+        .stage(&[file(&status, "README.md").clone()])
+        .unwrap();
+    repository.commit("Initial").unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let url = source.path().to_string_lossy().into_owned();
+    let name = clone_folder_name(&url).unwrap();
+    let cloned = Repository::clone_remote(&format!(" {url} "), parent.path()).unwrap();
+    let destination = parent.path().join(&name).canonicalize().unwrap();
+    assert_eq!(cloned.root(), destination);
+    let readme = fs::read_to_string(destination.join("README.md")).unwrap();
+    assert_eq!(readme.trim_end(), "hello");
+    assert!(cloned.status().unwrap().files.is_empty());
+
+    let error = Repository::clone_remote(&url, parent.path()).unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+    let missing = source.path().join("nowhere").join("void");
+    let error = Repository::clone_remote(&missing.to_string_lossy(), parent.path()).unwrap_err();
+    assert!(!error.to_string().starts_with("Cloning"), "{error}");
+    assert!(!parent.path().join("void").exists());
+    assert!(Repository::clone_remote("  ", parent.path()).is_err());
+}
+
+fn commit_file(repository: &Repository, relative: &str, text: &str, message: &str) {
+    fs::write(repository.root().join(relative), text).unwrap();
+    let status = repository.status().unwrap();
+    repository
+        .stage(&[file(&status, relative).clone()])
+        .unwrap();
+    repository.commit(message).unwrap();
+}
+
+fn configure(root: &Path) {
+    for args in [
+        ["config", "user.name", "Hephaestus Tests"],
+        ["config", "user.email", "tests@example.invalid"],
+        ["config", "commit.gpgsign", "false"],
+        ["config", "core.hooksPath", ".no-hooks"],
+        ["config", "pull.rebase", "false"],
+    ] {
+        let output = git(root).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", failure(&output));
+    }
+}
+
+#[test]
+fn fetches_pulls_and_pushes_through_a_remote() {
+    let (local, repository) = repository();
+    configure(local.path());
+    commit_file(&repository, "README.md", "one\n", "One");
+    for error in [repository.fetch(), repository.pull(), repository.push()] {
+        assert_eq!(
+            error.unwrap_err().to_string(),
+            "This repository has no remotes"
+        );
+    }
+
+    let remote = tempfile::tempdir().unwrap();
+    let output = git(remote.path())
+        .args(["init", "-q", "--bare", "--initial-branch=main"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", failure(&output));
+    let url = remote.path().to_string_lossy().into_owned();
+    repository.run(["remote", "add", "origin", &url]).unwrap();
+    assert_eq!(repository.push().unwrap(), "Pushed main to origin");
+    let branch = repository.status().unwrap().branch;
+    assert_eq!(branch.upstream.as_deref(), Some("origin/main"));
+    assert_eq!(
+        repository.push().unwrap(),
+        "origin/main is already up to date"
+    );
+
+    let parent = tempfile::tempdir().unwrap();
+    let other = Repository::clone_remote(&url, parent.path()).unwrap();
+    configure(other.root());
+    commit_file(&other, "README.md", "two\n", "Two");
+    commit_file(&other, "notes.txt", "notes\n", "Notes");
+    assert_eq!(other.push().unwrap(), "Pushed 2 commits to origin/main");
+
+    assert_eq!(repository.fetch().unwrap(), "Fetched from all remotes");
+    let branch = repository.status().unwrap().branch;
+    assert_eq!((branch.ahead, branch.behind), (0, 2));
+    assert_eq!(repository.pull().unwrap(), "Pulled 2 commits");
+    let readme = fs::read_to_string(repository.root().join("README.md")).unwrap();
+    assert_eq!(readme, "two\n");
+    assert_eq!(repository.pull().unwrap(), "Already up to date");
+
+    commit_file(&other, "notes.txt", "remote\n", "Remote");
+    other.push().unwrap();
+    commit_file(&repository, "README.md", "local\n", "Local");
+    let error = repository.push().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "The remote has commits you don't have yet — pull first"
+    );
+    assert_eq!(repository.pull().unwrap(), "Pulled 2 commits");
+    assert_eq!(
+        repository.push().unwrap(),
+        "Pushed 2 commits to origin/main"
+    );
+
+    repository.run(["checkout", "-q", "--detach"]).unwrap();
+    let error = repository.push().unwrap_err();
+    assert_eq!(error.to_string(), "Check out a branch before pushing");
 }

@@ -212,7 +212,10 @@ fn reports_git_errors_and_follows_changes_made_elsewhere(cx: &mut TestAppContext
     git(&root, &["config", "core.hooksPath", &hooks_path]);
     fs::write(root.join("src/main.rs"), "changed\n").unwrap();
     git(&root, &["add", "-A"]);
-    panel.update(cx, |panel, cx| panel.refresh(cx));
+    cx.run_until_parked();
+    assert!(rows(&panel, cx).is_empty());
+    cx.update(|window, _| window.activate_window());
+    cx.executor().advance_clock(POLL_INTERVAL);
     cx.run_until_parked();
     assert_eq!(rows(&panel, cx), ["Staged (1)", " M src/main.rs"]);
     panel.update_in(cx, |panel, window, cx| {
@@ -233,6 +236,103 @@ fn reports_git_errors_and_follows_changes_made_elsewhere(cx: &mut TestAppContext
     let reloaded = panel.update(cx, |panel, cx| panel.set_directory(Some(src), cx));
     assert!(!reloaded);
     assert_eq!(rows(&panel, cx), ["Staged (1)", " M src/main.rs"]);
+}
+
+pub(crate) fn with_remote(root: &Path) -> tempfile::TempDir {
+    let remote = tempfile::tempdir().unwrap();
+    git(
+        remote.path(),
+        &["init", "-q", "--bare", "--initial-branch=main"],
+    );
+    git(
+        root,
+        &["remote", "add", "origin", &remote.path().to_string_lossy()],
+    );
+    remote
+}
+
+fn choose(cx: &mut VisualTestContext, item: &'static str) {
+    let more = cx.debug_bounds("git-actions").unwrap();
+    cx.simulate_click(more.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let item = cx.debug_bounds(item).unwrap();
+    cx.simulate_click(item.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn actions_menu_stages_commits_and_syncs_with_the_remote(cx: &mut TestAppContext) {
+    let directory = repository();
+    let root = directory.path().canonicalize().unwrap();
+    let remote = with_remote(&root);
+    fs::write(root.join("notes.txt"), "todo\n").unwrap();
+    let (panel, cx) = setup(cx);
+    panel.update(cx, |panel, cx| panel.set_directory(Some(root.clone()), cx));
+    cx.run_until_parked();
+
+    let push_keys = cx.update(|_, cx| crate::commands::shortcut(&Push, cx));
+    let expected = if cfg!(target_os = "macos") {
+        "⇧⌘K"
+    } else {
+        "Ctrl+Shift+K"
+    };
+    assert_eq!(push_keys.as_deref(), Some(expected));
+    let commit_keys = cx.update(|_, cx| crate::commands::shortcut(&Commit, cx));
+    assert!(commit_keys.is_some_and(|keys| keys.contains("Enter") || keys.contains('⏎')));
+
+    choose(cx, "git-menu-Stage All Changes");
+    assert_eq!(rows(&panel, cx), ["Staged (1)", " A notes.txt"]);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.stage_all(&StageAll, window, cx)
+    });
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("info: No changes to stage")
+    );
+
+    choose(cx, "git-menu-Commit");
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("error: Write a commit message first")
+    );
+    cx.update(|window, cx| {
+        let focused = panel.read(cx).commit_message.read(cx).focus_handle(cx);
+        assert!(focused.is_focused(window));
+    });
+    cx.simulate_input("Add notes");
+    choose(cx, "git-menu-Commit");
+    assert_eq!(
+        git(&root, &["log", "-1", "--format=%s"]).trim(),
+        "Add notes"
+    );
+    assert!(rows(&panel, cx).is_empty());
+
+    choose(cx, "git-menu-Push");
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("info: Pushed main to origin")
+    );
+    let pushed = git(remote.path(), &["log", "-1", "--format=%s", "main"]);
+    assert_eq!(pushed.trim(), "Add notes");
+    cx.read(|cx| assert_eq!(panel.read(cx).branch().as_deref(), Some("main")));
+
+    choose(cx, "git-menu-Fetch");
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("info: Fetched from all remotes")
+    );
+    choose(cx, "git-menu-Pull");
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("info: Already up to date")
+    );
+
+    git(&root, &["remote", "remove", "origin"]);
+    choose(cx, "git-menu-Push");
+    assert_eq!(
+        notice(&panel, cx).as_deref(),
+        Some("error: This repository has no remotes")
+    );
 }
 
 #[gpui::test]

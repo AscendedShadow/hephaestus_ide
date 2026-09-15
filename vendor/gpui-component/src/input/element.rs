@@ -1462,6 +1462,9 @@ impl Element for TextElement {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            if let Some(offset) = state.pending_reveal.take() {
+                state.center_on(offset, cx);
+            }
 
             cx.notify();
         });

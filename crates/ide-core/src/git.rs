@@ -213,6 +213,16 @@ fn tracked(xy: &str, path: &str, original: Option<&str>) -> Option<Option<FileSt
     )
 }
 
+pub fn clone_folder_name(url: &str) -> Option<String> {
+    let url = url.trim().trim_end_matches(['/', '\\']);
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let name = url
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\', ':'])
+        .next()?;
+    (!matches!(name, "" | "." | "..")).then(|| name.to_string())
+}
+
 pub fn absolute(root: &Path, relative: &str) -> PathBuf {
     relative
         .split('/')
@@ -364,6 +374,23 @@ impl Repository {
             .ok_or_else(|| io::Error::other("git init did not create a repository"))
     }
 
+    pub fn clone_remote(url: &str, parent: &Path) -> io::Result<Self> {
+        let url = url.trim();
+        let name = clone_folder_name(url)
+            .ok_or_else(|| io::Error::other("Enter a repository URL or path"))?;
+        let destination = parent.join(name);
+        let output = git(parent)
+            .args(["clone", "--quiet", "--", url])
+            .arg(&destination)
+            .output()
+            .map_err(not_installed)?;
+        if !output.status.success() {
+            return Err(failure(&output));
+        }
+        Self::discover(&destination)?
+            .ok_or_else(|| io::Error::other("git clone did not create a repository"))
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -460,8 +487,100 @@ impl Repository {
         Ok(stdout.lines().next().unwrap_or_default().trim().to_string())
     }
 
+    pub fn fetch(&self) -> io::Result<String> {
+        self.default_remote()?;
+        self.run(["fetch", "--all", "--prune", "--quiet"])?;
+        Ok("Fetched from all remotes".into())
+    }
+
+    pub fn pull(&self) -> io::Result<String> {
+        self.default_remote()?;
+        let before = self.head()?;
+        self.run(["pull", "--no-edit", "--quiet"])?;
+        let after = self.head()?;
+        Ok(match (before, after) {
+            (Some(before), Some(after)) if before == after => "Already up to date".into(),
+            (Some(before), Some(_)) => {
+                let range = format!("{before}..HEAD");
+                let count = String::from_utf8_lossy(&self.run(["rev-list", "--count", &range])?)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                format!("Pulled {}", commits(count))
+            }
+            _ => "Pulled".into(),
+        })
+    }
+
+    pub fn push(&self) -> io::Result<String> {
+        let branch = self.status()?.branch;
+        let name = branch
+            .name
+            .ok_or_else(|| io::Error::other("Check out a branch before pushing"))?;
+        let (args, summary): (Vec<String>, _) = match branch.upstream {
+            Some(upstream) if branch.ahead == 0 => (
+                vec!["push".into()],
+                format!("{upstream} is already up to date"),
+            ),
+            Some(upstream) => (
+                vec!["push".into()],
+                format!("Pushed {} to {upstream}", commits(branch.ahead)),
+            ),
+            None => {
+                let remote = self.default_remote()?;
+                let summary = format!("Pushed {name} to {remote}");
+                (
+                    vec!["push".into(), "--set-upstream".into(), remote, name],
+                    summary,
+                )
+            }
+        };
+        let output = self.output(&args)?;
+        if output.status.success() {
+            Ok(summary)
+        } else if String::from_utf8_lossy(&output.stderr).contains("[rejected]") {
+            Err(io::Error::other(
+                "The remote has commits you don't have yet — pull first",
+            ))
+        } else {
+            Err(failure(&output))
+        }
+    }
+
+    fn default_remote(&self) -> io::Result<String> {
+        let output = self.run(["remote"])?;
+        let remotes = String::from_utf8_lossy(&output);
+        let remotes: Vec<_> = remotes
+            .lines()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .collect();
+        remotes
+            .iter()
+            .find(|&&remote| remote == "origin")
+            .or(remotes.first())
+            .map(|remote| remote.to_string())
+            .ok_or_else(|| io::Error::other("This repository has no remotes"))
+    }
+
+    fn head(&self) -> io::Result<Option<String>> {
+        let output = self.output(["rev-parse", "--verify", "--quiet", "HEAD"])?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+    }
+
     fn command(&self) -> Command {
         git(&self.root)
+    }
+
+    fn output<I, S>(&self, args: I) -> io::Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command().args(args).output().map_err(not_installed)
     }
 
     fn run<I, S>(&self, args: I) -> io::Result<Vec<u8>>
@@ -469,12 +588,19 @@ impl Repository {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self.command().args(args).output().map_err(not_installed)?;
+        let output = self.output(args)?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
             Err(failure(&output))
         }
+    }
+}
+
+fn commits(count: u32) -> String {
+    match count {
+        1 => "1 commit".into(),
+        count => format!("{count} commits"),
     }
 }
 
@@ -508,14 +634,17 @@ fn not_installed(error: io::Error) -> io::Error {
 fn failure(output: &Output) -> io::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let message = [stderr.trim(), stdout.trim()]
-        .into_iter()
-        .flat_map(str::lines)
-        .map(|line| {
-            line.trim_start_matches("fatal: ")
-                .trim_start_matches("error: ")
+    let lines = || {
+        [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .flat_map(str::lines)
+    };
+    let message = lines()
+        .find_map(|line| {
+            line.strip_prefix("fatal: ")
+                .or_else(|| line.strip_prefix("error: "))
         })
-        .find(|line| !line.is_empty() && !line.starts_with("hint:"))
+        .or_else(|| lines().find(|line| !line.is_empty() && !line.starts_with("hint:")))
         .unwrap_or("git failed")
         .to_string();
     io::Error::other(message)

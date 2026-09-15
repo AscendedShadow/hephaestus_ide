@@ -1,8 +1,10 @@
 use std::{collections::BTreeMap, rc::Rc};
 
 use gpui::{
-    Action, App, Global, KeyBinding, KeyBindingContextPredicate, Menu, MenuItem, NoAction, actions,
+    Action, App, AsKeystroke as _, Global, KeyBinding, KeyBindingContextPredicate, Menu, MenuItem,
+    NoAction, actions,
 };
+use gpui_component::kbd::Kbd;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,6 +20,7 @@ actions!(
         NewFile,
         OpenFile,
         OpenFolder,
+        CloneRepository,
         SaveFile,
         SaveFileAs,
         CloseTab,
@@ -42,6 +45,7 @@ pub enum Command {
     NewFile,
     OpenFile,
     OpenFolder,
+    CloneRepository,
     SaveFile,
     SaveFileAs,
     CloseTab,
@@ -58,15 +62,20 @@ pub enum Command {
     ToggleVimMode,
     ToggleFold,
     Commit,
+    StageAll,
+    Pull,
+    Push,
+    Fetch,
     TerminalCopy,
     TerminalPaste,
 }
 
 impl Command {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 26] = [
         Self::NewFile,
         Self::OpenFile,
         Self::OpenFolder,
+        Self::CloneRepository,
         Self::SaveFile,
         Self::SaveFileAs,
         Self::CloseTab,
@@ -83,6 +92,10 @@ impl Command {
         Self::ToggleVimMode,
         Self::ToggleFold,
         Self::Commit,
+        Self::StageAll,
+        Self::Pull,
+        Self::Push,
+        Self::Fetch,
         Self::TerminalCopy,
         Self::TerminalPaste,
     ];
@@ -99,6 +112,7 @@ impl Command {
             Self::NewFile => Box::new(NewFile),
             Self::OpenFile => Box::new(OpenFile),
             Self::OpenFolder => Box::new(OpenFolder),
+            Self::CloneRepository => Box::new(CloneRepository),
             Self::SaveFile => Box::new(SaveFile),
             Self::SaveFileAs => Box::new(SaveFileAs),
             Self::CloseTab => Box::new(CloseTab),
@@ -115,6 +129,10 @@ impl Command {
             Self::ToggleVimMode => Box::new(ToggleVimMode),
             Self::ToggleFold => Box::new(ToggleFold),
             Self::Commit => Box::new(git_panel::Commit),
+            Self::StageAll => Box::new(git_panel::StageAll),
+            Self::Pull => Box::new(git_panel::Pull),
+            Self::Push => Box::new(git_panel::Push),
+            Self::Fetch => Box::new(git_panel::Fetch),
             Self::TerminalCopy => Box::new(terminal_view::Copy),
             Self::TerminalPaste => Box::new(terminal_view::Paste),
         }
@@ -142,13 +160,20 @@ impl Command {
             Self::PreviousTab => &["ctrl-shift-tab", "ctrl-pageup"],
             Self::CloseWindow => &["secondary-shift-w"],
             Self::OpenSettings => &["secondary-,"],
-            Self::EditSettings | Self::ReloadSettings | Self::ToggleVimMode => &[],
+            Self::CloneRepository
+            | Self::EditSettings
+            | Self::ReloadSettings
+            | Self::ToggleVimMode => &[],
             Self::ShowFolderPanel => &["secondary-shift-e"],
             Self::ShowGitPanel => &["secondary-shift-g"],
             Self::ToggleTerminal => &["ctrl-`"],
             Self::ShowDebugPanel => &["secondary-shift-d"],
             Self::ToggleFold => &["secondary-shift-[", "secondary-k secondary-l"],
             Self::Commit => &["secondary-enter"],
+            Self::StageAll => &["secondary-shift-a"],
+            Self::Pull => &["secondary-shift-l"],
+            Self::Push => &["secondary-shift-k"],
+            Self::Fetch => &["secondary-shift-j"],
             Self::TerminalCopy => &[if mac { "cmd-c" } else { "ctrl-shift-c" }],
             Self::TerminalPaste => &[if mac { "cmd-v" } else { "ctrl-shift-v" }],
         };
@@ -188,6 +213,18 @@ impl From<Vec<String>> for Keys {
 }
 
 pub type Keybindings = BTreeMap<Command, Keys>;
+
+pub fn shortcut(action: &dyn Action, cx: &App) -> Option<String> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap.bindings_for_action(action).last()?;
+    let keys: Vec<_> = binding
+        .keystrokes()
+        .iter()
+        .map(|key| Kbd::format(key.as_keystroke()))
+        .collect();
+    Some(keys.join(" "))
+}
 
 pub fn default_keybindings() -> Keybindings {
     Command::ALL
@@ -286,6 +323,7 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("New", NewFile),
             MenuItem::action("Open…", OpenFile),
             MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Clone Repository…", CloneRepository),
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Save As…", SaveFileAs),

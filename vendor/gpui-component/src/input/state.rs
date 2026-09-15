@@ -303,6 +303,7 @@ pub struct InputState {
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+    pub(crate) pending_reveal: Option<usize>,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
 
@@ -402,6 +403,7 @@ impl InputState {
             scroll_handle: ScrollHandle::new(),
             scroll_size: gpui::size(px(0.), px(0.)),
             deferred_scroll_offset: None,
+            pending_reveal: None,
             preferred_column: None,
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
@@ -826,6 +828,37 @@ impl InputState {
         self.move_to(offset, None, cx);
         self.update_preferred_column();
         self.focus(window, cx);
+    }
+
+    pub fn reveal(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.text.clip_offset(offset, Bias::Left);
+        self.move_to(offset, None, cx);
+        self.focus(window, cx);
+        self.center_on(offset, cx);
+    }
+
+    pub(crate) fn center_on(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let (Some(layout), Some(bounds)) = (self.last_layout.as_ref(), self.last_bounds) else {
+            self.pending_reveal = Some(offset);
+            return;
+        };
+        let line_height = layout.line_height;
+        let row = self.text.offset_to_point(offset.min(self.text.len())).row;
+        let top = self
+            .text_wrapper
+            .lines
+            .iter()
+            .take(row)
+            .fold(px(0.), |top, line| top + line.height(line_height));
+        let mut scroll = self
+            .deferred_scroll_offset
+            .unwrap_or(self.scroll_handle.offset());
+        let height = bounds.size.height;
+        if top < -scroll.y || top + line_height > -scroll.y + height {
+            scroll.y = ((height - line_height) / 2. - top).min(px(0.));
+        }
+        self.deferred_scroll_offset = Some(scroll);
+        cx.notify();
     }
 
     /// Focus the input field.
@@ -1533,7 +1566,7 @@ impl InputState {
         })
     }
 
-    pub(crate) fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+    pub fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
             return 0;

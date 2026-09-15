@@ -3,21 +3,25 @@ use std::{
     io,
     ops::Range,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use gpui::{
-    Context, Div, Entity, EventEmitter, FontWeight, IntoElement, Render, Stateful, Task,
-    UniformListScrollHandle, Window, actions, div, prelude::*, px, uniform_list,
+    Action, App, Context, Corner, Div, Entity, EventEmitter, Focusable as _, FontWeight,
+    IntoElement, Render, Stateful, Task, UniformListScrollHandle, WeakEntity, Window, actions, div,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
+    menu::{DropdownMenu as _, PopupMenuItem},
 };
 use ide_core::git::{self, Change, FileStatus, Repository, Status};
 
 use crate::{
     assets::AppIcon,
+    commands::{self, CloneRepository, EditSettings},
     diff_view::DiffView,
     theme,
     ui::{self, ROW_GROUP},
@@ -27,15 +31,51 @@ use crate::{
 #[path = "git_panel_tests.rs"]
 pub(crate) mod tests;
 
-actions!(git, [Commit]);
+actions!(git, [Commit, StageAll, Pull, Push, Fetch]);
 
 pub const COMMIT_CONTEXT: &str = "GitCommit";
 
 const ROW_HEIGHT: f32 = 24.;
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const NO_REPOSITORY: &str = "Open a folder in a Git repository first";
 
 pub enum GitPanelEvent {
     OpenFile(PathBuf),
     ShowDiff,
+    Status(String),
+}
+
+#[derive(Clone, Copy)]
+enum Remote {
+    Pull,
+    Push,
+    Fetch,
+}
+
+impl Remote {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pull => "Pull",
+            Self::Push => "Push",
+            Self::Fetch => "Fetch",
+        }
+    }
+
+    fn progress(self) -> &'static str {
+        match self {
+            Self::Pull => "Pulling…",
+            Self::Push => "Pushing…",
+            Self::Fetch => "Fetching…",
+        }
+    }
+
+    fn run(self, repository: &Repository) -> io::Result<String> {
+        match self {
+            Self::Pull => repository.pull(),
+            Self::Push => repository.push(),
+            Self::Fetch => repository.fetch(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +112,8 @@ pub struct GitPanel {
     commit_message: Entity<InputState>,
     list_scroll: UniformListScrollHandle,
     refresh_task: Option<Task<()>>,
+    refreshing: bool,
+    _poll_task: Task<()>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -82,6 +124,19 @@ fn side(file: &FileStatus, staged: bool) -> Option<Change> {
 
 impl GitPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let poll_task = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL_INTERVAL).await;
+                let polled = this.update_in(cx, |this, window, cx| {
+                    if window.is_window_active() && !this.refreshing && !this.busy {
+                        this.refresh(cx);
+                    }
+                });
+                if polled.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             directory: None,
             repository: None,
@@ -103,6 +158,8 @@ impl GitPanel {
             }),
             list_scroll: UniformListScrollHandle::new(),
             refresh_task: None,
+            refreshing: false,
+            _poll_task: poll_task,
         }
     }
 
@@ -130,6 +187,7 @@ impl GitPanel {
         }
         self.directory = directory;
         self.refresh_task = None;
+        self.refreshing = false;
         self.loaded = false;
         self.load_error = None;
         self.notice = None;
@@ -145,6 +203,7 @@ impl GitPanel {
         };
         let repository = self.repository.clone();
         let executor = cx.background_executor().clone();
+        self.refreshing = true;
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = executor
                 .spawn(async move {
@@ -160,6 +219,7 @@ impl GitPanel {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                this.refreshing = false;
                 this.loaded = true;
                 this.load_error = None;
                 match result {
@@ -345,6 +405,60 @@ impl GitPanel {
         cx.notify();
     }
 
+    pub fn stage_all(&mut self, _: &StageAll, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repository.is_none() {
+            cx.emit(GitPanelEvent::Status(NO_REPOSITORY.into()));
+        } else if self.unstaged_count == 0 {
+            self.notice = Some(Notice::Info("No changes to stage".into()));
+            cx.notify();
+        } else {
+            let files = self.files(false);
+            self.move_files(files, false, window, cx);
+        }
+    }
+
+    pub fn pull(&mut self, _: &Pull, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync(Remote::Pull, window, cx);
+    }
+
+    pub fn push(&mut self, _: &Push, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync(Remote::Push, window, cx);
+    }
+
+    pub fn fetch(&mut self, _: &Fetch, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync(Remote::Fetch, window, cx);
+    }
+
+    fn sync(&mut self, remote: Remote, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            cx.emit(GitPanelEvent::Status(NO_REPOSITORY.into()));
+            return;
+        };
+        if self.busy {
+            return;
+        }
+        self.run(
+            move || Ok(remote.run(&repository)),
+            move |this, result, _, cx| {
+                let status = match result {
+                    Ok(summary) => {
+                        this.notice = Some(Notice::Info(summary.clone()));
+                        summary
+                    }
+                    Err(error) => {
+                        this.notice = Some(Notice::Error(error.to_string()));
+                        format!("{} failed: {error}", remote.name())
+                    }
+                };
+                cx.emit(GitPanelEvent::Status(status));
+            },
+            window,
+            cx,
+        );
+        self.notice = Some(Notice::Info(remote.progress().into()));
+        cx.emit(GitPanelEvent::Status(remote.progress().into()));
+    }
+
     fn init_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(directory) = self.directory.clone() else {
             return;
@@ -453,6 +567,90 @@ impl GitPanel {
                     )
                     .into_any_element()
             })
+    }
+
+    fn render_actions_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        let commit_input = self.commit_message.read(cx).focus_handle(cx);
+        let button = Button::new("git-actions")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Ellipsis)
+            .tooltip("More Actions")
+            .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, cx| {
+                let Some(this) = panel.upgrade() else {
+                    return menu;
+                };
+                let this = this.read(cx);
+                let (busy, staged, unstaged) = (this.busy, this.staged_count, this.unstaged_count);
+                let item =
+                    |icon: Icon,
+                     label: &'static str,
+                     action: &dyn Action,
+                     run: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+                        menu_item(&panel, icon, label, action, run, cx)
+                    };
+                menu.min_w(px(220.))
+                    .action_context(commit_input.clone())
+                    .item(
+                        item(
+                            Icon::new(IconName::Check),
+                            "Commit",
+                            &Commit,
+                            |this, window, cx| this.commit(&Commit, window, cx),
+                        )
+                        .disabled(busy || staged == 0),
+                    )
+                    .item(
+                        item(
+                            Icon::new(IconName::Plus),
+                            "Stage All Changes",
+                            &StageAll,
+                            |this, window, cx| this.stage_all(&StageAll, window, cx),
+                        )
+                        .disabled(busy || unstaged == 0),
+                    )
+                    .separator()
+                    .item(
+                        item(
+                            Icon::new(IconName::ArrowDown),
+                            "Pull",
+                            &Pull,
+                            |this, window, cx| this.pull(&Pull, window, cx),
+                        )
+                        .disabled(busy),
+                    )
+                    .item(
+                        item(
+                            Icon::new(IconName::ArrowUp),
+                            "Push",
+                            &Push,
+                            |this, window, cx| this.push(&Push, window, cx),
+                        )
+                        .disabled(busy),
+                    )
+                    .item(
+                        item(
+                            Icon::new(AppIcon::CloudDownload),
+                            "Fetch",
+                            &Fetch,
+                            |this, window, cx| this.fetch(&Fetch, window, cx),
+                        )
+                        .disabled(busy),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new("Keyboard Shortcuts…")
+                            .icon(IconName::Settings)
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(EditSettings), cx)
+                            }),
+                    )
+            });
+        div()
+            .debug_selector(|| "git-actions".into())
+            .flex_shrink_0()
+            .child(button)
     }
 
     fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -603,6 +801,37 @@ impl GitPanel {
     }
 }
 
+fn menu_item(
+    panel: &WeakEntity<GitPanel>,
+    icon: Icon,
+    label: &'static str,
+    action: &dyn Action,
+    run: fn(&mut GitPanel, &mut Window, &mut Context<GitPanel>),
+    cx: &App,
+) -> PopupMenuItem {
+    let shortcut = commands::shortcut(action, cx);
+    let panel = panel.clone();
+    PopupMenuItem::element(move |_, _| {
+        div()
+            .debug_selector(move || format!("git-menu-{label}"))
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .child(label)
+            .children(
+                shortcut
+                    .clone()
+                    .map(|keys| div().text_xs().text_color(theme::subtle()).child(keys)),
+            )
+    })
+    .icon(icon)
+    .on_click(move |_, window, cx| {
+        let _ = panel.update(cx, |panel, cx| run(panel, window, cx));
+    })
+}
+
 impl Render for GitPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let message = |text: String| div().px_4().py_2().text_color(theme::muted()).child(text);
@@ -610,6 +839,16 @@ impl Render for GitPanel {
             ui::empty_state(
                 Icon::new(AppIcon::GitBranch).size(px(28.)),
                 "Open a folder to see its Git changes.",
+            )
+            .child(
+                div().pt_2().child(
+                    Button::new("git-clone")
+                        .small()
+                        .label("Clone Repository…")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(CloneRepository), cx)
+                        }),
+                ),
             )
             .into_any_element()
         } else if let Some(error) = &self.load_error {
@@ -652,6 +891,7 @@ impl Render for GitPanel {
             self.render_changes(cx).into_any_element()
         };
         let has_repository = self.repository.is_some();
+        let actions = has_repository.then(|| self.render_actions_menu(cx));
         div()
             .debug_selector(|| "git-panel".into())
             .size_full()
@@ -682,14 +922,7 @@ impl Render for GitPanel {
                                     div().min_w_0().truncate().child(self.status.branch.label()),
                                 ),
                         )
-                        .child(
-                            Button::new("git-refresh")
-                                .ghost()
-                                .xsmall()
-                                .icon(AppIcon::Refresh)
-                                .tooltip("Refresh")
-                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                        )
+                        .children(actions)
                 }),
             )
             .child(div().flex_1().min_h_0().child(body))

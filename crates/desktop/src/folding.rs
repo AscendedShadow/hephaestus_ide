@@ -51,6 +51,14 @@ pub fn toggle_line(source: &str, folds: &mut Vec<Fold>, display_offset: usize) -
     Some(apply(source, folds, display_offset, change))
 }
 
+pub fn reveal(source: &str, folds: &mut Vec<Fold>, offset: usize) -> Option<Toggle> {
+    let ix = folds.iter().position(|fold| fold.range.contains(&offset))?;
+    let display = source_to_display(folds, folds[ix].range.start);
+    let mut toggle = apply(source, folds, display, Change::Unfold(ix));
+    toggle.cursor = source_to_display(folds, offset);
+    Some(toggle)
+}
+
 pub fn apply_edit(source: &str, folds: &mut Vec<Fold>, displayed: &str) -> Option<String> {
     let previous = projected(source, folds);
     if previous == displayed {
@@ -163,7 +171,7 @@ fn display_spans(folds: &[Fold]) -> Vec<(Range<usize>, Range<usize>)> {
         .collect()
 }
 
-fn display_to_source(folds: &[Fold], offset: usize, end_bias: bool) -> usize {
+pub fn display_to_source(folds: &[Fold], offset: usize, end_bias: bool) -> usize {
     let mut adjustment = 0isize;
     for (source, display) in display_spans(folds) {
         if offset <= display.start {
@@ -177,7 +185,7 @@ fn display_to_source(folds: &[Fold], offset: usize, end_bias: bool) -> usize {
     offset.saturating_add_signed(adjustment)
 }
 
-fn source_to_display(folds: &[Fold], offset: usize) -> usize {
+pub fn source_to_display(folds: &[Fold], offset: usize) -> usize {
     let mut adjustment = 0isize;
     for fold in folds {
         if offset <= fold.range.start {
@@ -441,6 +449,30 @@ mod tests {
         assert!(folds.is_empty());
         assert_eq!(apply_edit(SOURCE, &mut folds, &folded), None);
         assert_eq!(projected(SOURCE, &folds), folded);
+    }
+
+    #[test]
+    fn revealing_a_hidden_offset_unfolds_only_its_block() {
+        let source = "a {\n  one();\n}\nb {\n  two();\n}\n";
+        let mut folds = Vec::new();
+        toggle_line(source, &mut folds, 0).unwrap();
+        let displayed = projected(source, &folds);
+        toggle_line(source, &mut folds, displayed.find("b {").unwrap()).unwrap();
+        let displayed = projected(source, &folds);
+        assert_eq!(displayed, "a {...}\nb {...}\n");
+
+        let two = source.find("two").unwrap();
+        let toggle = reveal(source, &mut folds, two).unwrap();
+        assert!(!toggle.folded);
+        let revealed = edited(&displayed, &toggle);
+        assert_eq!(revealed, projected(source, &folds));
+        assert_eq!(revealed, "a {...}\nb {\n  two();\n}\n");
+        assert_eq!(&revealed[toggle.cursor..toggle.cursor + 3], "two");
+        assert_eq!(display_to_source(&folds, toggle.cursor, false), two);
+
+        assert!(reveal(source, &mut folds, two).is_none());
+        assert!(reveal(source, &mut folds, source.find("b {").unwrap()).is_none());
+        assert_eq!(source_to_display(&folds, source.find("b {").unwrap()), 8);
     }
 
     fn pair_text(source: &str, cursor: usize) -> Option<&str> {

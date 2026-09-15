@@ -1,33 +1,39 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui::{AssetSource, Image, ImageFormat, Result, SharedString};
 use gpui_component::IconNamed;
+
+static LOGO: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../resources/hephaestus-64.png").to_vec(),
+    ))
+});
+
+pub fn logo() -> Arc<Image> {
+    LOGO.clone()
+}
 
 #[derive(Clone, Copy)]
 pub enum AppIcon {
-    Anvil,
     Bug,
+    CloudDownload,
     Files,
     GitBranch,
-    Refresh,
 }
 
 impl AppIcon {
-    const ALL: [Self; 5] = [
-        Self::Anvil,
-        Self::Bug,
-        Self::Files,
-        Self::GitBranch,
-        Self::Refresh,
-    ];
+    const ALL: [Self; 4] = [Self::Bug, Self::CloudDownload, Self::Files, Self::GitBranch];
 
     fn svg(self) -> &'static str {
         match self {
-            Self::Anvil => include_str!("icons/anvil.svg"),
             Self::Bug => include_str!("icons/bug.svg"),
+            Self::CloudDownload => include_str!("icons/cloud-download.svg"),
             Self::Files => include_str!("icons/files.svg"),
             Self::GitBranch => include_str!("icons/git-branch.svg"),
-            Self::Refresh => include_str!("icons/refresh-cw.svg"),
         }
     }
 }
@@ -35,11 +41,10 @@ impl AppIcon {
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
         match self {
-            Self::Anvil => "icons/app/anvil.svg",
             Self::Bug => "icons/app/bug.svg",
+            Self::CloudDownload => "icons/app/cloud-download.svg",
             Self::Files => "icons/app/files.svg",
             Self::GitBranch => "icons/app/git-branch.svg",
-            Self::Refresh => "icons/app/refresh-cw.svg",
         }
         .into()
     }
