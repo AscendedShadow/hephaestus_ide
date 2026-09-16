@@ -8,9 +8,9 @@ use std::{
 
 use gpui::{
     Action, App, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler as _, Focusable,
-    FontWeight, Img, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    FontWeight, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     PathPromptOptions, Pixels, Render, Stateful, Subscription, Task, TextRun,
-    UniformListScrollHandle, Window, canvas, div, img, prelude::*, px, uniform_list,
+    UniformListScrollHandle, Window, canvas, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Root, RopeExt as _, Sizable as _, ThemeMode, TitleBar,
@@ -31,7 +31,7 @@ use ide_core::{
 };
 
 use crate::{
-    assets::{self, AppIcon},
+    assets::AppIcon,
     brace_guide::BraceGuide,
     commands::*,
     diff_view::DiffView,
@@ -216,10 +216,6 @@ fn tab_close_button(id: impl Into<ElementId>, hidden: bool) -> Stateful<Div> {
         })
         .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
         .child(Icon::new(IconName::Close).size(px(12.)))
-}
-
-fn logo() -> Img {
-    img(assets::logo()).size(px(18.)).flex_shrink_0()
 }
 
 type BufferId = u64;
@@ -2182,7 +2178,6 @@ impl IdeShell {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(logo())
                     .when_some(self.menu_bar.clone(), |row, menu_bar| {
                         row.child(div().flex_shrink_0().child(menu_bar))
                     }),

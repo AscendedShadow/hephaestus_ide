@@ -1,21 +1,7 @@
-use std::{
-    borrow::Cow,
-    sync::{Arc, LazyLock},
-};
+use std::borrow::Cow;
 
-use gpui::{AssetSource, Image, ImageFormat, Result, SharedString};
+use gpui::{AssetSource, Result, SharedString};
 use gpui_component::IconNamed;
-
-static LOGO: LazyLock<Arc<Image>> = LazyLock::new(|| {
-    Arc::new(Image::from_bytes(
-        ImageFormat::Png,
-        include_bytes!("../resources/hephaestus-64.png").to_vec(),
-    ))
-});
-
-pub fn logo() -> Arc<Image> {
-    LOGO.clone()
-}
 
 #[derive(Clone, Copy)]
 pub enum AppIcon {
