@@ -35,12 +35,34 @@ actions!(
         ShowGitPanel,
         ShowDebugPanel,
         ToggleVimMode,
-        ToggleFold
+        ToggleFold,
+        QuickOpen,
+        CommandPalette,
+        SearchProject,
+        FindInFile,
+        RunCommand,
+        StopCommand,
+        StartDebugger,
+        ReloadFile,
+        ShowDiagnostics,
+        GoToDefinition,
+        HoverInfo,
+        CompleteCode,
+        ToggleBreakpoint,
+        DebugContinue,
+        DebugStepOver,
+        DebugStepInto,
+        DebugStepOut,
+        DebugInterrupt,
+        GoBack,
+        GoForward,
+        GoToLine
     ]
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum Command {
     NewFile,
     OpenFile,
@@ -68,10 +90,31 @@ pub enum Command {
     Fetch,
     TerminalCopy,
     TerminalPaste,
+    QuickOpen,
+    CommandPalette,
+    SearchProject,
+    FindInFile,
+    RunCommand,
+    StopCommand,
+    StartDebugger,
+    ReloadFile,
+    ShowDiagnostics,
+    GoToDefinition,
+    HoverInfo,
+    CompleteCode,
+    ToggleBreakpoint,
+    DebugContinue,
+    DebugStepOver,
+    DebugStepInto,
+    DebugStepOut,
+    DebugInterrupt,
+    GoBack,
+    GoForward,
+    GoToLine,
 }
 
 impl Command {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 47] = [
         Self::NewFile,
         Self::OpenFile,
         Self::OpenFolder,
@@ -98,6 +141,27 @@ impl Command {
         Self::Fetch,
         Self::TerminalCopy,
         Self::TerminalPaste,
+        Self::QuickOpen,
+        Self::CommandPalette,
+        Self::SearchProject,
+        Self::FindInFile,
+        Self::RunCommand,
+        Self::StopCommand,
+        Self::StartDebugger,
+        Self::ReloadFile,
+        Self::ShowDiagnostics,
+        Self::GoToDefinition,
+        Self::HoverInfo,
+        Self::CompleteCode,
+        Self::ToggleBreakpoint,
+        Self::DebugContinue,
+        Self::DebugStepOver,
+        Self::DebugStepInto,
+        Self::DebugStepOut,
+        Self::DebugInterrupt,
+        Self::GoBack,
+        Self::GoForward,
+        Self::GoToLine,
     ];
 
     pub fn name(self) -> String {
@@ -107,7 +171,7 @@ impl Command {
         }
     }
 
-    fn action(self) -> Box<dyn Action> {
+    pub(crate) fn action(self) -> Box<dyn Action> {
         match self {
             Self::NewFile => Box::new(NewFile),
             Self::OpenFile => Box::new(OpenFile),
@@ -135,6 +199,27 @@ impl Command {
             Self::Fetch => Box::new(git_panel::Fetch),
             Self::TerminalCopy => Box::new(terminal_view::Copy),
             Self::TerminalPaste => Box::new(terminal_view::Paste),
+            Self::QuickOpen => Box::new(QuickOpen),
+            Self::CommandPalette => Box::new(CommandPalette),
+            Self::SearchProject => Box::new(SearchProject),
+            Self::FindInFile => Box::new(FindInFile),
+            Self::RunCommand => Box::new(RunCommand),
+            Self::StopCommand => Box::new(StopCommand),
+            Self::StartDebugger => Box::new(StartDebugger),
+            Self::ReloadFile => Box::new(ReloadFile),
+            Self::ShowDiagnostics => Box::new(ShowDiagnostics),
+            Self::GoToDefinition => Box::new(GoToDefinition),
+            Self::HoverInfo => Box::new(HoverInfo),
+            Self::CompleteCode => Box::new(CompleteCode),
+            Self::ToggleBreakpoint => Box::new(ToggleBreakpoint),
+            Self::DebugContinue => Box::new(DebugContinue),
+            Self::DebugStepOver => Box::new(DebugStepOver),
+            Self::DebugStepInto => Box::new(DebugStepInto),
+            Self::DebugStepOut => Box::new(DebugStepOut),
+            Self::DebugInterrupt => Box::new(DebugInterrupt),
+            Self::GoBack => Box::new(GoBack),
+            Self::GoForward => Box::new(GoForward),
+            Self::GoToLine => Box::new(GoToLine),
         }
     }
 
@@ -176,6 +261,27 @@ impl Command {
             Self::Fetch => &["secondary-shift-j"],
             Self::TerminalCopy => &[if mac { "cmd-c" } else { "ctrl-shift-c" }],
             Self::TerminalPaste => &[if mac { "cmd-v" } else { "ctrl-shift-v" }],
+            Self::QuickOpen => &["secondary-p"],
+            Self::CommandPalette => &["secondary-shift-p"],
+            Self::SearchProject => &["secondary-shift-f"],
+            Self::FindInFile => &[],
+            Self::RunCommand => &["secondary-shift-b"],
+            Self::StopCommand => &["secondary-shift-x"],
+            Self::StartDebugger => &["f5"],
+            Self::ReloadFile => &[],
+            Self::ShowDiagnostics => &["secondary-shift-m"],
+            Self::GoToDefinition => &["f12"],
+            Self::HoverInfo => &["secondary-k secondary-i"],
+            Self::CompleteCode => &["ctrl-space"],
+            Self::ToggleBreakpoint => &["f9"],
+            Self::DebugContinue => &["f6"],
+            Self::DebugStepOver => &["f10"],
+            Self::DebugStepInto => &["f11"],
+            Self::DebugStepOut => &["shift-f11"],
+            Self::DebugInterrupt => &["ctrl-f6"],
+            Self::GoBack => &["alt-left"],
+            Self::GoForward => &["alt-right"],
+            Self::GoToLine => &["secondary-g"],
         };
         let primary = if mac { "cmd" } else { "ctrl" };
         keys.iter()

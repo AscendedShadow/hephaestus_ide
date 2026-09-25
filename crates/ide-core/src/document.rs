@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File},
+    hash::{Hash, Hasher},
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
@@ -32,6 +33,7 @@ pub struct Document {
     saved_text: Rope,
     line_ending: LineEnding,
     utf8_bom: bool,
+    disk_hash: Option<u64>,
 }
 
 impl Document {
@@ -48,6 +50,7 @@ impl Document {
         }
         let mut document = Self::decode(&bytes)?;
         document.path = Some(path);
+        document.disk_hash = Some(hash_bytes(&bytes));
         Ok(document)
     }
 
@@ -72,6 +75,7 @@ impl Document {
             line_ending,
             utf8_bom,
             path: None,
+            disk_hash: None,
         })
     }
 
@@ -111,6 +115,12 @@ impl Document {
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("Invalid file path"))?;
+        if self.path.as_deref() == Some(path.as_path()) && self.has_external_changes()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "File changed on disk; reload it or use Save As to preserve both versions",
+            ));
+        }
         let permissions = match fs::metadata(&path) {
             Ok(metadata) => {
                 if metadata.permissions().readonly() {
@@ -137,17 +147,41 @@ impl Document {
             LineEnding::CrLf => text.replace('\n', "\r\n"),
         };
         file.write_all(text.as_bytes())?;
+        let mut written = Vec::with_capacity(text.len() + 3);
+        if self.utf8_bom {
+            written.extend_from_slice(b"\xef\xbb\xbf");
+        }
+        written.extend_from_slice(text.as_bytes());
         file.as_file().sync_all()?;
         file.persist(&path).map_err(|error| error.error)?;
         self.path = Some(path.canonicalize().unwrap_or(path));
         self.saved_text = self.text.clone();
+        self.disk_hash = Some(hash_bytes(&written));
         Ok(self)
+    }
+
+    pub fn has_external_changes(&self) -> io::Result<bool> {
+        let (Some(path), Some(expected)) = (&self.path, self.disk_hash) else {
+            return Ok(false);
+        };
+        match fs::read(path) {
+            Ok(bytes) => Ok(hash_bytes(&bytes) != expected),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn accept_saved(&mut self, saved: Self) {
         self.path = saved.path;
         self.saved_text = saved.saved_text;
+        self.disk_hash = saved.disk_hash;
     }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -242,5 +276,25 @@ mod tests {
         document.set_text(Rope::from("pasted\r\ntext\n"));
         document.save_to(&path).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "pasted\r\ntext\r\n");
+    }
+
+    #[test]
+    fn refuses_to_overwrite_external_edits_and_tracks_new_saved_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        fs::write(&path, "first").unwrap();
+        let mut document = Document::open(&path).unwrap();
+        document.set_text(Rope::from("ours"));
+        fs::write(&path, "theirs").unwrap();
+        assert!(document.has_external_changes().unwrap());
+        assert_eq!(
+            document.clone().save_to(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "theirs");
+        let saved = document
+            .save_to(&directory.path().join("ours.txt"))
+            .unwrap();
+        assert!(!saved.has_external_changes().unwrap());
     }
 }

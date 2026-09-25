@@ -1,16 +1,18 @@
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
+    fs,
     ops::Range,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     rc::Rc,
 };
 
 use gpui::{
-    Action, App, ClickEvent, Context, Div, ElementId, Entity, EntityInputHandler as _, Focusable,
-    FontWeight, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
-    PathPromptOptions, Pixels, Render, Stateful, Subscription, Task, TextRun,
-    UniformListScrollHandle, Window, canvas, div, prelude::*, px, uniform_list,
+    Action, App, Context, Div, ElementId, Entity, EntityInputHandler as _, Focusable, FontWeight,
+    IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, PathPromptOptions, Pixels,
+    Render, Stateful, Subscription, Task, TextRun, UniformListScrollHandle, Window, canvas, div,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Root, RopeExt as _, Sizable as _, ThemeMode, TitleBar,
@@ -18,14 +20,15 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::DialogButtonProps,
     input::{Input, InputEvent, InputState, Position, TabSize},
-    menu::AppMenuBar,
+    menu::{AppMenuBar, ContextMenuExt as _, PopupMenuItem},
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
+    scroll::ScrollableElement as _,
     switch::Switch,
-    tooltip::Tooltip,
 };
 use ide_core::{
     document::Document,
     git::{self, Change, Repository},
+    search::{self, Match as SearchMatch},
     vim::Command as VimCommand,
     workspace::{self, TreeRow, Workspace},
 };
@@ -35,12 +38,15 @@ use crate::{
     brace_guide::BraceGuide,
     commands::*,
     diff_view::DiffView,
+    file_icons::FileKind,
     folding::{self, Fold, Toggle},
     git_panel::{GitPanel, GitPanelEvent},
+    language_server,
     navigation::{self, Hit, Lookup, Search},
+    session::{self, Session},
     settings::{self, Settings},
     syntax,
-    terminal_view::TerminalView,
+    terminal_view::{TerminalEvent, TerminalView},
     theme,
     ui::{self, HEADER_HEIGHT},
     vim::VimInput,
@@ -49,6 +55,10 @@ use crate::{
 #[cfg(test)]
 #[path = "shell_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "shell_feature_tests.rs"]
+mod feature_tests;
 
 pub const EDITOR_CONTEXT: &str = "Editor";
 const INDENT_WIDTH: usize = 2;
@@ -65,6 +75,23 @@ fn position_at(text: &str, offset: usize) -> Position {
     Position::new(line, character)
 }
 
+fn breakpoint_command(path: &Path, line: usize, enabled: bool, lldb: bool) -> String {
+    let name = path.to_string_lossy().replace('\\', "/");
+    let name = name.strip_prefix("//?/").unwrap_or(&name);
+    let name = name.replace('"', "\\\"").replace(['\r', '\n'], "");
+    if lldb {
+        format!(
+            "breakpoint {} --file \"{name}\" --line {line}",
+            if enabled { "set" } else { "clear" }
+        )
+    } else {
+        format!(
+            "{} \"{name}\":{line}",
+            if enabled { "break" } else { "clear" }
+        )
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum SidebarPanel {
     #[default]
@@ -77,6 +104,18 @@ enum ToolPanel {
     #[default]
     Terminal,
     Debug,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchMode {
+    Files,
+    Commands,
+    Project,
+    File,
+    Tasks,
+    Diagnostics,
+    Completion,
+    Line,
 }
 
 impl ToolPanel {
@@ -97,49 +136,7 @@ impl ToolPanel {
     }
 }
 
-const ACTIVITY_BAR_WIDTH: f32 = 44.;
 const TAB_GROUP: &str = "tab";
-
-fn activity_item(
-    id: &'static str,
-    icon: Icon,
-    active: bool,
-    tooltip: &'static str,
-    action: Box<dyn Action>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .relative()
-        .size(px(34.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(theme::muted())
-        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
-        .when(active, |item| {
-            item.text_color(theme::text()).child(
-                div()
-                    .absolute()
-                    .left(px(-5.))
-                    .top(px(8.))
-                    .bottom(px(8.))
-                    .w(px(2.))
-                    .rounded_full()
-                    .bg(theme::accent()),
-            )
-        })
-        .child(icon.size(px(18.)))
-        .tooltip(move |window, cx| {
-            Tooltip::new(tooltip)
-                .action(action.as_ref(), None)
-                .build(window, cx)
-        })
-        .on_click(on_click)
-}
 
 fn status_item(id: &'static str, active: bool) -> Stateful<Div> {
     div()
@@ -232,6 +229,7 @@ struct Buffer {
     editor: Entity<InputState>,
     dirty: bool,
     folds: Vec<Fold>,
+    external_change: bool,
     _subscription: Subscription,
 }
 
@@ -258,8 +256,13 @@ pub struct IdeShell {
     sidebar_split: Entity<ResizableState>,
     tool_panel_split: Entity<ResizableState>,
     active_sidebar: SidebarPanel,
+    show_sidebar: bool,
     active_panel: ToolPanel,
     terminal: Entity<TerminalView>,
+    task_terminal: Entity<TerminalView>,
+    debugger_active: bool,
+    debugger_lldb: bool,
+    breakpoints: HashMap<PathBuf, BTreeSet<usize>>,
     git: Entity<GitPanel>,
     diff_view: Entity<DiffView>,
     show_diff: bool,
@@ -269,6 +272,28 @@ pub struct IdeShell {
     vim: Option<VimInput>,
     status: String,
     declaration_search: Task<()>,
+    search_mode: Option<SearchMode>,
+    search_input: Entity<InputState>,
+    search_paths: Vec<PathBuf>,
+    recent_paths: Vec<PathBuf>,
+    locations: Vec<SearchMatch>,
+    location_index: usize,
+    search_hits: Vec<SearchMatch>,
+    search_task: Task<()>,
+    search_selected: usize,
+    task_commands: Vec<settings::RunConfig>,
+    language_server: Option<language_server::Client>,
+    lsp_ready: bool,
+    lsp_versions: HashMap<PathBuf, i64>,
+    diagnostics: HashMap<PathBuf, Vec<SearchMatch>>,
+    run_hits: Vec<SearchMatch>,
+    command_directory: Option<PathBuf>,
+    lsp_task: Task<()>,
+    pending_definition: Option<(i64, BufferId, usize)>,
+    pending_hover: Option<i64>,
+    pending_completion: Option<(i64, BufferId)>,
+    completions: Vec<(String, String)>,
+    pending_hit: Option<SearchMatch>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -287,8 +312,15 @@ impl IdeShell {
             sidebar_split: cx.new(|_| ResizableState::default()),
             tool_panel_split: cx.new(|_| ResizableState::default()),
             active_sidebar: SidebarPanel::default(),
+            show_sidebar: settings::path(cx)
+                .and_then(|path| Settings::load(&path).ok())
+                .is_some_and(|settings| settings.show_sidebar),
             active_panel: ToolPanel::default(),
             terminal: cx.new(TerminalView::new),
+            task_terminal: cx.new(TerminalView::new),
+            debugger_active: false,
+            debugger_lldb: false,
+            breakpoints: HashMap::new(),
             git,
             diff_view,
             show_diff: false,
@@ -298,6 +330,32 @@ impl IdeShell {
             vim: None,
             status: "Ready — open a file or start typing".into(),
             declaration_search: Task::ready(()),
+            search_mode: None,
+            search_input: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Search…")
+                    .multi_line(false)
+            }),
+            search_paths: Vec::new(),
+            recent_paths: Vec::new(),
+            locations: Vec::new(),
+            location_index: 0,
+            search_hits: Vec::new(),
+            search_task: Task::ready(()),
+            search_selected: 0,
+            task_commands: Vec::new(),
+            language_server: None,
+            lsp_ready: false,
+            lsp_versions: HashMap::new(),
+            diagnostics: HashMap::new(),
+            run_hits: Vec::new(),
+            command_directory: None,
+            lsp_task: Task::ready(()),
+            pending_definition: None,
+            pending_hover: None,
+            pending_completion: None,
+            completions: Vec::new(),
+            pending_hit: None,
             _subscriptions: Vec::new(),
         };
         shell._subscriptions = vec![
@@ -332,7 +390,36 @@ impl IdeShell {
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_git(cx);
+                    this.check_disk_changes(window, cx);
                 }
+            }),
+            cx.subscribe_in(
+                &shell.search_input,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::Change => {
+                        let text = input.read(cx).text().to_string();
+                        if !text.ends_with('\n') {
+                            this.update_search(text, cx);
+                        }
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.choose_search_result(this.search_selected, window, cx)
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe(&shell.task_terminal, |this, _, event, cx| {
+                let TerminalEvent::Exited(lines) = event;
+                let directory = this.command_directory.as_deref().unwrap_or(Path::new("."));
+                this.run_hits = ide_core::output::locations(lines, directory);
+                if !this.run_hits.is_empty() {
+                    this.status = format!(
+                        "{} build location(s) — open Diagnostics to navigate",
+                        this.run_hits.len()
+                    );
+                }
+                cx.notify();
             }),
         ];
         let buffer = shell.new_buffer(Document::default(), window, cx);
@@ -343,6 +430,66 @@ impl IdeShell {
 
     pub fn set_status(&mut self, status: String) {
         self.status = status;
+    }
+
+    pub fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = settings::path(cx).map(|path| session::path(&path)) else {
+            return;
+        };
+        let snapshot = session::load(&path);
+        if let Some(folder) = snapshot.folder
+            && let Ok(workspace) = Workspace::open(&folder)
+        {
+            self.set_workspace(workspace, cx);
+        }
+        for (ix, file) in snapshot.files.into_iter().take(12).enumerate() {
+            if let Ok(document) = Document::open(&file) {
+                self.open_document(document, window, cx);
+                if let Some((line, column)) = snapshot.cursors.get(ix).copied() {
+                    self.editor().update(cx, |editor, cx| {
+                        editor.set_cursor_position(Position::new(line, column), window, cx)
+                    });
+                }
+            }
+        }
+        if snapshot.active < self.buffers.len() {
+            self.activate(snapshot.active, window, cx);
+        }
+        self.recent_paths = snapshot
+            .recent
+            .into_iter()
+            .filter(|path| path.is_file())
+            .take(100)
+            .collect();
+    }
+
+    fn save_session(&self, cx: &App) {
+        let Some(path) = settings::path(cx).map(|path| session::path(&path)) else {
+            return;
+        };
+        let snapshot = Session {
+            folder: self.workspace.root().map(Path::to_path_buf),
+            files: self
+                .buffers
+                .iter()
+                .filter_map(|buffer| buffer.document.path().map(Path::to_path_buf))
+                .collect(),
+            active: self.buffers[..self.active]
+                .iter()
+                .filter(|buffer| buffer.document.path().is_some())
+                .count(),
+            cursors: self
+                .buffers
+                .iter()
+                .filter(|buffer| buffer.document.path().is_some())
+                .map(|buffer| {
+                    let cursor = buffer.editor.read(cx).cursor_position();
+                    (cursor.line, cursor.character)
+                })
+                .collect(),
+            recent: self.recent_paths.clone(),
+        };
+        let _ = session::save(&path, &snapshot);
     }
 
     fn buffer(&self) -> &Buffer {
@@ -401,6 +548,7 @@ impl IdeShell {
                     buffer.document.set_text(text.into());
                 }
                 buffer.dirty = buffer.document.is_dirty();
+                this.sync_lsp_buffer(ix);
                 cx.notify();
             }
         });
@@ -410,12 +558,18 @@ impl IdeShell {
             editor,
             dirty: false,
             folds: Vec::new(),
+            external_change: false,
             _subscription: subscription,
         }
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active = ix;
+        if let Some(path) = self.document().path().map(Path::to_path_buf) {
+            self.recent_paths.retain(|recent| recent != &path);
+            self.recent_paths.insert(0, path);
+            self.recent_paths.truncate(100);
+        }
         self.show_diff = false;
         let editor = self.editor().clone();
         editor.update(cx, |editor, cx| editor.focus(window, cx));
@@ -423,6 +577,323 @@ impl IdeShell {
             vim.reset(&editor, cx);
         }
         self.sync_git(cx);
+        self.start_language_server(window, cx);
+        self.sync_lsp_buffer(ix);
+        cx.notify();
+    }
+
+    fn start_language_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.language_server.is_some() {
+            return;
+        }
+        let Some(root) = self.project_directory().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(settings_path) = settings::path(cx) else {
+            return;
+        };
+        let Ok(settings) = Settings::load(&settings_path) else {
+            return;
+        };
+        let Some(config) = settings.language_server else {
+            return;
+        };
+        if config.program.is_empty() {
+            return;
+        }
+        match language_server::Client::start(&config, &root) {
+            Ok(client) => {
+                let events = client.events.clone();
+                self.language_server = Some(client);
+                self.lsp_ready = false;
+                self.lsp_versions.clear();
+                self.lsp_task = cx.spawn_in(window, async move |this, cx| {
+                    while let Ok(event) = events.recv().await {
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.handle_lsp_event(event, window, cx)
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        this.language_server = None;
+                        this.lsp_ready = false;
+                        this.lsp_versions.clear();
+                        this.diagnostics.clear();
+                        this.status = "Language server stopped; reopen a file to restart it".into();
+                        cx.notify();
+                    });
+                });
+            }
+            Err(error) => self.status = format!("Language server: {error}"),
+        }
+    }
+
+    fn sync_lsp_buffer(&mut self, ix: usize) {
+        if !self.lsp_ready {
+            return;
+        }
+        let buffer = &self.buffers[ix];
+        if syntax::language(buffer.document.path()) != "rust" {
+            return;
+        }
+        let Some(path) = buffer.document.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let text = buffer.document.text().to_string();
+        let Some(client) = &mut self.language_server else {
+            return;
+        };
+        let version = self.lsp_versions.entry(path.clone()).or_insert(0);
+        *version += 1;
+        let result = if *version == 1 {
+            client.open(&path, &text, *version)
+        } else {
+            client.change(&path, &text, *version)
+        };
+        if result.is_err() {
+            self.language_server = None;
+            self.lsp_ready = false;
+        }
+    }
+
+    fn handle_lsp_event(
+        &mut self,
+        event: serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let (Some(id), Some(method)) = (event.get("id"), event["method"].as_str()) {
+            let result = match method {
+                "workspace/configuration" => serde_json::Value::Array(
+                    event["params"]["items"]
+                        .as_array()
+                        .map(|items| vec![serde_json::Value::Null; items.len()])
+                        .unwrap_or_default(),
+                ),
+                "workspace/applyEdit" => serde_json::json!({"applied":false}),
+                _ => serde_json::Value::Null,
+            };
+            if let Some(server) = &mut self.language_server {
+                let _ = server.respond(id.clone(), result);
+            }
+            return;
+        }
+        if event["id"] == 1 && event.get("result").is_some() {
+            self.lsp_ready = self
+                .language_server
+                .as_mut()
+                .is_some_and(|server| server.initialized().is_ok());
+            if self.lsp_ready {
+                for ix in 0..self.buffers.len() {
+                    self.sync_lsp_buffer(ix);
+                }
+            }
+        } else if event["method"] == "textDocument/publishDiagnostics" {
+            let params = &event["params"];
+            if let Some(path) = params["uri"]
+                .as_str()
+                .and_then(language_server::path_from_uri)
+            {
+                if !self.lsp_versions.contains_key(&path) {
+                    return;
+                }
+                let version = params["version"].as_i64();
+                if version.is_some_and(|version| {
+                    self.lsp_versions
+                        .get(&path)
+                        .is_some_and(|current| version < *current)
+                }) {
+                    return;
+                }
+                let count = params["diagnostics"].as_array().map_or(0, Vec::len);
+                let hits = params["diagnostics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|diagnostic| {
+                        let start = &diagnostic["range"]["start"];
+                        Some(SearchMatch {
+                            path: path.clone(),
+                            line: start["line"].as_u64()? as usize + 1,
+                            column: start["character"].as_u64()? as usize + 1,
+                            preview: diagnostic["message"]
+                                .as_str()?
+                                .lines()
+                                .next()?
+                                .chars()
+                                .take(160)
+                                .collect(),
+                        })
+                    })
+                    .collect();
+                self.diagnostics.insert(path.clone(), hits);
+                self.status = format!("{}: {count} diagnostic(s)", path.display());
+            }
+        } else if let Some((id, buffer_id, offset)) = self.pending_definition
+            && event["id"].as_i64() == Some(id)
+        {
+            self.pending_definition = None;
+            if self.buffer_index(buffer_id).is_some() {
+                let result = event["result"]
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .unwrap_or(&event["result"]);
+                let uri = result["uri"]
+                    .as_str()
+                    .or_else(|| result["targetUri"].as_str());
+                let start = if result.get("range").is_some() {
+                    &result["range"]["start"]
+                } else {
+                    &result["targetSelectionRange"]["start"]
+                };
+                if let (Some(path), Some(line), Some(character)) = (
+                    uri.and_then(language_server::path_from_uri),
+                    start["line"].as_u64(),
+                    start["character"].as_u64(),
+                ) {
+                    let hit = SearchMatch {
+                        path,
+                        line: line as usize + 1,
+                        column: character as usize + 1,
+                        preview: String::new(),
+                    };
+                    self.record_location(&hit, cx);
+                    self.open_at(hit, window, cx);
+                } else if self.buffer().id == buffer_id {
+                    self.go_to_declaration_fallback(offset, window, cx);
+                }
+            }
+        } else if self.pending_hover == event["id"].as_i64() && self.pending_hover.is_some() {
+            self.pending_hover = None;
+            let contents = &event["result"]["contents"];
+            let text = contents.as_str().or_else(|| contents["value"].as_str());
+            self.status = text
+                .map(|text| {
+                    text.lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(240)
+                        .collect()
+                })
+                .unwrap_or_else(|| "No hover information".into());
+        } else if let Some((id, buffer_id)) = self.pending_completion
+            && event["id"].as_i64() == Some(id)
+        {
+            self.pending_completion = None;
+            let result = &event["result"];
+            let items = result.as_array().or_else(|| result["items"].as_array());
+            self.completions = items
+                .into_iter()
+                .flatten()
+                .filter_map(|item| {
+                    let label = item["label"].as_str()?.to_string();
+                    let insert = item["textEdit"]["newText"]
+                        .as_str()
+                        .or_else(|| item["insertText"].as_str())
+                        .unwrap_or(&label)
+                        .to_string();
+                    (!insert.contains('$')).then_some((label, insert))
+                })
+                .take(100)
+                .collect();
+            if self.buffer().id == buffer_id && !self.completions.is_empty() {
+                self.show_search(SearchMode::Completion, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn check_disk_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let documents: Vec<_> = self
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.document.path().is_some())
+            .map(|buffer| (buffer.id, buffer.document.clone()))
+            .collect();
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let changed = executor
+                .spawn(async move {
+                    documents
+                        .into_iter()
+                        .filter_map(|(id, document)| match document.has_external_changes() {
+                            Ok(true) => Some((id, document.path().unwrap().to_path_buf())),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                for (id, path) in changed {
+                    let Some(ix) = this.buffer_index(id) else {
+                        continue;
+                    };
+                    if this.buffers[ix].document.path() != Some(path.as_path()) {
+                        continue;
+                    }
+                    if !this.buffers[ix]
+                        .document
+                        .has_external_changes()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if this.buffers[ix].dirty {
+                        this.buffers[ix].external_change = true;
+                        this.status =
+                            format!("{} changed on disk — Save As or reload", path.display());
+                    } else if let Ok(document) = Document::open(&path) {
+                        let text = document.text().to_string();
+                        let buffer = &mut this.buffers[ix];
+                        buffer.document = document;
+                        buffer.folds.clear();
+                        buffer
+                            .editor
+                            .update(cx, |editor, cx| editor.set_value(text, window, cx));
+                        buffer.dirty = false;
+                        buffer.external_change = false;
+                        this.status = format!("Reloaded {}", path.display());
+                    } else {
+                        this.buffers[ix].external_change = true;
+                        this.status = format!(
+                            "{} changed or was deleted — Save As to keep this buffer",
+                            path.display()
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reload_file(&mut self, _: &ReloadFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked() {
+            return;
+        }
+        let Some(path) = self.document().path().map(Path::to_path_buf) else {
+            return;
+        };
+        match Document::open(&path) {
+            Ok(document) => {
+                let text = document.text().to_string();
+                let buffer = &mut self.buffers[self.active];
+                buffer.document = document;
+                buffer.folds.clear();
+                buffer
+                    .editor
+                    .update(cx, |editor, cx| editor.set_value(text, window, cx));
+                buffer.dirty = false;
+                buffer.external_change = false;
+                self.status = format!("Reloaded {}", path.display());
+            }
+            Err(error) => self.status = format!("Reload failed: {error}"),
+        }
         cx.notify();
     }
 
@@ -446,12 +917,27 @@ impl IdeShell {
 
     fn show_folder_panel(&mut self, _: &ShowFolderPanel, _: &mut Window, cx: &mut Context<Self>) {
         self.active_sidebar = SidebarPanel::Folder;
+        self.show_sidebar = true;
         cx.notify();
     }
 
     fn show_git_panel(&mut self, _: &ShowGitPanel, _: &mut Window, cx: &mut Context<Self>) {
         self.active_sidebar = SidebarPanel::Git;
+        self.show_sidebar = true;
         self.refresh_git(cx);
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, panel: SidebarPanel, cx: &mut Context<Self>) {
+        if self.show_sidebar && self.active_sidebar == panel {
+            self.show_sidebar = false;
+        } else {
+            self.active_sidebar = panel;
+            self.show_sidebar = true;
+            if panel == SidebarPanel::Git {
+                self.refresh_git(cx);
+            }
+        }
         cx.notify();
     }
 
@@ -466,6 +952,193 @@ impl IdeShell {
 
     fn show_debug_panel(&mut self, _: &ShowDebugPanel, _: &mut Window, cx: &mut Context<Self>) {
         self.active_panel = ToolPanel::Debug;
+        cx.notify();
+    }
+
+    fn launch_config(
+        &mut self,
+        debugger: bool,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(settings_path) = settings::path(cx) else {
+            self.status = "No settings directory is available".into();
+            cx.notify();
+            return;
+        };
+        let settings = match Settings::load(&settings_path) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.status = error;
+                cx.notify();
+                return;
+            }
+        };
+        let config = if debugger {
+            settings.debugger
+        } else {
+            settings.commands.into_iter().nth(index)
+        };
+        let Some(config) = config.filter(|config| !config.program.trim().is_empty()) else {
+            self.status = if debugger {
+                "Configure debugger in settings.json (program and args)"
+            } else {
+                "Configure commands in settings.json (program and args)"
+            }
+            .into();
+            cx.notify();
+            return;
+        };
+        let directory = config
+            .working_directory
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    self.resolve(&path.to_string_lossy())
+                }
+            })
+            .or_else(|| self.project_directory().map(Path::to_path_buf));
+        if directory.as_ref().is_some_and(|path| !path.is_dir()) {
+            self.status = "Command working directory does not exist".into();
+            cx.notify();
+            return;
+        }
+        let lldb = Path::new(&config.program)
+            .file_stem()
+            .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase().contains("lldb"));
+        let result = self.task_terminal.update(cx, |terminal, cx| {
+            terminal.run(
+                terminal::Options {
+                    shell: Some((config.program, config.args)),
+                    working_directory: directory.clone(),
+                    env: config.env,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        if let Err(error) = result {
+            self.status = error;
+            cx.notify();
+            return;
+        }
+        self.run_hits.clear();
+        self.command_directory = directory;
+        self.debugger_active = debugger;
+        self.debugger_lldb = lldb;
+        self.active_panel = ToolPanel::Debug;
+        window.focus(&self.task_terminal.focus_handle(cx));
+        self.status = format!(
+            "Started {}",
+            if config.name.is_empty() {
+                if debugger { "debugger" } else { "command" }
+            } else {
+                &config.name
+            }
+        );
+        if debugger {
+            for (path, lines) in &self.breakpoints {
+                for line in lines {
+                    let command = breakpoint_command(path, *line, true, lldb);
+                    self.task_terminal.update(cx, |terminal, cx| {
+                        terminal.send_command(&command, cx);
+                    });
+                }
+            }
+            self.task_terminal.update(cx, |terminal, cx| {
+                terminal.send_command("run", cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn run_command(&mut self, _: &RunCommand, window: &mut Window, cx: &mut Context<Self>) {
+        self.task_commands = settings::path(cx)
+            .and_then(|path| Settings::load(&path).ok())
+            .map(|settings| settings.commands)
+            .unwrap_or_default();
+        if self.task_commands.len() > 1 {
+            self.show_search(SearchMode::Tasks, window, cx);
+        } else {
+            self.launch_config(false, 0, window, cx);
+        }
+    }
+
+    fn start_debugger(&mut self, _: &StartDebugger, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch_config(true, 0, window, cx);
+    }
+
+    fn stop_command(&mut self, _: &StopCommand, _: &mut Window, cx: &mut Context<Self>) {
+        self.task_terminal
+            .update(cx, |terminal, cx| terminal.terminate(cx));
+        self.debugger_active = false;
+        self.status = "Stopped process".into();
+        cx.notify();
+    }
+
+    fn debug_command(&mut self, gdb: &str, lldb: &str, cx: &mut Context<Self>) {
+        if !self.debugger_active {
+            self.status = "Start the debugger first".into();
+        } else {
+            let command = if self.debugger_lldb { lldb } else { gdb };
+            if !self
+                .task_terminal
+                .update(cx, |terminal, cx| terminal.send_command(command, cx))
+            {
+                self.status = "Debugger is not running".into();
+            }
+        }
+        cx.notify();
+    }
+
+    fn debug_continue(&mut self, _: &DebugContinue, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug_command("continue", "continue", cx);
+    }
+
+    fn debug_step_over(&mut self, _: &DebugStepOver, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug_command("next", "next", cx);
+    }
+
+    fn debug_step_into(&mut self, _: &DebugStepInto, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug_command("step", "step", cx);
+    }
+
+    fn debug_step_out(&mut self, _: &DebugStepOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.debug_command("finish", "finish", cx);
+    }
+
+    fn debug_interrupt(&mut self, _: &DebugInterrupt, _: &mut Window, cx: &mut Context<Self>) {
+        self.task_terminal
+            .update(cx, |terminal, cx| terminal.stop(cx));
+    }
+
+    fn toggle_breakpoint(&mut self, _: &ToggleBreakpoint, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.document().path().map(Path::to_path_buf) else {
+            self.status = "Save the file before setting a breakpoint".into();
+            cx.notify();
+            return;
+        };
+        let line = self.editor().read(cx).cursor_position().line as usize + 1;
+        let lines = self.breakpoints.entry(path.clone()).or_default();
+        let enabled = if !lines.insert(line) {
+            lines.remove(&line);
+            false
+        } else {
+            true
+        };
+        if self.debugger_active {
+            let command = breakpoint_command(&path, line, enabled, self.debugger_lldb);
+            self.task_terminal.update(cx, |terminal, cx| {
+                terminal.send_command(&command, cx);
+            });
+        }
+        self.status = format!(
+            "Breakpoint {} at {}:{line}",
+            if enabled { "set" } else { "removed" },
+            path.display()
+        );
         cx.notify();
     }
 
@@ -490,6 +1163,13 @@ impl IdeShell {
     }
 
     fn remove_buffer(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.buffers[ix].document.path().map(Path::to_path_buf) {
+            self.lsp_versions.remove(&path);
+            self.diagnostics.remove(&path);
+            if let Some(server) = &mut self.language_server {
+                let _ = server.close(&path);
+            }
+        }
         self.buffers.remove(ix);
         if self.buffers.is_empty() {
             let buffer = self.new_buffer(Document::default(), window, cx);
@@ -528,6 +1208,7 @@ impl IdeShell {
             self.request(PendingAction::CloseWindow, window, cx);
             false
         } else {
+            self.save_session(cx);
             true
         }
     }
@@ -557,7 +1238,10 @@ impl IdeShell {
                     self.remove_buffer(ix, window, cx);
                 }
             }
-            PendingAction::CloseWindow => window.remove_window(),
+            PendingAction::CloseWindow => {
+                self.save_session(cx);
+                window.remove_window();
+            }
         }
     }
 
@@ -619,8 +1303,17 @@ impl IdeShell {
                 this.busy = false;
                 match result {
                     Ok(Some(document)) => {
-                        this.status = format!("Opened {}", document.name());
+                        let opened_path = document.path().map(Path::to_path_buf);
+                        this.status = "Ready".into();
                         this.open_document(document, window, cx);
+                        if this
+                            .pending_hit
+                            .as_ref()
+                            .is_some_and(|hit| Some(&hit.path) == opened_path.as_ref())
+                        {
+                            let hit = this.pending_hit.take().unwrap();
+                            this.jump_to_hit(&hit, window, cx);
+                        }
                     }
                     Ok(None) => this.status = "Open cancelled".into(),
                     Err(error) => this.status = format!("Open failed: {error}"),
@@ -695,15 +1388,32 @@ impl IdeShell {
                         let saved_path = saved.path().map(Path::to_path_buf);
                         if let Some(ix) = this.buffer_index(id) {
                             let buffer = &mut this.buffers[ix];
+                            if let Some(old_path) = buffer.document.path().map(Path::to_path_buf)
+                                && saved_path.as_ref() != Some(&old_path)
+                            {
+                                this.lsp_versions.remove(&old_path);
+                                if let Some(server) = &mut this.language_server {
+                                    let _ = server.close(&old_path);
+                                }
+                            }
                             let language = syntax::language(buffer.document.path());
                             buffer.document.accept_saved(saved);
                             buffer.dirty = buffer.document.is_dirty();
+                            buffer.external_change = false;
                             this.status = format!("Saved {}", buffer.document.name());
                             let saved_language = syntax::language(buffer.document.path());
                             if saved_language != language {
                                 buffer.editor.update(cx, |editor, cx| {
                                     editor.set_highlighter(saved_language, cx)
                                 });
+                            }
+                            this.sync_lsp_buffer(ix);
+                            if let Some(path) = saved_path
+                                .as_deref()
+                                .filter(|path| this.lsp_versions.contains_key(*path))
+                                && let Some(server) = &mut this.language_server
+                            {
+                                let _ = server.saved(path);
                             }
                         }
                         this.refresh_parent(saved_path.as_deref(), cx);
@@ -722,7 +1432,14 @@ impl IdeShell {
                         }
                     }
                     Ok(None) => this.status = "Save cancelled".into(),
-                    Err(error) => this.status = format!("Save failed: {error}"),
+                    Err(error) => {
+                        if error.contains("File changed on disk")
+                            && let Some(ix) = this.buffer_index(id)
+                        {
+                            this.buffers[ix].external_change = true;
+                        }
+                        this.status = format!("Save failed: {error}");
+                    }
                 }
                 this.focus_editor(window, cx);
                 cx.notify();
@@ -775,6 +1492,7 @@ impl IdeShell {
                 for (id, result) in results {
                     match result {
                         Ok(saved) => {
+                            let saved_path = saved.path().map(Path::to_path_buf);
                             settings_saved |= saved
                                 .path()
                                 .is_some_and(|path| settings::is_settings_file(path, cx));
@@ -782,6 +1500,14 @@ impl IdeShell {
                                 let buffer = &mut this.buffers[ix];
                                 buffer.document.accept_saved(saved);
                                 buffer.dirty = buffer.document.is_dirty();
+                                buffer.external_change = false;
+                                if let Some(path) = saved_path
+                                    .as_deref()
+                                    .filter(|path| this.lsp_versions.contains_key(*path))
+                                    && let Some(server) = &mut this.language_server
+                                {
+                                    let _ = server.saved(path);
+                                }
                             }
                         }
                         Err(error) => failures.push(error),
@@ -975,12 +1701,519 @@ impl IdeShell {
     }
 
     fn set_workspace(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
+        if self.workspace.root() != workspace.root() {
+            self.task_terminal
+                .update(cx, |terminal, cx| terminal.terminate(cx));
+            self.debugger_active = false;
+        }
         self.status = format!("Opened folder {}", workspace.display_name());
         self.workspace = workspace;
+        self.language_server = None;
+        self.lsp_task = Task::ready(());
+        self.lsp_ready = false;
+        self.diagnostics.clear();
+        self.index_workspace(cx);
         self.tree_rows = self.workspace.rows();
         self.tree_scroll = UniformListScrollHandle::new();
         self.sync_git(cx);
         cx.notify();
+    }
+
+    fn index_workspace(&mut self, cx: &mut Context<Self>) {
+        self.search_paths.clear();
+        let Some(root) = self.workspace.root().map(Path::to_path_buf) else {
+            return;
+        };
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let paths = executor
+                .spawn({
+                    let root = root.clone();
+                    async move { search::files(&root) }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.workspace.root() == Some(root.as_path()) {
+                    match paths {
+                        Ok(paths) => this.search_paths = paths,
+                        Err(error) => this.status = format!("Could not index files: {error}"),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn show_search(&mut self, mode: SearchMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_mode = Some(mode);
+        self.search_selected = 0;
+        self.search_hits.clear();
+        self.search_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn quick_open(&mut self, _: &QuickOpen, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search(SearchMode::Files, window, cx);
+    }
+
+    fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search(SearchMode::Commands, window, cx);
+    }
+
+    fn search_project(&mut self, _: &SearchProject, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search(SearchMode::Project, window, cx);
+    }
+
+    fn show_diagnostics(
+        &mut self,
+        _: &ShowDiagnostics,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_search(SearchMode::Diagnostics, window, cx);
+    }
+
+    fn find_in_file(&mut self, _: &FindInFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search(SearchMode::File, window, cx);
+    }
+
+    fn go_to_line(&mut self, _: &GoToLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_search(SearchMode::Line, window, cx);
+    }
+
+    fn update_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_task = Task::ready(());
+        self.search_hits.clear();
+        self.search_selected = 0;
+        match self.search_mode {
+            Some(SearchMode::Project) if !query.is_empty() => {
+                let paths = self.search_paths.clone();
+                let open: Vec<_> =
+                    self.buffers
+                        .iter()
+                        .filter_map(|buffer| {
+                            buffer.document.path().map(|path| {
+                                (path.to_path_buf(), buffer.document.text().to_string())
+                            })
+                        })
+                        .collect();
+                let executor = cx.background_executor().clone();
+                let search_query = query.clone();
+                self.search_task = cx.spawn(async move |this, cx| {
+                    let hits = executor
+                        .spawn({
+                            let query = search_query.clone();
+                            async move {
+                                let mut hits = Vec::new();
+                                for (path, source) in &open {
+                                    hits.extend(search::search_source(
+                                        path,
+                                        source,
+                                        &query,
+                                        200 - hits.len(),
+                                    ));
+                                    if hits.len() == 200 {
+                                        return hits;
+                                    }
+                                }
+                                let closed: Vec<_> = paths
+                                    .into_iter()
+                                    .filter(|path| !open.iter().any(|(opened, _)| opened == path))
+                                    .collect();
+                                hits.extend(search::search_text(&closed, &query, 200 - hits.len()));
+                                hits
+                            }
+                        })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.search_mode == Some(SearchMode::Project)
+                            && *this.search_input.read(cx).text() == search_query
+                        {
+                            this.search_hits = hits;
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+            Some(SearchMode::File) if !query.is_empty() => {
+                let text = self.document().text().to_string();
+                let path = self
+                    .document()
+                    .path()
+                    .unwrap_or(Path::new("Untitled"))
+                    .to_path_buf();
+                self.search_hits = search::search_source(&path, &text, &query, 200);
+            }
+            _ => {}
+        }
+        if self.search_mode == Some(SearchMode::Diagnostics) {
+            self.search_hits = self
+                .diagnostics
+                .values()
+                .flatten()
+                .chain(self.run_hits.iter())
+                .filter(|hit| {
+                    query.is_empty() || hit.preview.to_lowercase().contains(&query.to_lowercase())
+                })
+                .cloned()
+                .collect();
+            self.search_hits
+                .sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line.cmp(&b.line)));
+        }
+        cx.notify();
+    }
+
+    fn choose_search_result(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mode) = self.search_mode else { return };
+        let query = self.search_input.read(cx).text().to_string();
+        let query = query.trim_end_matches(['\r', '\n']);
+        let file = (mode == SearchMode::Files)
+            .then(|| self.ranked_paths(query).get(ix).cloned())
+            .flatten();
+        let command = (mode == SearchMode::Commands)
+            .then(|| self.ranked_commands(query).get(ix).copied())
+            .flatten();
+        let task = (mode == SearchMode::Tasks)
+            .then(|| self.ranked_tasks(query).get(ix).copied())
+            .flatten();
+        let completion = (mode == SearchMode::Completion)
+            .then(|| self.ranked_completions(query).get(ix).copied())
+            .flatten();
+        let hit = self.search_hits.get(ix).cloned();
+        self.search_mode = None;
+        match mode {
+            SearchMode::Files => {
+                if let Some(path) = file {
+                    self.open(Some(path), window, cx);
+                }
+            }
+            SearchMode::Commands => {
+                if let Some(command) = command {
+                    window.dispatch_action(command.action(), cx);
+                }
+            }
+            SearchMode::Tasks => {
+                if let Some(index) = task {
+                    self.launch_config(false, index, window, cx);
+                }
+            }
+            SearchMode::Completion => {
+                if let Some(index) = completion {
+                    self.insert_completion(index, window, cx);
+                }
+            }
+            SearchMode::Line => {
+                let parts: Vec<_> = query.split(':').collect();
+                if let Some(line) = parts
+                    .first()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|line| *line > 0)
+                {
+                    let column = parts
+                        .get(1)
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    let path = self
+                        .document()
+                        .path()
+                        .unwrap_or(Path::new("Untitled"))
+                        .to_path_buf();
+                    let hit = SearchMatch {
+                        path,
+                        line,
+                        column,
+                        preview: String::new(),
+                    };
+                    self.record_location(&hit, cx);
+                    self.jump_to_hit(&hit, window, cx);
+                }
+            }
+            SearchMode::File => {
+                if let Some(hit) = hit {
+                    self.record_location(&hit, cx);
+                    self.jump_to_hit(&hit, window, cx);
+                }
+            }
+            SearchMode::Project | SearchMode::Diagnostics => {
+                if let Some(hit) = hit {
+                    self.record_location(&hit, cx);
+                    if self.document().path() == Some(hit.path.as_path()) {
+                        self.jump_to_hit(&hit, window, cx);
+                    } else {
+                        self.open_at(hit, window, cx);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn ranked_paths(&self, query: &str) -> Vec<PathBuf> {
+        let root = self.workspace.root();
+        let mut files: Vec<_> = self
+            .search_paths
+            .iter()
+            .filter_map(|path| {
+                search::rank(
+                    path.strip_prefix(root.unwrap_or(Path::new("")))
+                        .unwrap_or(path),
+                    query,
+                )
+                .map(|score| {
+                    (
+                        score,
+                        self.recent_paths
+                            .iter()
+                            .position(|recent| recent == path)
+                            .unwrap_or(usize::MAX),
+                        path.clone(),
+                    )
+                })
+            })
+            .collect();
+        files.sort_by(|a, b| {
+            if query.is_empty() {
+                a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2))
+            } else {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            }
+        });
+        files
+            .into_iter()
+            .take(30)
+            .map(|(_, _, path)| path)
+            .collect()
+    }
+
+    fn ranked_commands(&self, query: &str) -> Vec<Command> {
+        Command::ALL
+            .into_iter()
+            .filter(|command| search::rank(Path::new(&command.name()), query).is_some())
+            .collect()
+    }
+
+    fn ranked_tasks(&self, query: &str) -> Vec<usize> {
+        let mut ranked: Vec<_> = self
+            .task_commands
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, config)| {
+                search::rank(Path::new(&config.name), query).map(|score| (score, ix))
+            })
+            .collect();
+        ranked.sort();
+        ranked.into_iter().take(30).map(|(_, ix)| ix).collect()
+    }
+
+    fn ranked_completions(&self, query: &str) -> Vec<usize> {
+        self.completions
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, (label, _))| {
+                search::rank(Path::new(label), query).map(|score| (score, ix))
+            })
+            .take(30)
+            .map(|(_, ix)| ix)
+            .collect()
+    }
+
+    fn insert_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let insert = self.completions[index].1.clone();
+        let editor = self.editor().clone();
+        editor.update(cx, |editor, cx| {
+            let source = editor.text().to_string();
+            let end = editor.cursor().min(source.len());
+            if !source.is_char_boundary(end) {
+                return;
+            }
+            let start = source[..end]
+                .char_indices()
+                .rev()
+                .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+                .last()
+                .map_or(end, |(start, _)| start);
+            let range =
+                source[..start].encode_utf16().count()..source[..end].encode_utf16().count();
+            editor.replace_text_in_range(Some(range), &insert, window, cx);
+            editor.focus(window, cx);
+        });
+    }
+
+    fn jump_to_hit(&mut self, hit: &SearchMatch, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor().clone();
+        editor.update(cx, |editor, cx| {
+            editor.set_cursor_position(
+                Position::new((hit.line - 1) as u32, (hit.column - 1) as u32),
+                window,
+                cx,
+            );
+            editor.focus(window, cx);
+        });
+    }
+
+    fn current_location(&self, cx: &App) -> Option<SearchMatch> {
+        let path = self.document().path()?.to_path_buf();
+        let cursor = self.editor().read(cx).cursor_position();
+        Some(SearchMatch {
+            path,
+            line: cursor.line as usize + 1,
+            column: cursor.character as usize + 1,
+            preview: String::new(),
+        })
+    }
+
+    fn record_location(&mut self, destination: &SearchMatch, cx: &App) {
+        let Some(origin) = self.current_location(cx) else {
+            return;
+        };
+        self.locations
+            .truncate(self.location_index.saturating_add(1));
+        if self.locations.last() != Some(&origin) {
+            self.locations.push(origin);
+        }
+        if self.locations.last() != Some(destination) {
+            self.locations.push(destination.clone());
+        }
+        self.location_index = self.locations.len().saturating_sub(1);
+        if self.locations.len() > 100 {
+            self.locations.remove(0);
+            self.location_index = self.location_index.saturating_sub(1);
+        }
+    }
+
+    fn navigate_history(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.location_index as isize + direction;
+        if index < 0 || index as usize >= self.locations.len() {
+            return;
+        }
+        self.location_index = index as usize;
+        let hit = self.locations[self.location_index].clone();
+        self.open_at(hit, window, cx);
+    }
+
+    fn go_back(&mut self, _: &GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_history(-1, window, cx);
+    }
+
+    fn go_forward(&mut self, _: &GoForward, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_history(1, window, cx);
+    }
+
+    fn open_at(&mut self, hit: SearchMatch, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.buffer_for_path(&hit.path) {
+            self.activate(ix, window, cx);
+            self.jump_to_hit(&hit, window, cx);
+        } else {
+            self.open(Some(hit.path.clone()), window, cx);
+            // The asynchronous open completes later; location is applied in its completion handler.
+            self.pending_hit = Some(hit);
+        }
+    }
+
+    fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.search_mode.unwrap();
+        let query = self.search_input.read(cx).text().to_string();
+        let query = query.trim_end_matches(['\r', '\n']);
+        let items: Vec<String> = match mode {
+            SearchMode::Files => self
+                .ranked_paths(query)
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(self.workspace.root().unwrap_or(Path::new("")))
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect(),
+            SearchMode::Commands => self
+                .ranked_commands(query)
+                .iter()
+                .map(|command| {
+                    format!(
+                        "{}  {}",
+                        command.name(),
+                        shortcut(command.action().as_ref(), cx).unwrap_or_default()
+                    )
+                })
+                .collect(),
+            SearchMode::Tasks => self
+                .ranked_tasks(query)
+                .iter()
+                .map(|&ix| {
+                    let config = &self.task_commands[ix];
+                    format!("{}  {}", config.name, config.program)
+                })
+                .collect(),
+            SearchMode::Completion => self
+                .ranked_completions(query)
+                .iter()
+                .map(|&ix| self.completions[ix].0.clone())
+                .collect(),
+            SearchMode::Line => vec!["Enter line or line:column, then press Enter".into()],
+            SearchMode::File | SearchMode::Project | SearchMode::Diagnostics => self
+                .search_hits
+                .iter()
+                .take(30)
+                .map(|hit| {
+                    format!(
+                        "{}:{}:{}  {}",
+                        hit.path.display(),
+                        hit.line,
+                        hit.column,
+                        hit.preview
+                    )
+                })
+                .collect(),
+        };
+        div()
+            .p_2()
+            .bg(theme::panel())
+            .border_b_1()
+            .border_color(theme::border())
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.search_mode = None;
+                        this.focus_editor(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    "up" => {
+                        this.search_selected = this.search_selected.saturating_sub(1);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    "down" => {
+                        this.search_selected = (this.search_selected + 1).min(29);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(Input::new(&self.search_input))
+            .child(div().max_h(px(260.)).overflow_y_scrollbar().children(
+                items.into_iter().enumerate().map(|(ix, label)| {
+                    div()
+                        .id(("search-hit", ix))
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .when(ix == self.search_selected, |row| row.bg(theme::hover()))
+                        .hover(|style| style.bg(theme::hover()))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_search_result(ix, window, cx)
+                        }))
+                }),
+            ))
     }
 
     fn load_directory(&mut self, directory: PathBuf, cx: &mut Context<Self>) {
@@ -1025,6 +2258,122 @@ impl IdeShell {
         } else {
             self.load_directory(path, cx);
         }
+    }
+
+    fn reveal_tree_file(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let mut command = if cfg!(target_os = "windows") {
+            let mut command = ProcessCommand::new("explorer.exe");
+            let file = path.to_string_lossy();
+            let file = file
+                .strip_prefix(r"\\?\UNC\")
+                .map(|rest| format!(r"\\{rest}"))
+                .or_else(|| file.strip_prefix(r"\\?\").map(str::to_string))
+                .unwrap_or_else(|| file.into_owned());
+            command.arg(format!("/select,{file}"));
+            command
+        } else if cfg!(target_os = "macos") {
+            let mut command = ProcessCommand::new("open");
+            command.arg("-R").arg(path);
+            command
+        } else {
+            let mut command = ProcessCommand::new("xdg-open");
+            command.arg(path.parent().unwrap_or(path));
+            command
+        };
+        if let Err(error) = command.spawn() {
+            self.status = format!("Could not reveal {}: {error}", path.display());
+            cx.notify();
+        }
+    }
+
+    fn confirm_delete_tree_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.blocked()
+            || window.has_active_dialog(cx)
+            || !self
+                .tree_rows
+                .iter()
+                .any(|row| row.entry.path == path && !row.entry.is_dir)
+        {
+            return;
+        }
+        if self
+            .buffer_for_path(&path)
+            .is_some_and(|ix| self.buffers[ix].dirty)
+        {
+            self.status = "Save or close the modified file before deleting it".into();
+            cx.notify();
+            return;
+        }
+        let shell = cx.entity().downgrade();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (shell, path) = (shell.clone(), path.clone());
+            dialog
+                .title("Delete File")
+                .child(format!("Delete {name}? This cannot be undone."))
+                .confirm()
+                .button_props(DialogButtonProps::default().ok_text("Delete"))
+                .on_ok(move |_, window, cx| {
+                    let _ = shell.update(cx, |shell, cx| {
+                        shell.delete_tree_file(path.clone(), window, cx)
+                    });
+                    true
+                })
+        });
+    }
+
+    fn delete_tree_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked()
+            || !self
+                .tree_rows
+                .iter()
+                .any(|row| row.entry.path == path && !row.entry.is_dir)
+            || self
+                .buffer_for_path(&path)
+                .is_some_and(|ix| self.buffers[ix].dirty)
+        {
+            return;
+        }
+        self.busy = true;
+        self.status = format!("Deleting {}…", path.display());
+        cx.notify();
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = executor
+                .spawn({
+                    let path = path.clone();
+                    async move { fs::remove_file(&path) }
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(ix) = this.buffer_for_path(&path) {
+                            this.remove_buffer(ix, window, cx);
+                        }
+                        this.refresh_parent(Some(&path), cx);
+                        this.index_workspace(cx);
+                        this.refresh_git(cx);
+                        this.status = format!("Deleted {}", path.display());
+                    }
+                    Err(error) => {
+                        this.status = format!("Delete failed: {}: {error}", path.display())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn resolve(&self, path: &str) -> PathBuf {
@@ -1174,6 +2523,78 @@ impl IdeShell {
     }
 
     fn go_to_declaration(
+        &mut self,
+        display_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.lsp_ready && syntax::language(self.document().path()) == "rust" {
+            let buffer = self.buffer();
+            let buffer_id = buffer.id;
+            let offset = folding::display_to_source(&buffer.folds, display_offset, false);
+            let position = position_at(&buffer.document.text().to_string(), offset);
+            let path = buffer.document.path().map(Path::to_path_buf);
+            if let (Some(server), Some(path)) = (&mut self.language_server, path)
+                && let Ok(id) = server.definition(&path, position.line, position.character)
+            {
+                self.pending_definition = Some((id, buffer_id, display_offset));
+                self.status = "Looking up definition…".into();
+                cx.notify();
+                return true;
+            }
+        }
+        self.go_to_declaration_fallback(display_offset, window, cx)
+    }
+
+    fn go_to_definition_action(
+        &mut self,
+        _: &GoToDefinition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.show_diff {
+            return;
+        }
+        let offset = self.editor().read(cx).cursor();
+        self.go_to_declaration(offset, window, cx);
+    }
+
+    fn hover_info(&mut self, _: &HoverInfo, _: &mut Window, cx: &mut Context<Self>) {
+        let buffer = self.buffer();
+        let offset =
+            folding::display_to_source(&buffer.folds, buffer.editor.read(cx).cursor(), false);
+        let position = position_at(&buffer.document.text().to_string(), offset);
+        let path = buffer.document.path().map(Path::to_path_buf);
+        if let (Some(server), Some(path)) = (&mut self.language_server, path)
+            && let Ok(id) = server.hover(&path, position.line, position.character)
+        {
+            self.pending_hover = Some(id);
+            self.status = "Loading hover information…".into();
+        } else {
+            self.status = "Language server is not available".into();
+        }
+        cx.notify();
+    }
+
+    fn complete_code(&mut self, _: &CompleteCode, _: &mut Window, cx: &mut Context<Self>) {
+        let buffer = self.buffer();
+        let offset =
+            folding::display_to_source(&buffer.folds, buffer.editor.read(cx).cursor(), false);
+        let position = position_at(&buffer.document.text().to_string(), offset);
+        let path = buffer.document.path().map(Path::to_path_buf);
+        let buffer_id = buffer.id;
+        if let (Some(server), Some(path)) = (&mut self.language_server, path)
+            && let Ok(id) = server.completion(&path, position.line, position.character)
+        {
+            self.pending_completion = Some((id, buffer_id));
+            self.status = "Loading completions…".into();
+        } else {
+            self.status = "Language server is not available".into();
+        }
+        cx.notify();
+    }
+
+    fn go_to_declaration_fallback(
         &mut self,
         display_offset: usize,
         window: &mut Window,
@@ -1402,7 +2823,10 @@ impl IdeShell {
             return "No settings file is available".into();
         };
         let problems = match Settings::load(&path) {
-            Ok(settings) => settings.apply(Some(window), cx),
+            Ok(settings) => {
+                self.show_sidebar = settings.show_sidebar;
+                settings.apply(Some(window), cx)
+            }
             Err(error) => vec![error],
         };
         cx.notify();
@@ -1568,55 +2992,6 @@ impl IdeShell {
             })
     }
 
-    fn render_activity_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(ACTIVITY_BAR_WIDTH))
-            .h_full()
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_between()
-            .py_1p5()
-            .bg(theme::chrome())
-            .border_r_1()
-            .border_color(theme::border())
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(activity_item(
-                        "quick-folder",
-                        Icon::new(AppIcon::Files),
-                        self.active_sidebar == SidebarPanel::Folder,
-                        "Explorer",
-                        Box::new(ShowFolderPanel),
-                        cx.listener(|this, _, window, cx| {
-                            this.show_folder_panel(&ShowFolderPanel, window, cx)
-                        }),
-                    ))
-                    .child(activity_item(
-                        "quick-git",
-                        Icon::new(AppIcon::GitBranch),
-                        self.active_sidebar == SidebarPanel::Git,
-                        "Source Control",
-                        Box::new(ShowGitPanel),
-                        cx.listener(|this, _, window, cx| {
-                            this.show_git_panel(&ShowGitPanel, window, cx)
-                        }),
-                    )),
-            )
-            .child(activity_item(
-                "open-settings",
-                Icon::new(IconName::Settings),
-                false,
-                "Settings",
-                Box::new(OpenSettings),
-                cx.listener(|this, _, window, cx| this.open_settings(&OpenSettings, window, cx)),
-            ))
-    }
-
     fn render_project_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_root = self.workspace.root().is_some();
         let caption = if has_root {
@@ -1721,15 +3096,21 @@ impl IdeShell {
             })
     }
 
-    fn render_tree_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_tree_row(&self, ix: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let row = &self.tree_rows[ix];
+        let path = row.entry.path.clone();
+        let is_file = !row.entry.is_dir;
+        let shell = cx.entity().downgrade();
         let is_open = !row.entry.is_dir && self.document().path() == Some(row.entry.path.as_path());
-        let change = self.git.read(cx).tree_change(&row.entry.path);
+        let git = self.git.read(cx);
+        let change = git.tree_change(&row.entry.path);
+        let ignored = git.tree_ignored(&row.entry.path);
         let letter = change.filter(|_| !row.entry.is_dir).map(Change::letter);
+        let kind = FileKind::of(&row.entry.path);
         let (chevron, icon) = match (row.entry.is_dir, row.expanded) {
-            (true, true) => (Some(IconName::ChevronDown), IconName::FolderOpen),
-            (true, false) => (Some(IconName::ChevronRight), IconName::Folder),
-            (false, _) => (None, IconName::File),
+            (true, true) => (Some(IconName::ChevronDown), Icon::new(IconName::FolderOpen)),
+            (true, false) => (Some(IconName::ChevronRight), Icon::new(IconName::Folder)),
+            (false, _) => (None, Icon::new(kind.icon())),
         };
         div()
             .id(ix)
@@ -1744,7 +3125,8 @@ impl IdeShell {
             .cursor_pointer()
             .hover(|style| style.bg(theme::hover()))
             .when(is_open, |row| row.bg(theme::active_row()))
-            .when_some(change, |row, change| {
+            .when(ignored, |row| row.text_color(theme::subtle()))
+            .when_some(change.filter(|_| !ignored), |row, change| {
                 row.text_color(theme::git_change(change))
             })
             .child(
@@ -1755,16 +3137,13 @@ impl IdeShell {
                         slot.child(Icon::new(chevron).size_full().text_color(theme::subtle()))
                     }),
             )
-            .child(
-                Icon::new(icon)
-                    .size(px(15.))
-                    .flex_shrink_0()
-                    .text_color(if row.entry.is_dir {
-                        theme::accent()
-                    } else {
-                        theme::muted()
-                    }),
-            )
+            .child(icon.size(px(15.)).flex_shrink_0().text_color(if ignored {
+                theme::subtle()
+            } else if row.entry.is_dir {
+                theme::accent()
+            } else {
+                theme::file_icon(kind)
+            }))
             .child(
                 div()
                     .flex_1()
@@ -1784,6 +3163,41 @@ impl IdeShell {
             .on_click(
                 cx.listener(move |this, _, window, cx| this.activate_tree_row(ix, window, cx)),
             )
+            .context_menu(move |menu, _, _| {
+                if !is_file {
+                    return menu;
+                }
+                let open_shell = shell.clone();
+                let open_path = path.clone();
+                let reveal_shell = shell.clone();
+                let reveal_path = path.clone();
+                let delete_shell = shell.clone();
+                let delete_path = path.clone();
+                menu.item(
+                    PopupMenuItem::new("View File").on_click(move |_, window, cx| {
+                        let _ = open_shell.update(cx, |shell, cx| {
+                            if !shell.blocked() {
+                                shell.open(Some(open_path.clone()), window, cx);
+                            }
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new("Reveal in File Explorer").on_click(move |_, _, cx| {
+                        let _ = reveal_shell
+                            .update(cx, |shell, cx| shell.reveal_tree_file(&reveal_path, cx));
+                    }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Delete File…").on_click(move |_, window, cx| {
+                        let _ = delete_shell.update(cx, |shell, cx| {
+                            shell.confirm_delete_tree_file(delete_path.clone(), window, cx);
+                        });
+                    }),
+                )
+            })
+            .into_any_element()
     }
 
     fn tab_title(&self, buffer: &Buffer) -> String {
@@ -1881,7 +3295,7 @@ impl IdeShell {
         editor_tab(
             ("tab", id),
             active,
-            Icon::new(IconName::File),
+            Icon::new(FileKind::of(buffer.document.path().unwrap_or(Path::new(""))).icon()),
             self.tab_title(buffer),
         )
         .child(
@@ -2149,11 +3563,45 @@ impl IdeShell {
                 ToolPanel::Debug => div()
                     .flex_1()
                     .min_h_0()
+                    .flex()
+                    .flex_col()
                     .bg(theme::background())
-                    .child(ui::empty_state(
-                        Icon::new(AppIcon::Bug).size(px(24.)),
-                        "Debug adapter integration is not implemented yet.",
-                    ))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .gap_1()
+                            .child(Button::new("debug-start").small().label("Start").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.start_debugger(&StartDebugger, window, cx)
+                                }),
+                            ))
+                            .child(
+                                Button::new("debug-continue")
+                                    .small()
+                                    .label("Continue")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.debug_continue(&DebugContinue, window, cx)
+                                    })),
+                            )
+                            .child(Button::new("debug-next").small().label("Next").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.debug_step_over(&DebugStepOver, window, cx)
+                                }),
+                            ))
+                            .child(Button::new("debug-step").small().label("Step").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.debug_step_into(&DebugStepInto, window, cx)
+                                }),
+                            ))
+                            .child(Button::new("debug-stop").small().label("Stop").on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.stop_command(&StopCommand, window, cx)
+                                }),
+                            )),
+                    )
+                    .child(div().flex_1().min_h_0().child(self.task_terminal.clone()))
                     .into_any_element(),
             })
     }
@@ -2291,17 +3739,27 @@ impl IdeShell {
             .border_color(theme::border())
             .text_xs()
             .text_color(theme::muted())
-            .when_some(self.git.read(cx).branch(), |bar, branch| {
-                bar.child(
-                    status_item("status-branch", false)
-                        .child(Icon::new(AppIcon::GitBranch).size(px(13.)))
-                        .child(branch)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.show_git_panel(&ShowGitPanel, window, cx)
-                        })),
+            .child(
+                status_item(
+                    "quick-folder",
+                    self.show_sidebar && self.active_sidebar == SidebarPanel::Folder,
                 )
-                .child(divider())
-            })
+                .child(Icon::new(AppIcon::Files).size(px(13.)))
+                .child("Files")
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.toggle_sidebar(SidebarPanel::Folder, cx)),
+                ),
+            )
+            .child(
+                status_item(
+                    "quick-git",
+                    self.show_sidebar && self.active_sidebar == SidebarPanel::Git,
+                )
+                .child(Icon::new(AppIcon::GitBranch).size(px(13.)))
+                .child("Git")
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(SidebarPanel::Git, cx))),
+            )
+            .child(divider())
             .child(div().flex_1().min_w_0().px_1p5().truncate().child(status))
             .when_some(vim_mode, |bar, mode| {
                 bar.child(
@@ -2391,45 +3849,92 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::show_debug_panel))
             .on_action(cx.listener(Self::toggle_vim_mode))
             .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::quick_open))
+            .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::search_project))
+            .on_action(cx.listener(Self::show_diagnostics))
+            .on_action(cx.listener(Self::go_to_definition_action))
+            .on_action(cx.listener(Self::hover_info))
+            .on_action(cx.listener(Self::complete_code))
+            .on_action(cx.listener(Self::toggle_breakpoint))
+            .on_action(cx.listener(Self::debug_continue))
+            .on_action(cx.listener(Self::debug_step_over))
+            .on_action(cx.listener(Self::debug_step_into))
+            .on_action(cx.listener(Self::debug_step_out))
+            .on_action(cx.listener(Self::debug_interrupt))
+            .on_action(cx.listener(Self::go_back))
+            .on_action(cx.listener(Self::go_forward))
+            .on_action(cx.listener(Self::go_to_line))
+            .on_action(cx.listener(Self::find_in_file))
+            .on_action(cx.listener(Self::run_command))
+            .on_action(cx.listener(Self::stop_command))
+            .on_action(cx.listener(Self::start_debugger))
+            .on_action(cx.listener(Self::reload_file))
             .on_action(cx.listener(Self::forward_to_git(GitPanel::stage_all)))
             .on_action(cx.listener(Self::forward_to_git(GitPanel::pull)))
             .on_action(cx.listener(Self::forward_to_git(GitPanel::push)))
             .on_action(cx.listener(Self::forward_to_git(GitPanel::fetch)))
             .child(self.render_title_bar(cx))
+            .when(self.buffer().external_change, |view| {
+                view.child(
+                    div()
+                        .px_3()
+                        .py_1()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .bg(theme::panel())
+                        .child("File changed on disk. Reload discards your edits.")
+                        .child(
+                            Button::new("reload-external")
+                                .small()
+                                .label("Reload")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reload_file(&ReloadFile, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("save-external-as")
+                                .small()
+                                .label("Save As…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_file_as(&SaveFileAs, window, cx)
+                                })),
+                        ),
+                )
+            })
+            .when(self.search_mode.is_some(), |view| {
+                view.child(self.render_search(cx))
+            })
             .when(self.pending.is_some(), |view| {
                 view.child(self.render_save_prompt(cx))
             })
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(self.render_activity_bar(cx))
-                    .child(
-                        div().flex_1().min_w_0().h_full().child(
-                            h_resizable("sidebar-split")
-                                .with_state(&self.sidebar_split)
-                                .child(
+                div().flex_1().min_h_0().flex().child(
+                    div().flex_1().min_w_0().h_full().child(
+                        h_resizable("sidebar-split")
+                            .with_state(&self.sidebar_split)
+                            .when(self.show_sidebar, |split| {
+                                split.child(
                                     resizable_panel()
                                         .size(px(240.))
                                         .size_range(px(160.)..px(480.))
                                         .child(self.render_sidebar(cx)),
                                 )
-                                .child(
-                                    v_resizable("tool-panel-split")
-                                        .with_state(&self.tool_panel_split)
-                                        .child(
-                                            resizable_panel().child(self.render_editor(window, cx)),
-                                        )
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(200.))
-                                                .size_range(px(72.)..Pixels::MAX)
-                                                .child(self.render_tool_panel(cx)),
-                                        ),
-                                ),
-                        ),
+                            })
+                            .child(
+                                v_resizable("tool-panel-split")
+                                    .with_state(&self.tool_panel_split)
+                                    .child(resizable_panel().child(self.render_editor(window, cx)))
+                                    .child(
+                                        resizable_panel()
+                                            .size(px(200.))
+                                            .size_range(px(72.)..Pixels::MAX)
+                                            .child(self.render_tool_panel(cx)),
+                                    ),
+                            ),
                     ),
+                ),
             )
             .child(self.render_status_bar(cx))
             .children(Root::render_dialog_layer(window, cx))

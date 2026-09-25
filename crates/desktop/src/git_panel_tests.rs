@@ -129,7 +129,8 @@ fn lists_changes_shows_diffs_stages_and_commits(cx: &mut TestAppContext) {
             relative: "src/main.rs".into(),
             staged: false,
         };
-        panel.select(selection, cx);
+        panel.select(selection.clone(), cx);
+        panel.set_checked(selection, true, cx);
     });
     cx.run_until_parked();
     assert_eq!(
@@ -140,7 +141,7 @@ fn lists_changes_shows_diffs_stages_and_commits(cx: &mut TestAppContext) {
     panel.update_in(cx, |panel, window, cx| panel.commit(&Commit, window, cx));
     assert_eq!(
         notice(&panel, cx).as_deref(),
-        Some("error: Stage changes to commit them")
+        Some("error: Write a commit message first")
     );
 
     panel.update_in(cx, |panel, window, cx| {
@@ -155,8 +156,23 @@ fn lists_changes_shows_diffs_stages_and_commits(cx: &mut TestAppContext) {
     assert_eq!(diff_text(&panel, cx).len(), 4);
 
     panel.update_in(cx, |panel, window, cx| {
-        let notes = panel.files(true).remove(0);
-        panel.move_files(vec![notes], true, window, cx);
+        panel.set_checked(
+            Selection {
+                relative: "src/main.rs".into(),
+                staged: true,
+            },
+            false,
+            cx,
+        );
+        panel.set_checked(
+            Selection {
+                relative: "notes.txt".into(),
+                staged: true,
+            },
+            true,
+            cx,
+        );
+        panel.unstage_checked(window, cx);
     });
     cx.run_until_parked();
     assert_eq!(
@@ -168,6 +184,24 @@ fn lists_changes_shows_diffs_stages_and_commits(cx: &mut TestAppContext) {
             " U notes.txt"
         ]
     );
+    panel.update(cx, |panel, cx| {
+        panel.set_checked(
+            Selection {
+                relative: "src/main.rs".into(),
+                staged: true,
+            },
+            true,
+            cx,
+        );
+        panel.set_checked(
+            Selection {
+                relative: "notes.txt".into(),
+                staged: false,
+            },
+            false,
+            cx,
+        );
+    });
 
     panel.update_in(cx, |panel, window, cx| {
         panel
@@ -219,6 +253,14 @@ fn reports_git_errors_and_follows_changes_made_elsewhere(cx: &mut TestAppContext
     cx.run_until_parked();
     assert_eq!(rows(&panel, cx), ["Staged (1)", " M src/main.rs"]);
     panel.update_in(cx, |panel, window, cx| {
+        panel.set_checked(
+            Selection {
+                relative: "src/main.rs".into(),
+                staged: true,
+            },
+            true,
+            cx,
+        );
         panel
             .commit_message
             .update(cx, |input, cx| input.set_value("Change", window, cx));
@@ -282,6 +324,16 @@ fn actions_menu_stages_commits_and_syncs_with_the_remote(cx: &mut TestAppContext
 
     choose(cx, "git-menu-Stage All Changes");
     assert_eq!(rows(&panel, cx), ["Staged (1)", " A notes.txt"]);
+    panel.update(cx, |panel, cx| {
+        panel.set_checked(
+            Selection {
+                relative: "notes.txt".into(),
+                staged: true,
+            },
+            true,
+            cx,
+        )
+    });
     panel.update_in(cx, |panel, window, cx| {
         panel.stage_all(&StageAll, window, cx)
     });
@@ -360,4 +412,37 @@ fn offers_to_create_a_repository(cx: &mut TestAppContext) {
         );
     });
     assert_eq!(rows(&panel, cx), ["Changes (1)", " U new.txt"]);
+}
+
+#[gpui::test]
+fn explorer_ignore_state_refreshes_with_gitignore(cx: &mut TestAppContext) {
+    let directory = repository();
+    let root = directory.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join("build/nested")).unwrap();
+    fs::write(root.join("build/nested/out.txt"), "").unwrap();
+    fs::write(root.join("notes.log"), "").unwrap();
+    let (panel, cx) = setup(cx);
+    panel.update(cx, |panel, cx| panel.set_directory(Some(root.clone()), cx));
+    cx.run_until_parked();
+    cx.read(|cx| assert!(!panel.read(cx).tree_ignored(&root.join("build"))));
+
+    fs::write(root.join(".gitignore"), "build/\n*.log\n").unwrap();
+    panel.update(cx, |panel, cx| panel.refresh(cx));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let panel = panel.read(cx);
+        assert!(panel.tree_ignored(&root.join("build")));
+        assert!(panel.tree_ignored(&root.join("build/nested/out.txt")));
+        assert!(panel.tree_ignored(&root.join("notes.log")));
+        assert!(!panel.tree_ignored(&root.join(".gitignore")));
+    });
+
+    fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    panel.update(cx, |panel, cx| panel.refresh(cx));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let panel = panel.read(cx);
+        assert!(!panel.tree_ignored(&root.join("build")));
+        assert!(panel.tree_ignored(&root.join("notes.log")));
+    });
 }

@@ -210,6 +210,25 @@ fn repository() -> (tempfile::TempDir, Repository) {
     (directory, repository)
 }
 
+#[test]
+fn ignored_paths_follow_gitignore_rules_and_collapse_ignored_directories() {
+    let (directory, repository) = repository();
+    let root = directory.path();
+    fs::write(root.join(".gitignore"), "build/\n*.log\n!keep.log\n").unwrap();
+    fs::create_dir_all(root.join("build/nested")).unwrap();
+    fs::write(root.join("build/nested/output.txt"), "").unwrap();
+    fs::write(root.join("error log.log"), "").unwrap();
+    fs::write(root.join("keep.log"), "").unwrap();
+    fs::write(root.join("tracked.log"), "").unwrap();
+    repository.run(["add", "-f", "tracked.log"]).unwrap();
+
+    let ignored = repository.ignored_paths().unwrap();
+    assert!(ignored.contains(&repository.root().join("build")));
+    assert!(ignored.contains(&repository.root().join("error log.log")));
+    assert!(!ignored.contains(&repository.root().join("keep.log")));
+    assert!(!ignored.contains(&repository.root().join("tracked.log")));
+}
+
 fn summary(repository: &Repository) -> Vec<String> {
     let status = repository.status().unwrap();
     status
@@ -344,6 +363,51 @@ fn stages_diffs_commits_and_unstages_in_a_real_repository() {
 
     let error = repository.commit("Nothing staged").unwrap_err();
     assert!(!error.to_string().is_empty());
+}
+
+#[test]
+fn commits_and_reverts_only_selected_files() {
+    let (directory, repository) = repository();
+    let root = directory.path();
+    fs::write(root.join("keep.txt"), "one\n").unwrap();
+    fs::write(root.join("commit.txt"), "one\n").unwrap();
+    let status = repository.status().unwrap();
+    repository.stage(&status.files).unwrap();
+    repository.commit("Initial").unwrap();
+
+    fs::write(root.join("keep.txt"), "staged\n").unwrap();
+    fs::write(root.join("commit.txt"), "selected\n").unwrap();
+    fs::write(root.join("remove.txt"), "untracked\n").unwrap();
+    let status = repository.status().unwrap();
+    repository
+        .stage(&[file(&status, "keep.txt").clone()])
+        .unwrap();
+    let status = repository.status().unwrap();
+    let selected = file(&status, "commit.txt").clone();
+    repository.stage(std::slice::from_ref(&selected)).unwrap();
+    repository
+        .commit_files(std::slice::from_ref(&selected), "Selected")
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("commit.txt")).unwrap(),
+        "selected\n"
+    );
+    assert_eq!(summary(&repository), ["M. keep.txt", ".U remove.txt"]);
+
+    fs::write(root.join("commit.txt"), "discard me\n").unwrap();
+    let status = repository.status().unwrap();
+    repository
+        .revert(&[
+            file(&status, "commit.txt").clone(),
+            file(&status, "remove.txt").clone(),
+        ])
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("commit.txt")).unwrap(),
+        "selected\n"
+    );
+    assert!(!root.join("remove.txt").exists());
+    assert_eq!(summary(&repository), ["M. keep.txt"]);
 }
 
 #[test]

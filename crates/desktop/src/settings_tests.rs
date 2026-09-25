@@ -12,6 +12,8 @@ use crate::{
 fn defaults_round_trip_through_the_settings_file() {
     let defaults = Settings::defaults();
     let json = defaults.to_json();
+    assert!(!defaults.show_sidebar);
+    assert!(json.contains("\"show_sidebar\": false"), "{json}");
     assert!(json.contains("\"toggle_terminal\": \"ctrl-`\""), "{json}");
     assert!(json.contains("\"panel\": \"#16171b\""), "{json}");
     assert!(json.contains("\"keyword\": \"#c792ea\""), "{json}");
@@ -51,6 +53,12 @@ fn partial_settings_accept_single_keys_key_lists_and_hex_colors() {
         Some(&Hex(rgba(0xff000080)))
     );
     assert_eq!(settings.theme.light, theme::Palette::default());
+    assert!(!settings.show_sidebar);
+    assert!(
+        Settings::parse(r#"{ "show_sidebar": true }"#)
+            .unwrap()
+            .show_sidebar
+    );
     assert!(
         serde_json::to_string(&Hex(rgba(0xff000080)))
             .unwrap()

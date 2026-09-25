@@ -4,9 +4,12 @@ mod assets;
 mod brace_guide;
 mod commands;
 mod diff_view;
+mod file_icons;
 mod folding;
 mod git_panel;
+mod language_server;
 mod navigation;
+mod session;
 mod settings;
 mod shell;
 mod syntax;
@@ -45,6 +48,7 @@ fn main() {
                 window.set_window_title("Hephaestus");
                 let shell = gpui::AppContext::new(cx, |cx| {
                     let mut shell = IdeShell::new(window, cx);
+                    shell.restore_session(window, cx);
                     if let Some(status) = settings_status {
                         shell.set_status(status);
                     }

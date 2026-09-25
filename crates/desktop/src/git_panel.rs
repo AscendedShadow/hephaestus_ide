@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     ops::Range,
     path::{Path, PathBuf},
@@ -14,6 +14,7 @@ use gpui::{
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     input::{Input, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
 };
@@ -78,7 +79,7 @@ impl Remote {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Selection {
     pub(crate) relative: String,
     pub(crate) staged: bool,
@@ -102,10 +103,12 @@ pub struct GitPanel {
     loaded: bool,
     load_error: Option<String>,
     tree_changes: HashMap<PathBuf, Change>,
+    ignored_paths: HashSet<PathBuf>,
     rows: Vec<Row>,
     staged_count: usize,
     unstaged_count: usize,
     selected: Option<Selection>,
+    checked: HashSet<Selection>,
     diff_view: Entity<DiffView>,
     notice: Option<Notice>,
     busy: bool,
@@ -144,10 +147,12 @@ impl GitPanel {
             loaded: false,
             load_error: None,
             tree_changes: HashMap::new(),
+            ignored_paths: HashSet::new(),
             rows: Vec::new(),
             staged_count: 0,
             unstaged_count: 0,
             selected: None,
+            checked: HashSet::new(),
             diff_view: cx.new(DiffView::new),
             notice: None,
             busy: false,
@@ -175,6 +180,16 @@ impl GitPanel {
         self.tree_changes.get(path).copied()
     }
 
+    pub fn tree_ignored(&self, path: &Path) -> bool {
+        self.repository.as_ref().is_some_and(|repository| {
+            path.starts_with(repository.root())
+                && path
+                    .ancestors()
+                    .take_while(|ancestor| ancestor.starts_with(repository.root()))
+                    .any(|ancestor| self.ignored_paths.contains(ancestor))
+        })
+    }
+
     pub fn set_directory(&mut self, directory: Option<PathBuf>, cx: &mut Context<Self>) -> bool {
         if directory == self.directory {
             return false;
@@ -192,7 +207,8 @@ impl GitPanel {
         self.load_error = None;
         self.notice = None;
         self.selected = None;
-        self.apply_status(None, Status::default(), cx);
+        self.checked.clear();
+        self.apply_status(None, Status::default(), HashSet::new(), cx);
         self.refresh(cx);
         true
     }
@@ -215,7 +231,8 @@ impl GitPanel {
                         },
                     };
                     let status = repository.status()?;
-                    io::Result::Ok(Some((repository, status)))
+                    let ignored_paths = repository.ignored_paths()?;
+                    io::Result::Ok(Some((repository, status, ignored_paths)))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -223,12 +240,12 @@ impl GitPanel {
                 this.loaded = true;
                 this.load_error = None;
                 match result {
-                    Ok(Some((repository, status))) => {
-                        this.apply_status(Some(repository), status, cx)
+                    Ok(Some((repository, status, ignored_paths))) => {
+                        this.apply_status(Some(repository), status, ignored_paths, cx)
                     }
-                    Ok(None) => this.apply_status(None, Status::default(), cx),
+                    Ok(None) => this.apply_status(None, Status::default(), HashSet::new(), cx),
                     Err(error) => {
-                        this.apply_status(None, Status::default(), cx);
+                        this.apply_status(None, Status::default(), HashSet::new(), cx);
                         this.load_error = Some(error.to_string());
                     }
                 }
@@ -240,6 +257,7 @@ impl GitPanel {
         &mut self,
         repository: Option<Repository>,
         status: Status,
+        ignored_paths: HashSet<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         self.tree_changes = repository
@@ -248,6 +266,7 @@ impl GitPanel {
             .unwrap_or_default();
         self.repository = repository;
         self.status = status;
+        self.ignored_paths = ignored_paths;
         self.rows.clear();
         for staged in [true, false] {
             let files: Vec<_> = (0..self.status.files.len())
@@ -271,6 +290,19 @@ impl GitPanel {
         {
             self.selected = None;
         }
+        let available: HashSet<_> = self
+            .rows
+            .iter()
+            .filter_map(|row| match *row {
+                Row::File { ix, staged } => Some(Selection {
+                    relative: self.status.files[ix].relative.clone(),
+                    staged,
+                }),
+                Row::Header { .. } => None,
+            })
+            .collect();
+        self.checked
+            .retain(|selection| available.contains(selection));
         self.load_diff(cx);
         cx.notify();
     }
@@ -288,6 +320,33 @@ impl GitPanel {
             .filter(|file| side(file, staged).is_some())
             .cloned()
             .collect()
+    }
+
+    fn checked_files(&self, staged: Option<bool>) -> Vec<FileStatus> {
+        self.status
+            .files
+            .iter()
+            .filter(|file| {
+                self.checked.iter().any(|selection| {
+                    selection.relative == file.relative
+                        && staged.is_none_or(|staged| selection.staged == staged)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn checked_count(&self, staged: Option<bool>) -> usize {
+        self.checked_files(staged).len()
+    }
+
+    fn set_checked(&mut self, selection: Selection, checked: bool, cx: &mut Context<Self>) {
+        if checked {
+            self.checked.insert(selection);
+        } else {
+            self.checked.remove(&selection);
+        }
+        cx.notify();
     }
 
     pub(crate) fn select(&mut self, selection: Selection, cx: &mut Context<Self>) {
@@ -375,6 +434,16 @@ impl GitPanel {
                 {
                     selection.staged = !staged;
                 }
+                this.checked = this
+                    .checked
+                    .drain()
+                    .map(|mut selection| {
+                        if selection.staged == staged && moved.contains(&selection.relative) {
+                            selection.staged = !staged;
+                        }
+                        selection
+                    })
+                    .collect();
             },
             window,
             cx,
@@ -385,14 +454,18 @@ impl GitPanel {
         let Some(repository) = self.repository.clone() else {
             return;
         };
+        let files = self.checked_files(None);
         let message = self.commit_message.read(cx).value().trim_end().to_string();
-        if self.staged_count == 0 {
-            self.notice = Some(Notice::Error("Stage changes to commit them".into()));
+        if files.is_empty() {
+            self.notice = Some(Notice::Error("Select changes to commit them".into()));
         } else if message.trim().is_empty() {
             self.notice = Some(Notice::Error("Write a commit message first".into()));
         } else {
             self.run(
-                move || repository.commit(&message),
+                move || {
+                    repository.stage(&files)?;
+                    repository.commit_files(&files, &message)
+                },
                 |this, summary, window, cx| {
                     this.notice = Some(Notice::Info(summary));
                     this.commit_message
@@ -403,6 +476,34 @@ impl GitPanel {
             );
         }
         cx.notify();
+    }
+
+    fn unstage_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let files = self.checked_files(Some(true));
+        if files.is_empty() {
+            self.notice = Some(Notice::Info("Select staged changes to unstage".into()));
+            cx.notify();
+        } else {
+            self.move_files(files, true, window, cx);
+        }
+    }
+
+    fn revert_checked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.repository.clone() else {
+            return;
+        };
+        let files = self.checked_files(Some(false));
+        if files.is_empty() {
+            self.notice = Some(Notice::Info("Select unstaged changes to revert".into()));
+            cx.notify();
+            return;
+        }
+        self.run(
+            move || repository.revert(&files),
+            |_, (), _, _| {},
+            window,
+            cx,
+        );
     }
 
     pub fn stage_all(&mut self, _: &StageAll, window: &mut Window, cx: &mut Context<Self>) {
@@ -487,7 +588,10 @@ impl GitPanel {
     }
 
     fn render_changes(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_commit = !self.busy && self.staged_count > 0;
+        let selected_count = self.checked_count(None);
+        let selected_staged = self.checked_count(Some(true));
+        let selected_unstaged = self.checked_count(Some(false));
+        let can_commit = !self.busy && selected_count > 0;
         div()
             .size_full()
             .flex()
@@ -514,19 +618,48 @@ impl GitPanel {
                             .small()
                             .w_full()
                             .icon(IconName::Check)
-                            .label(if self.staged_count > 0 {
-                                format!("Commit {} staged", self.staged_count)
+                            .label(if selected_count > 0 {
+                                format!("Commit {selected_count} selected")
                             } else {
                                 "Commit".into()
                             })
                             .tooltip(if cfg!(target_os = "macos") {
-                                "Commit staged changes (Cmd+Enter)"
+                                "Commit selected changes (Cmd+Enter)"
                             } else {
-                                "Commit staged changes (Ctrl+Enter)"
+                                "Commit selected changes (Ctrl+Enter)"
                             })
                             .disabled(!can_commit)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.commit(&Commit, window, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("git-unstage-selected")
+                                    .ghost()
+                                    .small()
+                                    .flex_1()
+                                    .icon(IconName::Minus)
+                                    .label(format!("Unstage ({selected_staged})"))
+                                    .disabled(self.busy || selected_staged == 0)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.unstage_checked(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("git-revert-selected")
+                                    .ghost()
+                                    .small()
+                                    .flex_1()
+                                    .icon(IconName::Close)
+                                    .label(format!("Revert ({selected_unstaged})"))
+                                    .disabled(self.busy || selected_unstaged == 0)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.revert_checked(window, cx)
+                                    })),
                             ),
                     ),
             )
@@ -582,7 +715,8 @@ impl GitPanel {
                     return menu;
                 };
                 let this = this.read(cx);
-                let (busy, staged, unstaged) = (this.busy, this.staged_count, this.unstaged_count);
+                let (busy, selected, unstaged) =
+                    (this.busy, this.checked_count(None), this.unstaged_count);
                 let item =
                     |icon: Icon,
                      label: &'static str,
@@ -599,7 +733,7 @@ impl GitPanel {
                             &Commit,
                             |this, window, cx| this.commit(&Commit, window, cx),
                         )
-                        .disabled(busy || staged == 0),
+                        .disabled(busy || selected == 0),
                     )
                     .item(
                         item(
@@ -714,6 +848,7 @@ impl GitPanel {
                     staged,
                 };
                 let selected = self.selected.as_ref() == Some(&selection);
+                let checked = self.checked.contains(&selection);
                 let (folder, name) = match file.relative.rsplit_once('/') {
                     Some((folder, name)) => (folder, name),
                     None => ("", file.relative.as_str()),
@@ -730,13 +865,31 @@ impl GitPanel {
                 let relative = file.relative.clone();
                 let moved = file.clone();
                 let color = theme::git_change(change);
+                let file_icon = match change {
+                    Change::Added | Change::Untracked => IconName::Plus,
+                    Change::Deleted => IconName::Close,
+                    _ => IconName::File,
+                };
+                let checkbox_panel = cx.entity().downgrade();
+                let checkbox_selection = selection.clone();
                 row.debug_selector(move || format!("git-row-{ix}"))
                     .pl_3()
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::hover()))
                     .when(selected, |row| row.bg(theme::active_row()))
                     .child(
-                        Icon::new(IconName::File)
+                        Checkbox::new(("git-check", ix))
+                            .xsmall()
+                            .checked(checked)
+                            .disabled(self.busy)
+                            .on_click(move |checked, _, cx| {
+                                let _ = checkbox_panel.update(cx, |panel, cx| {
+                                    panel.set_checked(checkbox_selection.clone(), *checked, cx)
+                                });
+                            }),
+                    )
+                    .child(
+                        Icon::new(file_icon)
                             .size(px(14.))
                             .flex_shrink_0()
                             .text_color(theme::subtle()),

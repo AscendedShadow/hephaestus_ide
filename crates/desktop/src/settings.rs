@@ -23,6 +23,20 @@ pub const FILE_NAME: &str = "settings.json";
 pub struct Settings {
     pub keybindings: Keybindings,
     pub theme: Themes,
+    pub show_sidebar: bool,
+    pub commands: Vec<RunConfig>,
+    pub debugger: Option<RunConfig>,
+    pub language_server: Option<RunConfig>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RunConfig {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub working_directory: Option<PathBuf>,
+    pub env: std::collections::HashMap<String, String>,
 }
 
 impl Settings {
@@ -30,6 +44,10 @@ impl Settings {
         Self {
             keybindings: commands::default_keybindings(),
             theme: Themes::defaults(),
+            show_sidebar: false,
+            commands: Vec::new(),
+            debugger: None,
+            language_server: None,
         }
     }
 

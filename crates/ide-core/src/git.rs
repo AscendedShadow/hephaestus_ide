@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -407,6 +407,27 @@ impl Repository {
         Status::parse(&String::from_utf8_lossy(&output))
     }
 
+    pub fn ignored_paths(&self) -> io::Result<HashSet<PathBuf>> {
+        let output = self.run([
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ])?;
+        Ok(output
+            .split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                absolute(
+                    &self.root,
+                    String::from_utf8_lossy(path).trim_end_matches('/'),
+                )
+            })
+            .collect())
+    }
+
     pub fn diff(&self, file: &FileStatus, staged: bool) -> io::Result<Diff> {
         let mut command = self.command();
         let untracked = !staged && file.unstaged == Some(Change::Untracked);
@@ -466,10 +487,53 @@ impl Repository {
             .map(drop)
     }
 
+    pub fn revert(&self, files: &[FileStatus]) -> io::Result<()> {
+        let mut tracked = Vec::new();
+        for file in files {
+            if file.unstaged == Some(Change::Untracked) {
+                let path = absolute(&self.root, &file.relative);
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+                    Ok(_) => std::fs::remove_file(path)?,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            } else {
+                tracked.push(file.relative.as_str());
+            }
+        }
+        if tracked.is_empty() {
+            Ok(())
+        } else {
+            self.run(["restore", "--worktree", "--"].into_iter().chain(tracked))
+                .map(drop)
+        }
+    }
+
     pub fn commit(&self, message: &str) -> io::Result<String> {
-        let mut child = self
-            .command()
-            .args(["commit", "--file=-"])
+        self.write_commit(message, &[])
+    }
+
+    pub fn commit_files(&self, files: &[FileStatus], message: &str) -> io::Result<String> {
+        let paths: Vec<_> = files
+            .iter()
+            .flat_map(|file| {
+                file.original
+                    .as_deref()
+                    .into_iter()
+                    .chain([file.relative.as_str()])
+            })
+            .collect();
+        self.write_commit(message, &paths)
+    }
+
+    fn write_commit(&self, message: &str, paths: &[&str]) -> io::Result<String> {
+        let mut command = self.command();
+        command.args(["commit", "--file=-"]);
+        if !paths.is_empty() {
+            command.arg("--").args(paths);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

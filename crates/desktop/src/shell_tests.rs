@@ -72,16 +72,25 @@ fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
 
 #[gpui::test]
 fn sidebar_and_tool_panel_resize_by_dragging_their_edges(cx: &mut TestAppContext) {
-    let (_, cx) = setup(cx);
+    let (shell, cx) = setup(cx);
+    shell.update(cx, |shell, cx| {
+        shell.show_sidebar = true;
+        cx.notify();
+    });
     cx.simulate_resize(size(px(1200.), px(800.)));
     cx.run_until_parked();
 
     let sidebar = cx.debug_bounds("sidebar").unwrap();
     let edge = point(sidebar.right(), sidebar.center().y);
-    drag(cx, edge, edge + point(px(100.), px(0.)));
+    let movement = if sidebar.size.width >= px(380.) {
+        px(-100.)
+    } else {
+        px(100.)
+    };
+    drag(cx, edge, edge + point(movement, px(0.)));
     let resized = cx.debug_bounds("sidebar").unwrap();
     assert!(
-        (resized.size.width - (sidebar.size.width + px(100.))).abs() < px(1.),
+        (resized.size.width - (sidebar.size.width + movement)).abs() < px(1.),
         "sidebar {:?} -> {:?}",
         sidebar.size.width,
         resized.size.width
@@ -564,6 +573,66 @@ fn click_tree_row(cx: &mut VisualTestContext, ix: usize) {
 }
 
 #[gpui::test]
+fn deleting_tree_file_closes_its_tab_and_refreshes_the_tree(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("notes.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let file = file.canonicalize().unwrap();
+    let (shell, cx) = setup(cx);
+    let workspace = Workspace::open(directory.path()).unwrap();
+    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open(Some(file.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(tabs(&shell, cx), ["*notes.txt"]);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(!shell.blocked());
+        assert_eq!(shell.tree_rows[0].entry.path, file);
+        assert!(!shell.buffers[shell.active].dirty);
+    });
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.delete_tree_file(file.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(
+        !file.exists(),
+        "{}",
+        cx.read(|cx| shell.read(cx).status.clone())
+    );
+    assert!(tree_names(&shell, cx).is_empty());
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
+}
+
+#[gpui::test]
+fn modified_tree_file_cannot_be_deleted(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("notes.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let file = file.canonicalize().unwrap();
+    let (shell, cx) = setup(cx);
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(directory.path()).unwrap(), cx);
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open(Some(file.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("changed");
+    assert!(dirty(&shell, cx));
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.delete_tree_file(file.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(file.exists());
+    assert_eq!(tree_names(&shell, cx), ["notes.txt"]);
+    assert_eq!(tabs(&shell, cx), ["*notes.txt"]);
+}
+
+#[gpui::test]
 fn project_tree_expands_folders_and_opens_files_in_tabs(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -573,7 +642,11 @@ fn project_tree_expands_folders_and_opens_files_in_tabs(cx: &mut TestAppContext)
     let (shell, cx) = setup(cx);
     cx.simulate_resize(size(px(1200.), px(800.)));
     let workspace = ide_core::workspace::Workspace::open(root).unwrap();
-    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(workspace, cx);
+        shell.show_sidebar = true;
+        cx.notify();
+    });
     cx.run_until_parked();
     assert_eq!(tree_names(&shell, cx), ["src", "README.md"]);
 
@@ -766,7 +839,11 @@ fn git_status_colors_the_tree_and_follows_saves(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     cx.simulate_resize(size(px(1200.), px(800.)));
     let workspace = ide_core::workspace::Workspace::open(&root).unwrap();
-    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(workspace, cx);
+        shell.show_sidebar = true;
+        cx.notify();
+    });
     cx.run_until_parked();
     let change = |path: &str, cx: &mut VisualTestContext| {
         let path = ide_core::git::absolute(&root, path);

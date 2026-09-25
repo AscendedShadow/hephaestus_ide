@@ -9,7 +9,7 @@ use gpui_component::{Theme, ThemeMode, highlighter::SyntaxColors};
 use ide_core::git::Change;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::syntax::Token;
+use crate::{file_icons::FileKind, syntax::Token};
 
 thread_local! {
     static MODE: Cell<ThemeMode> = const { Cell::new(ThemeMode::Dark) };
@@ -380,6 +380,20 @@ pub fn git_change(change: Change) -> Rgba {
             Color::GitModified
         }
     })
+}
+
+pub fn file_icon(kind: FileKind) -> Rgba {
+    match kind {
+        FileKind::GitIgnore => pick(0xe8735f, 0xc14a34),
+        FileKind::JavaScript => pick(0xe3c25f, 0x8a6d00),
+        FileKind::Json => pick(0x8fca8a, 0x2f7d3a),
+        FileKind::Lock => pick(0x9096a0, 0x6c717b),
+        FileKind::Markdown => pick(0x6fc9c4, 0x14807a),
+        FileKind::Rust => pick(0xdca07a, 0xa9591f),
+        FileKind::Toml => pick(0xb79ae0, 0x6a3fb5),
+        FileKind::TypeScript => pick(0x6aa9f0, 0x1f6fd0),
+        FileKind::Plain => muted(),
+    }
 }
 
 pub fn diff_added() -> Rgba {

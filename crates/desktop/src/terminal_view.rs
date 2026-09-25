@@ -2,10 +2,11 @@ use std::{ops::Range, path::PathBuf};
 
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Render,
-    ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Task, TextRun, UTF16Selection,
-    UnderlineStyle, Window, actions, canvas, div, fill, outline, point, prelude::*, px, rgb, size,
+    EventEmitter, FocusHandle, Focusable, Font, FontStyle, FontWeight, Hsla, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels,
+    Point, Render, ScrollWheelEvent, ShapedLine, Size, StrikethroughStyle, Task, TextRun,
+    UTF16Selection, UnderlineStyle, Window, actions, canvas, div, fill, outline, point, prelude::*,
+    px, rgb, size,
 };
 use terminal::{
     Cell, CursorShape, Event, GridPoint, GridSize, Modifiers, Options, Palette, PtyEvent,
@@ -22,6 +23,10 @@ actions!(terminal, [Copy, Paste]);
 
 pub const KEY_CONTEXT: &str = "Terminal";
 
+pub enum TerminalEvent {
+    Exited(Vec<String>),
+}
+
 const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 1.3;
 
@@ -34,6 +39,8 @@ pub struct TerminalView {
     scroll_remainder: f32,
     selecting: bool,
 }
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
 
 struct Session {
     terminal: Terminal,
@@ -92,7 +99,7 @@ impl TerminalView {
 
     pub fn start(&mut self, working_directory: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.session.is_none() {
-            self.spawn(
+            let _ = self.spawn(
                 Options {
                     working_directory: working_directory.or_else(std::env::home_dir),
                     ..Default::default()
@@ -102,14 +109,46 @@ impl TerminalView {
         }
     }
 
-    fn spawn(&mut self, options: Options, cx: &mut Context<Self>) {
+    pub fn run(&mut self, options: Options, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.is_running() {
+            Err("Stop the current process before starting another".into())
+        } else {
+            self.spawn(options, cx)
+        }
+    }
+
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.terminal.input(b"\x03".to_vec());
+            cx.notify();
+        }
+    }
+
+    pub fn terminate(&mut self, cx: &mut Context<Self>) {
+        self.session = None;
+        cx.notify();
+    }
+
+    pub fn send_command(&mut self, command: &str, cx: &mut Context<Self>) -> bool {
+        let Some(session) = &self.session else {
+            return false;
+        };
+        if session.terminal.exited() {
+            return false;
+        }
+        session.terminal.input(format!("{command}\r").into_bytes());
+        cx.notify();
+        true
+    }
+
+    fn spawn(&mut self, options: Options, cx: &mut Context<Self>) -> Result<(), String> {
         self.session = None;
         let size = self.layout.map(|layout| layout.grid).unwrap_or_default();
         let spawn_options = Options {
             palette: theme::terminal_palette(),
             ..options.clone()
         };
-        match Terminal::spawn(spawn_options, size) {
+        let result = match Terminal::spawn(spawn_options, size) {
             Ok((terminal, events)) => {
                 let events = cx.spawn(async move |this, cx| {
                     while let Some(event) = events.recv().await {
@@ -129,10 +168,16 @@ impl TerminalView {
                     _events: events,
                 });
                 self.error = None;
+                Ok(())
             }
-            Err(error) => self.error = Some(format!("Could not start a shell: {error}")),
-        }
+            Err(error) => {
+                let message = format!("Could not start a shell: {error}");
+                self.error = Some(message.clone());
+                Err(message)
+            }
+        };
         cx.notify();
+        result
     }
 
     fn handle_events(&mut self, events: Vec<PtyEvent>, cx: &mut Context<Self>) {
@@ -140,8 +185,25 @@ impl TerminalView {
             return;
         };
         for event in events {
-            if let Some(Event::Copy(text)) = session.terminal.handle(event) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            match session.terminal.handle(event) {
+                Some(Event::Copy(text)) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+                Some(Event::Exited) => {
+                    let lines = session
+                        .terminal
+                        .snapshot()
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .map(|cell| cell.ch)
+                                .collect::<String>()
+                                .trim_end()
+                                .to_string()
+                        })
+                        .collect();
+                    cx.emit(TerminalEvent::Exited(lines));
+                }
+                _ => {}
             }
         }
         cx.notify();
@@ -155,7 +217,7 @@ impl TerminalView {
         if session.terminal.exited() {
             if keystroke.key == "enter" {
                 let options = session.options.clone();
-                self.spawn(options, cx);
+                let _ = self.spawn(options, cx);
                 cx.stop_propagation();
             }
             return;
