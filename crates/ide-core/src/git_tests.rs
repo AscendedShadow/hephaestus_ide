@@ -411,6 +411,68 @@ fn commits_and_reverts_only_selected_files() {
 }
 
 #[test]
+fn commits_every_staged_file_while_a_merge_is_in_progress() {
+    let (directory, repository) = repository();
+    let root = directory.path().canonicalize().unwrap();
+    repository
+        .run(["config", "merge.conflictStyle", "merge"])
+        .unwrap();
+    commit_file(
+        &repository,
+        "shared.txt",
+        "base
+",
+        "Base",
+    );
+    repository.run(["checkout", "-q", "-b", "feature"]).unwrap();
+    commit_file(
+        &repository,
+        "shared.txt",
+        "feature
+",
+        "Feature",
+    );
+    repository.run(["checkout", "-q", "main"]).unwrap();
+    commit_file(
+        &repository,
+        "shared.txt",
+        "main
+",
+        "Main",
+    );
+    assert!(!repository.merging().unwrap());
+    assert!(repository.run(["merge", "--no-edit", "feature"]).is_err());
+    assert!(repository.merging().unwrap());
+    assert_eq!(summary(&repository), [".! shared.txt"]);
+
+    fs::write(
+        root.join("shared.txt"),
+        "both
+",
+    )
+    .unwrap();
+    fs::write(
+        root.join("extra.txt"),
+        "extra
+",
+    )
+    .unwrap();
+    let status = repository.status().unwrap();
+    let selected = [file(&status, "shared.txt").clone()];
+    repository.stage(&selected).unwrap();
+    repository.commit_files(&selected, "Merge feature").unwrap();
+    assert!(!repository.merging().unwrap());
+    assert_eq!(summary(&repository), [".U extra.txt"]);
+    let parents = repository
+        .run(["rev-list", "--parents", "-n", "1", "HEAD"])
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&parents).split_whitespace().count(),
+        3
+    );
+}
+
+#[test]
 fn clones_into_a_new_folder_named_after_the_repository() {
     let (source, repository) = repository();
     fs::write(source.path().join("README.md"), "hello\n").unwrap();

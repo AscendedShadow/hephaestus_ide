@@ -8,8 +8,8 @@ use std::{
 
 use gpui::{
     Action, App, Context, Corner, Div, Entity, EventEmitter, Focusable as _, FontWeight,
-    IntoElement, Render, Stateful, Task, UniformListScrollHandle, WeakEntity, Window, actions, div,
-    prelude::*, px, uniform_list,
+    IntoElement, Render, Stateful, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    actions, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, Sizable as _,
@@ -23,7 +23,7 @@ use ide_core::git::{self, Change, FileStatus, Repository, Status};
 use crate::{
     assets::AppIcon,
     commands::{self, CloneRepository, EditSettings},
-    diff_view::DiffView,
+    diff_view::{DiffView, DiffViewEvent},
     theme,
     ui::{self, ROW_GROUP},
 };
@@ -117,6 +117,7 @@ pub struct GitPanel {
     refresh_task: Option<Task<()>>,
     refreshing: bool,
     _poll_task: Task<()>,
+    _diff_subscription: Subscription,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -140,6 +141,14 @@ impl GitPanel {
                 }
             }
         });
+        let diff_view = cx.new(DiffView::new);
+        let diff_subscription = cx.subscribe(&diff_view, |this, _, event, cx| match event {
+            DiffViewEvent::Resolved(summary) => {
+                this.notice = Some(Notice::Info(summary.clone()));
+                cx.emit(GitPanelEvent::Status(summary.clone()));
+                this.refresh(cx);
+            }
+        });
         Self {
             directory: None,
             repository: None,
@@ -153,7 +162,7 @@ impl GitPanel {
             unstaged_count: 0,
             selected: None,
             checked: HashSet::new(),
-            diff_view: cx.new(DiffView::new),
+            diff_view,
             notice: None,
             busy: false,
             commit_message: cx.new(|cx| {
@@ -165,6 +174,7 @@ impl GitPanel {
             refresh_task: None,
             refreshing: false,
             _poll_task: poll_task,
+            _diff_subscription: diff_subscription,
         }
     }
 
@@ -172,6 +182,7 @@ impl GitPanel {
         &self.diff_view
     }
 
+    #[cfg(test)]
     pub fn branch(&self) -> Option<String> {
         self.repository.as_ref().map(|_| self.status.branch.label())
     }

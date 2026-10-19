@@ -1344,6 +1344,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "dap"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "lsp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "data-url"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2618,12 +2628,16 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hephaestus"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel 2.5.0",
+ "dap",
  "embed-resource",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "ide-core",
+ "lsp",
+ "lsp-types",
  "ropey",
  "serde",
  "serde_json",
@@ -3371,6 +3385,17 @@ name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
+
+[[package]]
+name = "lsp"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "lsp-types"

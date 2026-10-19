@@ -129,3 +129,52 @@ fn applying_settings_recolors_the_theme_and_reports_bad_keys(cx: &mut TestAppCon
         assert_eq!(theme::syntax(Token::Keyword), rgb(0x8e3fc9));
     });
 }
+
+#[test]
+fn language_servers_extend_and_replace_the_built_in_list() {
+    let settings = Settings::parse(
+        r#"{
+            "language_servers": [
+                {
+                    "languages": ["rust"],
+                    "program": "my-analyzer",
+                    "args": ["--stdio"],
+                    "settings": { "cargo": { "allFeatures": true } }
+                },
+                { "languages": ["go"], "program": "gopls", "enabled": false }
+            ]
+        }"#,
+    )
+    .unwrap();
+    let servers = settings.servers();
+    let serving = |language: &str| {
+        servers
+            .iter()
+            .find(|server| server.serves(language))
+            .map(|server| server.program.clone())
+    };
+    assert_eq!(serving("rust").as_deref(), Some("my-analyzer"));
+    assert_eq!(serving("go"), None);
+    assert_eq!(serving("zig").as_deref(), Some("zls"));
+    assert_eq!(
+        serving("tsx").as_deref(),
+        Some("typescript-language-server")
+    );
+    let rust = servers.iter().find(|server| server.serves("rust")).unwrap();
+    assert_eq!(rust.args, ["--stdio"]);
+    assert_eq!(
+        rust.settings.as_ref().unwrap()["cargo"]["allFeatures"],
+        true
+    );
+
+    assert!(
+        Settings::default()
+            .servers()
+            .iter()
+            .any(|server| server.serves("rust"))
+    );
+    assert!(
+        Settings::parse(r#"{ "language_servers": [{ "languages": ["rust"], "commnd": "x" }] }"#)
+            .is_err()
+    );
+}

@@ -1,245 +1,529 @@
 use std::{
-    io::{self, BufRead, BufReader, Write},
-    path::Path,
-    process::{Child, Command, Stdio},
-    thread,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::Rc,
 };
 
-use async_channel::{Receiver, Sender, bounded, unbounded};
-use serde_json::{Value, json};
+use anyhow::Result;
+use gpui::{App, Context, Entity, EventEmitter, Task, WeakEntity, Window};
+use gpui_component::input::{HoverProvider, InputState, Position, Rope};
+use lsp_types::{
+    CompletionItem, CompletionParams, CompletionResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, MarkupContent, MarkupKind,
+    TextDocumentIdentifier, TextDocumentPositionParams,
+};
 
-use crate::settings::RunConfig;
+use crate::{navigation, settings::LanguageServer, syntax};
 
-pub struct Client {
-    child: Child,
-    outgoing: Sender<Value>,
-    sequence: i64,
-    pub events: Receiver<Value>,
+#[cfg(test)]
+#[path = "language_server_tests.rs"]
+mod tests;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    Starting,
+    Ready,
+    Failed(String),
 }
 
-impl Client {
-    pub fn start(config: &RunConfig, root: &Path) -> io::Result<Self> {
-        let mut child = Command::new(&config.program)
-            .args(&config.args)
-            .current_dir(config.working_directory.as_deref().unwrap_or(root))
-            .envs(&config.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("Language server has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("Language server has no stdout"))?;
-        let (sender, events) = unbounded();
-        let (outgoing, queued) = bounded::<Value>(64);
-        thread::spawn(move || {
-            while let Ok(message) = queued.recv_blocking() {
-                let Ok(bytes) = serde_json::to_vec(&message) else {
-                    continue;
-                };
-                if write!(stdin, "Content-Length: {}\r\n\r\n", bytes.len()).is_err()
-                    || stdin.write_all(&bytes).is_err()
-                    || stdin.flush().is_err()
+impl State {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Starting => "starting…",
+            Self::Ready => "ready",
+            Self::Failed(reason) => reason,
+        }
+    }
+}
+
+pub enum ServerEvent {
+    Diagnostics {
+        path: PathBuf,
+        diagnostics: Vec<lsp_types::Diagnostic>,
+    },
+    Ready,
+    Status(String),
+}
+
+struct Server {
+    client: lsp::Client,
+    state: State,
+    _events: Task<()>,
+}
+
+struct Document {
+    server: String,
+    language: &'static str,
+    version: i32,
+}
+
+#[derive(Default)]
+pub struct Servers {
+    root: Option<PathBuf>,
+    configs: Vec<LanguageServer>,
+    servers: HashMap<String, Server>,
+    documents: HashMap<PathBuf, Document>,
+    failures: HashMap<String, String>,
+}
+
+impl EventEmitter<ServerEvent> for Servers {}
+
+impl Servers {
+    pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.root == root {
+            return;
+        }
+        self.root = root;
+        self.stop(cx);
+    }
+
+    pub fn set_configs(&mut self, configs: Vec<LanguageServer>, cx: &mut Context<Self>) {
+        if self.configs == configs {
+            return;
+        }
+        self.configs = configs;
+        self.stop(cx);
+    }
+
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        self.servers.clear();
+        self.documents.clear();
+        self.failures.clear();
+        cx.notify();
+    }
+
+    pub fn state(&self, language: &str) -> Option<(String, State)> {
+        let name = self.config(language)?.program.clone();
+        let state = match (self.servers.get(&name), self.failures.get(&name)) {
+            (Some(server), _) => server.state.clone(),
+            (None, Some(reason)) => State::Failed(reason.clone()),
+            (None, None) => State::Starting,
+        };
+        Some((name, state))
+    }
+
+    fn config(&self, language: &str) -> Option<&LanguageServer> {
+        self.configs.iter().find(|config| config.serves(language))
+    }
+
+    fn client(&self, language: &str) -> Option<&lsp::Client> {
+        let name = &self.config(language)?.program;
+        let server = self.servers.get(name)?;
+        (server.state == State::Ready && server.client.is_running()).then_some(&server.client)
+    }
+
+    fn start(&mut self, language: &'static str, cx: &mut Context<Self>) -> Option<String> {
+        let root = self.root.clone()?;
+        let config = self.config(language)?.clone();
+        let name = config.program.clone();
+        if self.servers.contains_key(&name) {
+            return Some(name);
+        }
+        if self.failures.contains_key(&name) {
+            return None;
+        }
+        let options = lsp::Options {
+            program: config.program.clone(),
+            args: config.args.clone(),
+            env: config.env.clone(),
+            root,
+            initialization_options: config.initialization_options.clone(),
+            settings: config.settings.clone(),
+        };
+        let client = match lsp::Client::start(&options) {
+            Ok(client) => client,
+            Err(error) => {
+                self.failures.insert(name.clone(), error.to_string());
+                cx.emit(ServerEvent::Status(format!("{name}: {error}")));
+                return None;
+            }
+        };
+        let events = client.events();
+        let owner = name.clone();
+        let pump = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let stopped = matches!(event, lsp::Event::Stopped(_));
+                if this
+                    .update(cx, |this, cx| this.handle(&owner, event, cx))
+                    .is_err()
+                    || stopped
                 {
                     break;
                 }
             }
         });
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            while let Ok(Some(message)) = read_message(&mut reader) {
-                if sender.send_blocking(message).is_err() {
-                    break;
+        let handshake = client.initialize(&options);
+        let owner = name.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = handshake.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(server) = this.servers.get_mut(&owner) else {
+                    return;
+                };
+                match outcome {
+                    Ok(_) => {
+                        server.state = State::Ready;
+                        cx.emit(ServerEvent::Ready);
+                    }
+                    Err(error) => {
+                        server.state = State::Failed(error.to_string());
+                        cx.emit(ServerEvent::Status(format!("{owner}: {error}")));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        self.servers.insert(
+            name.clone(),
+            Server {
+                client,
+                state: State::Starting,
+                _events: pump,
+            },
+        );
+        Some(name)
+    }
+
+    fn handle(&mut self, name: &str, event: lsp::Event, cx: &mut Context<Self>) {
+        match event {
+            lsp::Event::Diagnostics { path, diagnostics } => {
+                if self.documents.contains_key(&path) {
+                    cx.emit(ServerEvent::Diagnostics { path, diagnostics });
                 }
             }
-        });
-        let mut client = Self {
-            child,
-            outgoing,
-            sequence: 1,
-            events,
-        };
-        client.write(json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {
-                "processId": std::process::id(), "rootUri": uri(root),
-                "capabilities": {"textDocument": {"publishDiagnostics": {}, "synchronization": {},
-                    "completion": {"completionItem": {"snippetSupport": false}}}},
-                "clientInfo": {"name": "Hephaestus"}
+            lsp::Event::Log(message) => {
+                let message = message.lines().next().unwrap_or_default().trim();
+                if !message.is_empty() {
+                    cx.emit(ServerEvent::Status(format!("{name}: {message}")));
+                }
             }
-        }))?;
-        Ok(client)
+            lsp::Event::Stopped(reason) => {
+                let log = self
+                    .servers
+                    .get(name)
+                    .map(|server| server.client.log())
+                    .unwrap_or_default();
+                let detail = log.lines().last().unwrap_or(&reason).trim().to_string();
+                if let Some(server) = self.servers.get_mut(name) {
+                    server.state = State::Failed(detail.clone());
+                }
+                self.documents.retain(|_, document| document.server != name);
+                cx.emit(ServerEvent::Status(format!("{name} stopped: {detail}")));
+                cx.notify();
+            }
+        }
     }
 
-    pub fn initialized(&mut self) -> io::Result<()> {
-        self.write(json!({"jsonrpc":"2.0","method":"initialized","params":{}}))
+    pub fn sync(
+        &mut self,
+        path: &Path,
+        language: &'static str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self.start(language, cx) else {
+            return;
+        };
+        if self.client(language).is_none() {
+            return;
+        }
+        let Some(uri) = lsp::path_to_uri(path) else {
+            return;
+        };
+        let opened = self.documents.contains_key(path);
+        let document = self
+            .documents
+            .entry(path.to_path_buf())
+            .or_insert(Document {
+                server: name,
+                language,
+                version: 0,
+            });
+        document.version += 1;
+        let version = document.version;
+        let Some(client) = self.client(language) else {
+            return;
+        };
+        if opened {
+            client.notify::<lsp_types::notification::DidChangeTextDocument>(
+                lsp_types::DidChangeTextDocumentParams {
+                    text_document: lsp_types::VersionedTextDocumentIdentifier { uri, version },
+                    content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                        range: None,
+                        range_length: None,
+                        text: text.to_string(),
+                    }],
+                },
+            );
+        } else {
+            client.notify::<lsp_types::notification::DidOpenTextDocument>(
+                lsp_types::DidOpenTextDocumentParams {
+                    text_document: lsp_types::TextDocumentItem {
+                        uri,
+                        language_id: language_id(language).into(),
+                        version,
+                        text: text.to_string(),
+                    },
+                },
+            );
+        }
     }
 
-    pub fn respond(&mut self, id: Value, result: Value) -> io::Result<()> {
-        self.write(json!({"jsonrpc":"2.0","id":id,"result":result}))
+    pub fn saved(&mut self, path: &Path, text: &str) {
+        let Some(document) = self.documents.get(path) else {
+            return;
+        };
+        let (Some(client), Some(uri)) = (self.client(document.language), lsp::path_to_uri(path))
+        else {
+            return;
+        };
+        client.notify::<lsp_types::notification::DidSaveTextDocument>(
+            lsp_types::DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+                text: Some(text.to_string()),
+            },
+        );
     }
 
-    pub fn open(&mut self, path: &Path, text: &str, version: i64) -> io::Result<()> {
-        self.write(
-            json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{
-                "textDocument":{"uri":uri(path),"languageId":"rust","version":version,"text":text}
-            }}),
-        )
+    pub fn close(&mut self, path: &Path) {
+        let Some(document) = self.documents.remove(path) else {
+            return;
+        };
+        let (Some(client), Some(uri)) = (self.client(document.language), lsp::path_to_uri(path))
+        else {
+            return;
+        };
+        client.notify::<lsp_types::notification::DidCloseTextDocument>(
+            lsp_types::DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri },
+            },
+        );
     }
 
-    pub fn change(&mut self, path: &Path, text: &str, version: i64) -> io::Result<()> {
-        self.write(
-            json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{
-                "textDocument":{"uri":uri(path),"version":version},"contentChanges":[{"text":text}]
-            }}),
-        )
+    pub fn hover(
+        &self,
+        path: &Path,
+        language: &str,
+        position: Position,
+    ) -> Option<impl Future<Output = Option<Hover>> + use<>> {
+        let request = self
+            .client(language)?
+            .request::<lsp_types::request::HoverRequest>(HoverParams {
+                text_document_position_params: self.locate(path, position)?,
+                work_done_progress_params: Default::default(),
+            });
+        Some(async move { request.await.ok().flatten() })
     }
 
-    pub fn close(&mut self, path: &Path) -> io::Result<()> {
-        self.write(
-            json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{
-                "textDocument":{"uri":uri(path)}
-            }}),
-        )
+    pub fn definition(
+        &self,
+        path: &Path,
+        language: &str,
+        position: Position,
+    ) -> Option<impl Future<Output = Option<(PathBuf, Position)>> + use<>> {
+        let request = self
+            .client(language)?
+            .request::<lsp_types::request::GotoDefinition>(GotoDefinitionParams {
+                text_document_position_params: self.locate(path, position)?,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            });
+        Some(async move { request.await.ok().flatten().and_then(first_location) })
     }
 
-    pub fn saved(&mut self, path: &Path) -> io::Result<()> {
-        self.write(
-            json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{
-                "textDocument":{"uri":uri(path)}
-            }}),
-        )
+    pub fn completions(
+        &self,
+        path: &Path,
+        language: &str,
+        position: Position,
+    ) -> Option<impl Future<Output = Vec<CompletionItem>> + use<>> {
+        let request = self
+            .client(language)?
+            .request::<lsp_types::request::Completion>(CompletionParams {
+                text_document_position: self.locate(path, position)?,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            });
+        Some(async move {
+            match request.await {
+                Ok(Some(CompletionResponse::Array(items))) => items,
+                Ok(Some(CompletionResponse::List(list))) => list.items,
+                _ => Vec::new(),
+            }
+        })
     }
 
-    pub fn definition(&mut self, path: &Path, line: u32, character: u32) -> io::Result<i64> {
-        self.sequence += 1;
-        let id = self.sequence;
-        self.write(
-            json!({"jsonrpc":"2.0","id":id,"method":"textDocument/definition","params":{
-                "textDocument":{"uri":uri(path)},"position":{"line":line,"character":character}
-            }}),
-        )?;
-        Ok(id)
-    }
-
-    pub fn hover(&mut self, path: &Path, line: u32, character: u32) -> io::Result<i64> {
-        self.sequence += 1;
-        let id = self.sequence;
-        self.write(
-            json!({"jsonrpc":"2.0","id":id,"method":"textDocument/hover","params":{
-                "textDocument":{"uri":uri(path)},"position":{"line":line,"character":character}
-            }}),
-        )?;
-        Ok(id)
-    }
-
-    pub fn completion(&mut self, path: &Path, line: u32, character: u32) -> io::Result<i64> {
-        self.sequence += 1;
-        let id = self.sequence;
-        self.write(
-            json!({"jsonrpc":"2.0","id":id,"method":"textDocument/completion","params":{
-                "textDocument":{"uri":uri(path)},"position":{"line":line,"character":character}
-            }}),
-        )?;
-        Ok(id)
-    }
-
-    fn write(&mut self, message: Value) -> io::Result<()> {
-        self.outgoing.try_send(message).map_err(io::Error::other)
+    fn locate(&self, path: &Path, position: Position) -> Option<TextDocumentPositionParams> {
+        Some(TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: lsp::path_to_uri(path)?,
+            },
+            position,
+        })
     }
 }
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+fn first_location(response: GotoDefinitionResponse) -> Option<(PathBuf, Position)> {
+    match response {
+        GotoDefinitionResponse::Scalar(location) => {
+            Some((lsp::uri_to_path(&location.uri)?, location.range.start))
+        }
+        GotoDefinitionResponse::Array(locations) => {
+            let location = locations.into_iter().next()?;
+            Some((lsp::uri_to_path(&location.uri)?, location.range.start))
+        }
+        GotoDefinitionResponse::Link(links) => {
+            let link = links.into_iter().next()?;
+            Some((
+                lsp::uri_to_path(&link.target_uri)?,
+                link.target_selection_range.start,
+            ))
+        }
     }
 }
 
-pub fn uri(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    #[cfg(target_os = "windows")]
-    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
-    let path = path.replace('\\', "/");
-    let path = if cfg!(target_os = "windows") {
-        format!("/{path}")
-    } else {
-        path
+fn language_id(language: &str) -> &'static str {
+    match language {
+        "c" => "c",
+        "c_sharp" => "csharp",
+        "go" => "go",
+        "java" => "java",
+        "javascript" => "javascript",
+        "jsx" => "javascriptreact",
+        "rust" => "rust",
+        "typescript" => "typescript",
+        "tsx" => "typescriptreact",
+        "zig" => "zig",
+        _ => "plaintext",
+    }
+}
+
+pub fn position_at(text: &str, offset: usize) -> Position {
+    let offset = offset.min(text.len());
+    let line = text[..offset].matches('\n').count() as u32;
+    let start = text[..offset].rfind('\n').map_or(0, |ix| ix + 1);
+    let character = text[start..offset].encode_utf16().count() as u32;
+    Position::new(line, character)
+}
+
+pub struct EditorSupport {
+    servers: WeakEntity<Servers>,
+    path: Option<PathBuf>,
+    language: &'static str,
+    root: Option<PathBuf>,
+}
+
+pub fn attach(
+    editor: &Entity<InputState>,
+    servers: &Entity<Servers>,
+    path: Option<PathBuf>,
+    language: &'static str,
+    cx: &mut App,
+) {
+    let support = Rc::new(EditorSupport {
+        servers: servers.downgrade(),
+        path,
+        language,
+        root: servers.read(cx).root.clone(),
+    });
+    editor.update(cx, |editor, _| {
+        editor.lsp.hover_provider = Some(support);
+    });
+}
+
+impl HoverProvider for EditorSupport {
+    fn hover(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<Hover>>> {
+        let source = text.to_string();
+        let request = match (self.servers.upgrade(), self.path.as_deref()) {
+            (Some(servers), Some(path)) => {
+                servers
+                    .read(cx)
+                    .hover(path, self.language, position_at(&source, offset))
+            }
+            _ => None,
+        };
+        let language = self.language;
+        let root = self.root.clone();
+        let origin = self.path.clone();
+        cx.background_executor().spawn(async move {
+            if let Some(request) = request
+                && let Some(hover) = request.await
+                && !is_empty(&hover)
+            {
+                return Ok(Some(hover));
+            }
+            Ok(declaration_hover(
+                language,
+                &source,
+                offset,
+                root.as_deref(),
+                origin.as_deref(),
+            ))
+        })
+    }
+}
+
+fn is_empty(hover: &Hover) -> bool {
+    match &hover.contents {
+        HoverContents::Scalar(lsp_types::MarkedString::String(text)) => text.trim().is_empty(),
+        HoverContents::Scalar(_) => false,
+        HoverContents::Array(items) => items.is_empty(),
+        HoverContents::Markup(markup) => markup.value.trim().is_empty(),
+    }
+}
+
+pub fn declaration_hover(
+    language: &'static str,
+    source: &str,
+    offset: usize,
+    root: Option<&Path>,
+    origin: Option<&Path>,
+) -> Option<Hover> {
+    let (declaration, path) = match navigation::lookup(language, source, offset)? {
+        navigation::Lookup::Found(name) => (
+            navigation::summarize(language, source, name)?,
+            origin.map(Path::to_path_buf),
+        ),
+        navigation::Lookup::Search(search) => {
+            let hit =
+                navigation::search_workspace(root?, origin, language, &search, &HashMap::new())?;
+            let text = hit.document?.text().to_string();
+            let language = syntax::language(Some(&hit.path));
+            (
+                navigation::summarize(language, &text, hit.name)?,
+                Some(hit.path),
+            )
+        }
     };
-    let mut encoded = String::from("file://");
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-._~:".contains(&byte) {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
+    Some(markdown(language, &declaration, path.as_deref()))
 }
 
-pub fn path_from_uri(uri: &str) -> Option<std::path::PathBuf> {
-    let source = uri.strip_prefix("file://")?;
-    let mut bytes = Vec::new();
-    let mut source = source.bytes();
-    while let Some(byte) = source.next() {
-        if byte == b'%' {
-            let hi = (source.next()? as char).to_digit(16)?;
-            let lo = (source.next()? as char).to_digit(16)?;
-            bytes.push((hi * 16 + lo) as u8);
-        } else {
-            bytes.push(byte);
-        }
+fn markdown(language: &str, declaration: &navigation::Declaration, path: Option<&Path>) -> Hover {
+    let mut value = format!("```{language}\n{}\n```", declaration.signature);
+    if !declaration.documentation.is_empty() {
+        value.push_str("\n\n");
+        value.push_str(&declaration.documentation);
     }
-    let path = String::from_utf8(bytes).ok()?;
-    #[cfg(target_os = "windows")]
-    let path = path.strip_prefix('/').unwrap_or(&path).replace('/', "\\");
-    let path: std::path::PathBuf = path.into();
-    Some(path.canonicalize().unwrap_or(path))
-}
-
-fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
-    let mut length = None;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(None);
-        }
-        if line.trim().is_empty() {
-            break;
-        }
-        if let Some(value) = line.trim().strip_prefix("Content-Length:") {
-            length = value.trim().parse::<usize>().ok();
-        }
+    if let Some(name) = path.and_then(Path::file_name) {
+        value.push_str(&format!(
+            "\n\n`{}:{}`",
+            name.to_string_lossy(),
+            declaration.line
+        ));
     }
-    let length = length.ok_or_else(|| io::Error::other("Missing LSP Content-Length"))?;
-    if length > 16 * 1024 * 1024 {
-        return Err(io::Error::other("LSP message too large"));
-    }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(io::Error::other)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_framed_messages_and_round_trips_uri() {
-        let data = b"Content-Length: 7\r\n\r\n{\"a\":1}";
-        assert_eq!(read_message(&mut &data[..]).unwrap().unwrap()["a"], 1);
-        let path = std::path::Path::new(if cfg!(windows) {
-            "C:\\my files\\é.rs"
-        } else {
-            "/my files/é.rs"
-        });
-        assert_eq!(path_from_uri(&uri(path)).as_deref(), Some(path));
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: None,
     }
 }

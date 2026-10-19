@@ -1,25 +1,49 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Context, Div, FocusHandle, Focusable, FontWeight, IntoElement,
-    ListHorizontalSizingBehavior, Render, SharedString, Task, UniformListScrollHandle, Window, div,
-    prelude::*, px, uniform_list,
+    App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement,
+    ListHorizontalSizingBehavior, Render, SharedString, Subscription, Task,
+    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{Icon, IconName};
-use ide_core::git::{Change, Diff, DiffLine, FileStatus, LineKind, Repository};
+use ide_core::{
+    document::Document,
+    git::{self, Change, Diff, DiffLine, FileStatus, LineKind, Repository},
+};
 
-use crate::{git_panel::Selection, theme};
+use crate::{
+    commands::SaveFile,
+    git_panel::Selection,
+    merge_view::{MergeEvent, MergeView},
+    theme,
+};
 
 const ROW_HEIGHT: f32 = 20.;
+
+pub enum DiffViewEvent {
+    Resolved(String),
+}
+
+struct MergeSource {
+    target: Selection,
+    repository: Repository,
+    file: FileStatus,
+    document: Result<Document, String>,
+}
 
 pub struct DiffView {
     target: Option<Selection>,
     diff: Option<(Selection, Result<Diff, String>)>,
+    conflicted: bool,
+    merge_source: Option<MergeSource>,
+    merge: Option<(Selection, Entity<MergeView>, Subscription)>,
     widest_line: usize,
     scroll: UniformListScrollHandle,
     task: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
+
+impl EventEmitter<DiffViewEvent> for DiffView {}
 
 impl Focusable for DiffView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -32,6 +56,9 @@ impl DiffView {
         Self {
             target: None,
             diff: None,
+            conflicted: false,
+            merge_source: None,
+            merge: None,
             widest_line: 0,
             scroll: UniformListScrollHandle::new(),
             task: None,
@@ -50,13 +77,26 @@ impl DiffView {
         }
     }
 
+    pub(crate) fn merge_view(&self) -> Option<&Entity<MergeView>> {
+        match (&self.target, &self.merge) {
+            (Some(target), Some((shown, view, _))) if target == shown => Some(view),
+            _ => None,
+        }
+    }
+
     pub fn title(&self) -> Option<String> {
         self.target.as_ref().map(|target| {
             let name = target
                 .relative
                 .rsplit_once('/')
                 .map_or(target.relative.as_str(), |(_, name)| name);
-            let side = if target.staged { "Staged" } else { "Unstaged" };
+            let side = if self.conflicted {
+                "Merging"
+            } else if target.staged {
+                "Staged"
+            } else {
+                "Unstaged"
+            };
             format!("{name} ({side})")
         })
     }
@@ -68,6 +108,13 @@ impl DiffView {
         file: FileStatus,
         cx: &mut Context<Self>,
     ) {
+        if !target.staged && file.unstaged == Some(Change::Conflicted) {
+            self.load_merge(repository, target, file, cx);
+            return;
+        }
+        self.conflicted = false;
+        self.merge_source = None;
+        self.merge = None;
         self.target = Some(target.clone());
         let executor = cx.background_executor().clone();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -91,9 +138,79 @@ impl DiffView {
         cx.notify();
     }
 
+    fn load_merge(
+        &mut self,
+        repository: Repository,
+        target: Selection,
+        file: FileStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let loaded = self.conflicted
+            && self.target.as_ref() == Some(&target)
+            && (self.merge.is_some()
+                || self
+                    .merge_source
+                    .as_ref()
+                    .is_none_or(|source| source.document.is_ok()));
+        if loaded {
+            return;
+        }
+        self.target = Some(target.clone());
+        self.conflicted = true;
+        self.diff = None;
+        self.merge = None;
+        self.merge_source = None;
+        let executor = cx.background_executor().clone();
+        let path = git::absolute(repository.root(), &target.relative);
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let document = executor
+                .spawn(async move { Document::open(&path) })
+                .await
+                .map_err(|error| error.to_string());
+            let _ = this.update(cx, |this, cx| {
+                if this.target.as_ref() == Some(&target) && this.conflicted {
+                    this.merge_source = Some(MergeSource {
+                        target,
+                        repository,
+                        file,
+                        document,
+                    });
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    fn open_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.merge_source.take_if(|source| source.document.is_ok()) else {
+            return;
+        };
+        let Ok(document) = source.document else {
+            return;
+        };
+        let path = git::absolute(source.repository.root(), &source.target.relative);
+        let view =
+            cx.new(|cx| MergeView::new(source.repository, source.file, path, document, window, cx));
+        let subscription = cx.subscribe(&view, |_, _, event, cx| match event {
+            MergeEvent::Resolved(summary) => cx.emit(DiffViewEvent::Resolved(summary.clone())),
+        });
+        self.merge = Some((source.target, view, subscription));
+    }
+
+    fn save(&mut self, _: &SaveFile, _: &mut Window, cx: &mut Context<Self>) {
+        match self.merge_view().cloned() {
+            Some(view) => view.update(cx, |view, cx| view.save(cx)),
+            None => cx.propagate(),
+        }
+    }
+
     pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
         self.target = None;
         self.diff = None;
+        self.conflicted = false;
+        self.merge_source = None;
+        self.merge = None;
         self.task = None;
         cx.notify();
     }
@@ -153,7 +270,38 @@ fn render_diff_line(line: &DiffLine) -> Div {
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.conflicted {
+            self.open_merge(window, cx);
+            let body = match (self.merge_view(), &self.merge_source) {
+                (Some(view), _) => view.clone().into_any_element(),
+                (
+                    None,
+                    Some(MergeSource {
+                        document: Err(error),
+                        ..
+                    }),
+                ) => div()
+                    .p_3()
+                    .text_color(theme::error())
+                    .child(error.clone())
+                    .into_any_element(),
+                _ => div()
+                    .p_3()
+                    .text_xs()
+                    .text_color(theme::muted())
+                    .child("Loading merge conflicts…")
+                    .into_any_element(),
+            };
+            return div()
+                .debug_selector(|| "git-diff".into())
+                .track_focus(&self.focus_handle)
+                .on_action(cx.listener(Self::save))
+                .size_full()
+                .bg(theme::background())
+                .child(body)
+                .into_any_element();
+        }
         let message = |text: SharedString| {
             div()
                 .p_3()
@@ -241,5 +389,6 @@ impl Render for DiffView {
                 )
             })
             .child(body)
+            .into_any_element()
     }
 }

@@ -532,3 +532,46 @@ fn workspace_search_reads_open_buffers_instead_of_disk() {
     assert!(hit.document.is_none());
     assert_eq!(&edited[hit.name], "Circle");
 }
+
+#[test]
+fn declarations_summarise_their_signature_and_doc_comment() {
+    let summary = |language: &'static str, source: &str, word: &str, n: usize| {
+        summarize(language, source, at(source, word, n)).expect("a declaration")
+    };
+
+    let go = summary("go", GO, "Area", 0);
+    assert_eq!(go.signature, "func (c *Circle) Area(scale float64) float64");
+    assert_eq!(go.documentation, "");
+    assert_eq!(go.line, 11);
+
+    let typescript = summary("typescript", TYPESCRIPT, "area", 0);
+    assert_eq!(typescript.signature, "area(scale: number): number");
+
+    let field = summary("typescript", TYPESCRIPT, "label", 1);
+    assert_eq!(field.signature, "label = \"circle\"");
+
+    let c = summary("c", C, "make", 0);
+    assert_eq!(
+        c.signature,
+        "static Point *make(const char *name, int (*callback)(int value))"
+    );
+
+    let java = summary("java", JAVA, "total", 0);
+    assert_eq!(java.signature, "int total(List<T> items)");
+
+    let zig = summary("zig", ZIG, "doubled", 0);
+    assert_eq!(zig.signature, "fn doubled(self: Point) i32");
+
+    let documented = "/* Counts things.\n * Twice.\n */\nfn counter() {}\n";
+    let summary = summarize("rust", documented, at(documented, "counter", 0)).unwrap();
+    assert_eq!(summary.signature, "fn counter()");
+    assert_eq!(summary.documentation, "Counts things.\nTwice.");
+
+    let detached = "// unrelated\n\nfn counter() {}\n";
+    assert_eq!(
+        summarize("rust", detached, at(detached, "counter", 0))
+            .unwrap()
+            .documentation,
+        ""
+    );
+}

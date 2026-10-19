@@ -6,7 +6,7 @@ use std::{
 
 use gpui::{App, Font, FontFallbacks, Hsla, Rgba, Window, font, px, rgb, rgba};
 use gpui_component::{Theme, ThemeMode, highlighter::SyntaxColors};
-use ide_core::git::Change;
+use ide_core::{git::Change, merge::Side};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{file_icons::FileKind, syntax::Token};
@@ -59,10 +59,12 @@ pub enum Color {
     DiffAdded,
     DiffRemoved,
     DiffHunk,
+    MergeCurrent,
+    MergeIncoming,
 }
 
 impl Color {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::Background,
         Self::Panel,
         Self::Chrome,
@@ -86,6 +88,8 @@ impl Color {
         Self::DiffAdded,
         Self::DiffRemoved,
         Self::DiffHunk,
+        Self::MergeCurrent,
+        Self::MergeIncoming,
     ];
 
     fn defaults(self) -> (u32, u32) {
@@ -113,6 +117,8 @@ impl Color {
             Self::DiffAdded => (0x1f3a2b, 0xe3f6e5),
             Self::DiffRemoved => (0x42262a, 0xfde7e7),
             Self::DiffHunk => (0x1e2436, 0xeef3ff),
+            Self::MergeCurrent => (0x1c3530, 0xdcf2ea),
+            Self::MergeIncoming => (0x1d2c44, 0xe0eafb),
         }
     }
 }
@@ -408,8 +414,34 @@ pub fn diff_hunk() -> Rgba {
     color(Color::DiffHunk)
 }
 
+pub fn merge_side(side: Side) -> Rgba {
+    color(match side {
+        Side::Current => Color::MergeCurrent,
+        Side::Incoming => Color::MergeIncoming,
+    })
+}
+
+pub fn merge_label(side: Side) -> Rgba {
+    match side {
+        Side::Current => color(Color::GitAdded),
+        Side::Incoming => color(Color::GitModified),
+    }
+}
+
 pub fn error() -> Rgba {
     color(Color::Error)
+}
+
+pub fn breakpoint() -> Rgba {
+    pick(0xe5534b, 0xd1242f)
+}
+
+pub fn execution_line() -> Rgba {
+    pick(0xe8b84a, 0xb07d00)
+}
+
+pub fn execution_wash() -> Hsla {
+    Hsla::from(execution_line()).opacity(if mode().is_dark() { 0.16 } else { 0.14 })
 }
 
 pub fn syntax(token: Token) -> Rgba {

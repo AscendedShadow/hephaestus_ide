@@ -65,6 +65,8 @@ const SKIPPED_DIRECTORIES: [&str; 8] = [
     "build",
 ];
 const MAX_WORKSPACE_ENTRIES: usize = 20_000;
+const MAX_SIGNATURE_LINES: usize = 8;
+const NEWLINE: char = '\n';
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup {
@@ -489,4 +491,160 @@ fn source_files(root: &Path, language: &str) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    pub signature: String,
+    pub documentation: String,
+    pub line: usize,
+}
+
+pub fn summarize(language: &'static str, source: &str, name: Range<usize>) -> Option<Declaration> {
+    let grammar = syntax::grammar(language)?;
+    let query = definitions_query(language)?.ok()?;
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let target = root.descendant_for_byte_range(name.start, name.end)?;
+    let declaration = declaration_node(&query, root, source, target).unwrap_or(target);
+    let start = declaration.start_byte();
+    let end = declaration
+        .child_by_field_name("body")
+        .map_or(declaration.end_byte(), |body| body.start_byte())
+        .max(start);
+    Some(Declaration {
+        signature: signature(&source[start..end]),
+        documentation: documentation(declaration, source),
+        line: source[..name.start].matches(NEWLINE).count() + 1,
+    })
+}
+
+fn declaration_node<'t>(
+    query: &Query,
+    root: Node<'t>,
+    source: &str,
+    name: Node<'t>,
+) -> Option<Node<'t>> {
+    let definition_capture = query.capture_index_for_name("definition");
+    let kinds: Vec<u32> = ["item", "local", "import"]
+        .iter()
+        .filter_map(|kind| query.capture_index_for_name(kind))
+        .collect();
+    let mut candidates: Vec<Node<'t>> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, root, source.as_bytes());
+    while let Some(found) = matches.next() {
+        let mut declaration = None;
+        let mut names = Vec::new();
+        for capture in found.captures {
+            if Some(capture.index) == definition_capture {
+                declaration = Some(capture.node);
+            } else if kinds.contains(&capture.index) {
+                if capture.node.named_child_count() == 0 {
+                    names.push(capture.node);
+                } else {
+                    pattern_names(capture.node, &mut names);
+                }
+            }
+        }
+        if names.iter().any(|node| node.id() == name.id()) {
+            candidates.push(declaration.or_else(|| name.parent()).unwrap_or(name));
+        }
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|node| node.end_byte() - node.start_byte())
+}
+
+fn signature(text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.truncate(MAX_SIGNATURE_LINES);
+    let indent = lines
+        .iter()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take_while(|c| c.is_whitespace()).count())
+        .min()
+        .unwrap_or(0);
+    let signature = lines
+        .iter()
+        .enumerate()
+        .map(|(ix, line)| match ix {
+            0 => line.trim_start(),
+            _ => trim_indent(line, indent),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    signature
+        .trim_end()
+        .trim_end_matches(['{', '=', ','])
+        .trim_end()
+        .to_string()
+}
+
+fn trim_indent(line: &str, indent: usize) -> &str {
+    let mut characters = line.char_indices();
+    for _ in 0..indent {
+        match characters.next() {
+            Some((_, character)) if character.is_whitespace() => {}
+            _ => return line.trim_start(),
+        }
+    }
+    match characters.next() {
+        Some((offset, _)) => &line[offset..],
+        None => "",
+    }
+}
+
+fn documentation(declaration: Node, source: &str) -> String {
+    let line_of = |offset: usize| source[..offset].matches(NEWLINE).count();
+    let mut comments: Vec<&str> = Vec::new();
+    let mut node = declaration;
+    let mut line = line_of(declaration.start_byte());
+    while let Some(previous) = node.prev_named_sibling() {
+        if line_of(previous.end_byte()) + 1 < line {
+            break;
+        }
+        let kind = previous.kind();
+        if kind.contains("comment") {
+            comments.push(&source[previous.byte_range()]);
+        } else if !(kind.contains("attribute")
+            || kind.contains("modifier")
+            || kind.contains("annotation"))
+        {
+            break;
+        }
+        line = line_of(previous.start_byte());
+        node = previous;
+    }
+    comments.reverse();
+    let documentation = comments
+        .into_iter()
+        .map(strip_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    documentation.trim().to_string()
+}
+
+fn strip_comment(comment: &str) -> String {
+    let block = comment.trim_start().starts_with("/*");
+    comment
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            let line = ["///", "//!", "//", "/**", "/*"]
+                .iter()
+                .find_map(|marker| line.strip_prefix(marker))
+                .unwrap_or(line);
+            let line = line.strip_suffix("*/").unwrap_or(line);
+            let line = match block {
+                true => line.trim_start().strip_prefix('*').unwrap_or(line),
+                false => line,
+            };
+            line.trim().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

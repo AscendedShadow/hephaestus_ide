@@ -54,6 +54,8 @@ actions!(
         DebugStepInto,
         DebugStepOut,
         DebugInterrupt,
+        DebugStop,
+        DebugRestart,
         GoBack,
         GoForward,
         GoToLine
@@ -108,13 +110,15 @@ pub enum Command {
     DebugStepInto,
     DebugStepOut,
     DebugInterrupt,
+    DebugStop,
+    DebugRestart,
     GoBack,
     GoForward,
     GoToLine,
 }
 
 impl Command {
-    pub const ALL: [Self; 47] = [
+    pub const ALL: [Self; 49] = [
         Self::NewFile,
         Self::OpenFile,
         Self::OpenFolder,
@@ -159,6 +163,8 @@ impl Command {
         Self::DebugStepInto,
         Self::DebugStepOut,
         Self::DebugInterrupt,
+        Self::DebugStop,
+        Self::DebugRestart,
         Self::GoBack,
         Self::GoForward,
         Self::GoToLine,
@@ -217,6 +223,8 @@ impl Command {
             Self::DebugStepInto => Box::new(DebugStepInto),
             Self::DebugStepOut => Box::new(DebugStepOut),
             Self::DebugInterrupt => Box::new(DebugInterrupt),
+            Self::DebugStop => Box::new(DebugStop),
+            Self::DebugRestart => Box::new(DebugRestart),
             Self::GoBack => Box::new(GoBack),
             Self::GoForward => Box::new(GoForward),
             Self::GoToLine => Box::new(GoToLine),
@@ -279,6 +287,8 @@ impl Command {
             Self::DebugStepInto => &["f11"],
             Self::DebugStepOut => &["shift-f11"],
             Self::DebugInterrupt => &["ctrl-f6"],
+            Self::DebugStop => &["shift-f5"],
+            Self::DebugRestart => &["secondary-shift-f5"],
             Self::GoBack => &["alt-left"],
             Self::GoForward => &["alt-right"],
             Self::GoToLine => &["secondary-g"],

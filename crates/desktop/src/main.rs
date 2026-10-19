@@ -3,11 +3,13 @@
 mod assets;
 mod brace_guide;
 mod commands;
+mod debugger;
 mod diff_view;
 mod file_icons;
 mod folding;
 mod git_panel;
 mod language_server;
+mod merge_view;
 mod navigation;
 mod session;
 mod settings;

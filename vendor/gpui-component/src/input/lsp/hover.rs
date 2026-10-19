@@ -23,6 +23,24 @@ pub trait HoverProvider {
 }
 
 impl InputState {
+    /// The hover information shown in the popover, if one is open.
+    pub fn hover_popover_content(&self, cx: &App) -> Option<std::rc::Rc<lsp_types::Hover>> {
+        Some(self.hover_popover.as_ref()?.read(cx).hover.clone())
+    }
+
+    /// Show the hover popover for the symbol at the given byte offset.
+    pub fn show_hover(
+        &mut self,
+        offset: usize,
+        hover: &lsp_types::Hover,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let symbol_range = self.text.word_range(offset).unwrap_or(offset..offset);
+        self.hover_popover = Some(HoverPopover::new(cx.entity(), symbol_range, hover, cx));
+        cx.notify();
+    }
+
     /// Handle hover trigger LSP request.
     pub(super) fn handle_hover_popover(
         &mut self,

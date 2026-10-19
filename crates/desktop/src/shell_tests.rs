@@ -935,6 +935,59 @@ fn git_changes_open_their_diff_as_an_editor_tab(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn conflicted_files_open_in_the_merge_editor(cx: &mut TestAppContext) {
+    use crate::{git_panel::tests::git, merge_view::tests::conflicted_repository};
+    use ide_core::merge::Side;
+
+    let (_directory, root) = conflicted_repository();
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let workspace = ide_core::workspace::Workspace::open(&root).unwrap();
+    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    cx.simulate_keystrokes(&primary("shift-g"));
+    cx.run_until_parked();
+    let row = cx.debug_bounds("git-row-1").unwrap();
+    cx.simulate_click(row.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*notes.txt (Merging)"]);
+    let merge = cx.debug_bounds("merge-view").unwrap();
+    assert!(merge.left() >= cx.debug_bounds("sidebar").unwrap().right());
+    let view = cx.read(|cx| {
+        shell
+            .read(cx)
+            .diff_view
+            .read(cx)
+            .merge_view()
+            .cloned()
+            .unwrap()
+    });
+
+    view.update_in(cx, |view, window, cx| {
+        view.accept_all(Side::Incoming, window, cx)
+    });
+    shell.update(cx, |shell, cx| shell.refresh_git(cx));
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let diff_view = shell.read(cx).diff_view.read(cx);
+        assert_eq!(diff_view.merge_view(), Some(&view));
+    });
+
+    cx.simulate_keystrokes(&primary("s"));
+    cx.run_until_parked();
+    let saved = std::fs::read_to_string(root.join("notes.txt")).unwrap();
+    assert!(saved.contains("beta feature\n") && !saved.contains("<<<<<<<"));
+    assert_eq!(
+        git(&root, &["diff", "--name-only", "--diff-filter=U"]).trim(),
+        "notes.txt"
+    );
+
+    view.update(cx, |view, cx| view.complete(cx));
+    cx.run_until_parked();
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
+    assert_eq!(git(&root, &["diff", "--name-only", "--diff-filter=U"]), "");
+}
+
+#[gpui::test]
 fn panel_shortcuts_do_not_enter_vim_commands(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
     cx.simulate_resize(size(px(1200.), px(800.)));
@@ -1105,4 +1158,49 @@ fn vim_commands_open_switch_and_close_tabs(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("x : q ! enter");
     assert_eq!(tabs(&shell, cx), ["*Untitled"]);
     assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+}
+
+#[gpui::test]
+fn clicking_the_breakpoint_margin_toggles_source_line_breakpoints(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    open_fold_source(&shell, directory.path(), cx);
+    let path = cx.read(|cx| shell.read(cx).document().path().unwrap().to_path_buf());
+    let click = |selector: &'static str, line: usize, cx: &mut VisualTestContext| {
+        let gutter = cx.debug_bounds(selector).unwrap();
+        let y = gutter.top() + px(8. + 20. * line as f32 + 10.);
+        cx.simulate_click(point(gutter.center().x, y), Modifiers::none());
+        cx.run_until_parked();
+    };
+    let lines = |cx: &mut VisualTestContext| {
+        cx.read(|cx| {
+            shell
+                .read(cx)
+                .debugger
+                .read(cx)
+                .lines(&path)
+                .map(|lines| lines.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+    };
+
+    click("breakpoint-gutter", 2, cx);
+    assert_eq!(lines(cx), vec![3]);
+    assert_projection(&shell, cx, FOLD_SOURCE);
+
+    click("fold-gutter", 1, cx);
+    assert_projection(&shell, cx, FOLDED_IF);
+    cx.read(|cx| assert_eq!(shell.read(cx).display_row(3, cx), 1));
+    click("breakpoint-gutter", 2, cx);
+    assert_eq!(lines(cx), vec![3, 5]);
+
+    click("breakpoint-gutter", 2, cx);
+    assert_eq!(lines(cx), vec![3]);
+    click("breakpoint-gutter", 9, cx);
+    assert_eq!(lines(cx), vec![3]);
+
+    cx.dispatch_action(ShowDebugPanel);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("debug-panel").is_some());
 }

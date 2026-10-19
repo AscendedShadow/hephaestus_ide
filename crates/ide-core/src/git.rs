@@ -515,6 +515,9 @@ impl Repository {
     }
 
     pub fn commit_files(&self, files: &[FileStatus], message: &str) -> io::Result<String> {
+        if self.merging()? {
+            return self.write_commit(message, &[]);
+        }
         let paths: Vec<_> = files
             .iter()
             .flat_map(|file| {
@@ -625,6 +628,11 @@ impl Repository {
             .or(remotes.first())
             .map(|remote| remote.to_string())
             .ok_or_else(|| io::Error::other("This repository has no remotes"))
+    }
+
+    pub fn merging(&self) -> io::Result<bool> {
+        let output = self.output(["rev-parse", "--quiet", "--verify", "MERGE_HEAD"])?;
+        Ok(output.status.success())
     }
 
     fn head(&self) -> io::Result<Option<String>> {

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ide-core", "crates/terminal", "crates/desktop"]
+members = ["crates/ide-core", "crates/lsp", "crates/dap", "crates/terminal", "crates/desktop"]
 default-members = ["crates/desktop"]
 exclude = ["vendor"]
 resolver = "2"
@@ -11,7 +11,11 @@ publish = false
 
 [workspace.dependencies]
 ide-core = { path = "crates/ide-core" }
+lsp = { path = "crates/lsp" }
+dap = { path = "crates/dap" }
+lsp-types = { version = "=0.97.0", features = ["proposed"] }
 terminal = { path = "crates/terminal" }
+anyhow = "1"
 alacritty_terminal = { version = "=0.26.0", default-features = false }
 async-channel = "2"
 embed-resource = "3"

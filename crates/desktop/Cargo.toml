@@ -6,11 +6,15 @@ publish.workspace = true
 default-run = "hephaestus"
 
 [dependencies]
+anyhow.workspace = true
 async-channel.workspace = true
+dap.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 ide-core.workspace = true
+lsp.workspace = true
+lsp-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 terminal.workspace = true

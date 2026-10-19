@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -25,8 +26,8 @@ pub struct Settings {
     pub theme: Themes,
     pub show_sidebar: bool,
     pub commands: Vec<RunConfig>,
-    pub debugger: Option<RunConfig>,
-    pub language_server: Option<RunConfig>,
+    pub debugger: Option<DebuggerConfig>,
+    pub language_servers: Vec<LanguageServer>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -36,7 +37,80 @@ pub struct RunConfig {
     pub program: String,
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
-    pub env: std::collections::HashMap<String, String>,
+    pub env: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebuggerConfig {
+    pub name: String,
+    pub adapter: String,
+    pub adapter_args: Vec<String>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub working_directory: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub stop_on_entry: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LanguageServer {
+    pub languages: Vec<String>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub initialization_options: Option<serde_json::Value>,
+    pub settings: Option<serde_json::Value>,
+    pub enabled: bool,
+}
+
+impl Default for LanguageServer {
+    fn default() -> Self {
+        Self {
+            languages: Vec::new(),
+            program: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            initialization_options: None,
+            settings: None,
+            enabled: true,
+        }
+    }
+}
+
+impl LanguageServer {
+    fn new(languages: &[&str], program: &str, args: &[&str]) -> Self {
+        Self {
+            languages: languages
+                .iter()
+                .map(|language| language.to_string())
+                .collect(),
+            program: program.into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            ..Self::default()
+        }
+    }
+
+    pub fn serves(&self, language: &str) -> bool {
+        self.enabled && self.languages.iter().any(|served| served == language)
+    }
+}
+
+pub fn default_language_servers() -> Vec<LanguageServer> {
+    vec![
+        LanguageServer::new(&["rust"], "rust-analyzer", &[]),
+        LanguageServer::new(&["c"], "clangd", &[]),
+        LanguageServer::new(&["go"], "gopls", &[]),
+        LanguageServer::new(&["zig"], "zls", &[]),
+        LanguageServer::new(&["java"], "jdtls", &[]),
+        LanguageServer::new(&["c_sharp"], "omnisharp", &["-lsp"]),
+        LanguageServer::new(
+            &["javascript", "jsx", "typescript", "tsx"],
+            "typescript-language-server",
+            &["--stdio"],
+        ),
+    ]
 }
 
 impl Settings {
@@ -47,8 +121,29 @@ impl Settings {
             show_sidebar: false,
             commands: Vec::new(),
             debugger: None,
-            language_server: None,
+            language_servers: default_language_servers(),
         }
+    }
+
+    pub fn servers(&self) -> Vec<LanguageServer> {
+        let configured: HashSet<&str> = self
+            .language_servers
+            .iter()
+            .flat_map(|server| server.languages.iter().map(String::as_str))
+            .collect();
+        let mut servers: Vec<LanguageServer> = self
+            .language_servers
+            .iter()
+            .filter(|server| server.enabled && !server.program.is_empty())
+            .cloned()
+            .collect();
+        servers.extend(default_language_servers().into_iter().filter(|server| {
+            server
+                .languages
+                .iter()
+                .all(|language| !configured.contains(language.as_str()))
+        }));
+        servers
     }
 
     pub fn parse(source: &str) -> Result<Self, String> {
@@ -70,6 +165,7 @@ impl Settings {
     }
 
     pub fn apply(&self, window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
+        cx.set_global(ActiveLanguageServers(self.servers()));
         theme::set_themes(self.theme.clone());
         theme::set_mode(theme::mode(), window, cx);
         commands::rebind(cx, &self.keybindings)
@@ -79,6 +175,16 @@ impl Settings {
 pub struct SettingsPath(pub PathBuf);
 
 impl Global for SettingsPath {}
+
+pub struct ActiveLanguageServers(pub Vec<LanguageServer>);
+
+impl Global for ActiveLanguageServers {}
+
+pub fn language_servers(cx: &App) -> Vec<LanguageServer> {
+    cx.try_global::<ActiveLanguageServers>()
+        .map(|servers| servers.0.clone())
+        .unwrap_or_else(default_language_servers)
+}
 
 pub fn default_path() -> Option<PathBuf> {
     let var = |name| env::var_os(name).filter(|value| !value.is_empty());

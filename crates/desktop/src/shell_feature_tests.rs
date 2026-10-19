@@ -2,23 +2,6 @@ use super::*;
 use gpui::TestAppContext;
 use gpui_component::Root;
 
-#[test]
-fn debugger_breakpoints_use_selected_backend_syntax() {
-    let path = Path::new("src/main.rs");
-    assert_eq!(
-        breakpoint_command(path, 12, true, false),
-        "break \"src/main.rs\":12"
-    );
-    assert_eq!(
-        breakpoint_command(path, 12, false, false),
-        "clear \"src/main.rs\":12"
-    );
-    assert_eq!(
-        breakpoint_command(path, 12, true, true),
-        "breakpoint set --file \"src/main.rs\" --line 12"
-    );
-}
-
 #[gpui::test]
 fn quick_open_uses_workspace_index_and_opens_selected_file(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -168,15 +151,8 @@ fn completion_from_server_replaces_word_as_one_edit(cx: &mut TestAppContext) {
     let shell = shell.unwrap();
     cx.simulate_input("let greet");
     shell.update_in(cx, |shell, window, cx| {
-        shell.pending_completion = Some((2, shell.buffer().id));
-        shell.handle_lsp_event(
-            serde_json::json!({
-                "jsonrpc":"2.0", "id":2,
-                "result":{"items":[{"label":"greeting", "insertText":"greeting"}]}
-            }),
-            window,
-            cx,
-        );
+        shell.completions = vec![("greeting".into(), "greeting".into())];
+        shell.show_search(SearchMode::Completion, window, cx);
         assert_eq!(shell.search_mode, Some(SearchMode::Completion));
         shell.choose_search_result(0, window, cx);
     });
@@ -228,4 +204,55 @@ fn go_to_line_accepts_line_and_column(cx: &mut TestAppContext) {
             Position::new(1, 2)
         )
     });
+}
+
+#[gpui::test]
+fn hovering_shows_the_declaration_and_docs_without_a_language_server(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::commands::init(cx);
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.rs");
+    let source = "/// Greets the world.\npub fn greet(name: &str) {}\n\nfn main() {\n    greet(\"hi\");\n}\n";
+    std::fs::write(&path, source).unwrap();
+    let mut shell = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let entity = cx.new(|cx| IdeShell::new(window, cx));
+        shell = Some(entity.clone());
+        Root::new(entity, window, cx)
+    });
+    let shell = shell.unwrap();
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(directory.path()).unwrap(), cx)
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.open_document(Document::open(&path).unwrap(), window, cx)
+    });
+    cx.run_until_parked();
+
+    shell.update_in(cx, |shell, window, cx| {
+        shell.editor().update(cx, |editor, cx| {
+            editor.set_cursor_position(Position::new(4, 6), window, cx)
+        });
+    });
+    cx.dispatch_action(HoverInfo);
+    cx.run_until_parked();
+
+    let hover = cx.read(|cx| {
+        shell
+            .read(cx)
+            .editor()
+            .read(cx)
+            .hover_popover_content(cx)
+            .expect("a hover popover")
+    });
+    let lsp_types::HoverContents::Markup(markup) = &hover.contents else {
+        panic!("expected markdown, got {:?}", hover.contents);
+    };
+    assert_eq!(
+        markup.value,
+        "```rust\npub fn greet(name: &str)\n```\n\nGreets the world.\n\n`main.rs:2`"
+    );
+    cx.read(|cx| assert_eq!(shell.read(cx).status, "Showing the declaration"));
 }

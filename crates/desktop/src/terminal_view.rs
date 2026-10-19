@@ -117,28 +117,9 @@ impl TerminalView {
         }
     }
 
-    pub fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(session) = &self.session {
-            session.terminal.input(b"\x03".to_vec());
-            cx.notify();
-        }
-    }
-
     pub fn terminate(&mut self, cx: &mut Context<Self>) {
         self.session = None;
         cx.notify();
-    }
-
-    pub fn send_command(&mut self, command: &str, cx: &mut Context<Self>) -> bool {
-        let Some(session) = &self.session else {
-            return false;
-        };
-        if session.terminal.exited() {
-            return false;
-        }
-        session.terminal.input(format!("{command}\r").into_bytes());
-        cx.notify();
-        true
     }
 
     fn spawn(&mut self, options: Options, cx: &mut Context<Self>) -> Result<(), String> {
