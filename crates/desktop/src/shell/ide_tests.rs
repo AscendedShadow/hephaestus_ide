@@ -327,8 +327,10 @@ fn save_all_and_auto_save_after_delay(cx: &mut TestAppContext) {
     );
     cx.read(|cx| {
         let shell = shell.read(cx);
+        // Either auto-save hit the conflict, or the file watcher flagged it first.
         assert!(
-            shell.status.starts_with("Auto-save failed"),
+            shell.status.starts_with("Auto-save failed")
+                || shell.status.contains("changed on disk"),
             "{}",
             shell.status
         );
@@ -622,5 +624,90 @@ fn terminal_sessions_are_independent(cx: &mut TestAppContext) {
             Some(true),
             "other terminals keep running"
         );
+    });
+}
+
+#[gpui::test]
+fn external_changes_update_explorer_index_and_buffers(cx: &mut TestAppContext) {
+    use super::mock_lsp::wait_until;
+    let (shell, cx) = setup(cx);
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    write(&root.join("clean.rs"), "one\ntwo\nthree\n");
+    write(&root.join("dirty.rs"), "dirty\n");
+    write(&root.join("doomed.rs"), "bye\n");
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    wait_until(cx, |cx| cx.read(|cx| shell.read(cx).fs_sync_ready()));
+    open_file(&shell, &root.join("doomed.rs"), cx);
+    open_file(&shell, &root.join("dirty.rs"), cx);
+    cx.simulate_input("mine ");
+    open_file(&shell, &root.join("clean.rs"), cx);
+    set_cursor(&shell, 1, 2, cx);
+
+    // Another process edits, creates and deletes files while the window stays active.
+    std::fs::write(root.join("clean.rs"), "one\nTWO\nthree\nfour\n").unwrap();
+    std::fs::write(root.join("dirty.rs"), "theirs\n").unwrap();
+    std::fs::remove_file(root.join("doomed.rs")).unwrap();
+    // Atomic-save pattern: write a temporary file and rename it over a new name.
+    std::fs::write(root.join(".new.rs.tmp"), "fresh\n").unwrap();
+    std::fs::rename(root.join(".new.rs.tmp"), root.join("new.rs")).unwrap();
+
+    wait_until(cx, |cx| {
+        text(&shell, cx) == "one\nTWO\nthree\nfour\n"
+            && cx.read(|cx| {
+                shell
+                    .read(cx)
+                    .search_paths
+                    .iter()
+                    .any(|path| path.ends_with("new.rs"))
+            })
+    });
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let cursor = shell.editor().read(cx).cursor_position();
+        assert_eq!(
+            (cursor.line, cursor.character),
+            (1, 2),
+            "cursor preserved on reload"
+        );
+        let dirty = &shell.buffers[shell.buffer_for_path(&root.join("dirty.rs")).unwrap()];
+        assert!(dirty.external_change && dirty.dirty);
+        assert_eq!(dirty.document.text().to_string(), "mine dirty\n");
+        let doomed = &shell.buffers[shell.buffer_for_path(&root.join("doomed.rs")).unwrap()];
+        assert!(doomed.deleted_on_disk);
+        assert!(shell.tree_rows.iter().any(|row| row.entry.name == "new.rs"));
+        assert!(
+            shell
+                .tree_rows
+                .iter()
+                .all(|row| row.entry.name != "doomed.rs")
+        );
+    });
+
+    // Our own save does not trigger a reload; switching workspaces drops old events.
+    cx.simulate_input("x");
+    cx.simulate_keystrokes(&primary("s"));
+    cx.run_until_parked();
+    let other = tempfile::tempdir().unwrap();
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(other.path()).unwrap(), cx)
+    });
+    std::fs::write(root.join("late.rs"), "late\n").unwrap();
+    for _ in 0..40 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(
+            shell
+                .search_paths
+                .iter()
+                .all(|path| !path.ends_with("late.rs"))
+        );
+        assert!(!shell.buffer().external_change);
     });
 }

@@ -59,6 +59,7 @@ mod completion;
 mod editor_preferences;
 mod edits;
 mod explorer;
+mod fs_sync;
 mod language_mode;
 mod line_commands;
 mod lsp_features;
@@ -260,6 +261,8 @@ struct Buffer {
     dirty: bool,
     folds: Vec<Fold>,
     external_change: bool,
+    /// The file was deleted on disk while open.
+    deleted_on_disk: bool,
     _subscription: Subscription,
 }
 
@@ -340,6 +343,7 @@ pub struct IdeShell {
     lsp_diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
     snippet: Option<completion::SnippetSession>,
     signature: signature_help::SignatureState,
+    fs_sync: fs_sync::FsSync,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -411,6 +415,7 @@ impl IdeShell {
             lsp_diagnostics: HashMap::new(),
             snippet: None,
             signature: Default::default(),
+            fs_sync: Default::default(),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
@@ -680,6 +685,7 @@ impl IdeShell {
             dirty: false,
             folds: Vec::new(),
             external_change: false,
+            deleted_on_disk: false,
             _subscription: subscription,
         }
     }
@@ -861,15 +867,7 @@ impl IdeShell {
                         this.status =
                             format!("{} changed on disk — Save As or reload", path.display());
                     } else if let Ok(document) = Document::open(&path) {
-                        let text = document.text().to_string();
-                        let buffer = &mut this.buffers[ix];
-                        buffer.document = document;
-                        buffer.folds.clear();
-                        buffer
-                            .editor
-                            .update(cx, |editor, cx| editor.set_value(text, window, cx));
-                        buffer.dirty = false;
-                        buffer.external_change = false;
+                        this.replace_document_preserving_view(ix, document, window, cx);
                         this.status = format!("Reloaded {}", path.display());
                     } else {
                         this.buffers[ix].external_change = true;
@@ -1901,6 +1899,8 @@ impl IdeShell {
         self.index_workspace(cx);
         self.tree_rows = self.workspace.rows();
         self.tree_scroll = UniformListScrollHandle::new();
+        self.tree_selection = None;
+        self.start_watching(cx);
         self.sync_git(cx);
         cx.notify();
     }
@@ -4286,6 +4286,7 @@ impl IdeShell {
 
 impl Render for IdeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.schedule_fs_batch(window, cx);
         let (name, dirty) = self.active_tab(cx);
         let name = format!("{name}{}", if dirty { " •" } else { "" });
         window.set_window_title(&match self.workspace.root() {
@@ -4380,6 +4381,7 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::close_terminal))
             .on_action(cx.listener(Self::rename_terminal))
             .on_action(cx.listener(Self::select_terminal_profile))
+            .on_action(cx.listener(Self::refresh_explorer))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))
@@ -4400,7 +4402,11 @@ impl Render for IdeShell {
                         .items_center()
                         .gap_3()
                         .bg(theme::panel())
-                        .child("File changed on disk. Reload discards your edits.")
+                        .child(if self.buffer().deleted_on_disk {
+                            "File was deleted on disk. Save As to keep this buffer."
+                        } else {
+                            "File changed on disk. Reload discards your edits."
+                        })
                         .child(
                             Button::new("reload-external")
                                 .small()

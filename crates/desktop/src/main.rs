@@ -22,6 +22,7 @@ mod terminal_view;
 mod theme;
 mod ui;
 mod vim;
+mod watcher;
 mod whitespace;
 mod workspace_edit;
 

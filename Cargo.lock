@@ -2639,6 +2639,7 @@ dependencies = [
  "ide-core",
  "lsp",
  "lsp-types",
+ "notify",
  "ropey",
  "serde",
  "serde_json",

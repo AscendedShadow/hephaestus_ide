@@ -103,7 +103,8 @@ actions!(
         NextTerminal,
         CloseTerminal,
         RenameTerminal,
-        SelectTerminalProfile
+        SelectTerminalProfile,
+        RefreshExplorer
     ]
 );
 
@@ -228,6 +229,7 @@ commands! {
     CloseTerminal => CloseTerminal,
     RenameTerminal => RenameTerminal,
     SelectTerminalProfile => SelectTerminalProfile,
+    RefreshExplorer => RefreshExplorer,
 }
 
 impl Command {
