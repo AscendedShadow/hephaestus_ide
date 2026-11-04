@@ -75,6 +75,14 @@ where
         self.grouping = true;
     }
 
+    /// Make the next change start a new undo step even if it happens within the group
+    /// interval of the previous one.
+    pub fn break_group(&mut self) {
+        if let Some(past) = Instant::now().checked_sub(Duration::from_secs(3600)) {
+            self.last_changed_at = past;
+        }
+    }
+
     /// End grouping changes, this will allow the version to be incremented again.
     pub fn end_grouping(&mut self) {
         self.grouping = false;

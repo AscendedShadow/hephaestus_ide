@@ -54,6 +54,11 @@ use crate::{
     vim::VimInput,
 };
 
+mod language_mode;
+
+#[cfg(test)]
+mod ide_tests;
+
 #[cfg(test)]
 #[path = "shell_tests.rs"]
 mod tests;
@@ -76,6 +81,16 @@ fn position_at(text: &str, offset: usize) -> Position {
     let line_start = before.rfind('\n').map_or(0, |ix| ix + 1);
     let character = before[line_start..].encode_utf16().count() as u32;
     Position::new(line, character)
+}
+
+/// The first line of a document (bounded), used for shebang detection.
+fn first_line(document: &Document) -> String {
+    document
+        .text()
+        .chars()
+        .take_while(|character| *character != '\n')
+        .take(256)
+        .collect()
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -103,6 +118,7 @@ enum SearchMode {
     Diagnostics,
     Completion,
     Line,
+    Languages,
 }
 
 impl ToolPanel {
@@ -216,6 +232,10 @@ enum PendingAction {
 struct Buffer {
     id: BufferId,
     document: Document,
+    /// Language mode (see `ide_core::language`); detected or chosen by the user.
+    language: &'static str,
+    /// The user picked the language mode explicitly; keep it across saves.
+    language_overridden: bool,
     editor: Entity<InputState>,
     dirty: bool,
     folds: Vec<Fold>,
@@ -534,9 +554,10 @@ impl IdeShell {
     ) -> Buffer {
         let id = self.next_buffer_id;
         self.next_buffer_id += 1;
+        let language = syntax::detect(document.path(), Some(&first_line(&document)));
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
-                .code_editor(syntax::language(document.path()))
+                .code_editor(language)
                 .line_number(true)
                 .soft_wrap(false)
                 .tab_size(TabSize {
@@ -549,7 +570,7 @@ impl IdeShell {
             &editor,
             &self.servers,
             document.path().map(Path::to_path_buf),
-            syntax::language(document.path()),
+            language,
             cx,
         );
         let subscription = cx.subscribe_in(&editor, window, move |this, editor, event, _, cx| {
@@ -570,6 +591,8 @@ impl IdeShell {
         Buffer {
             id,
             document,
+            language,
+            language_overridden: false,
             editor,
             dirty: false,
             folds: Vec::new(),
@@ -621,7 +644,7 @@ impl IdeShell {
         let Some(buffer) = self.buffers.get(ix) else {
             return;
         };
-        let language = syntax::language(buffer.document.path());
+        let language = buffer.language;
         let Some(path) = buffer.document.path().map(Path::to_path_buf) else {
             return;
         };
@@ -1381,12 +1404,20 @@ impl IdeShell {
                                 this.servers
                                     .update(cx, |servers, _| servers.close(&old_path));
                             }
-                            let language = syntax::language(buffer.document.path());
+                            let language = buffer.language;
                             buffer.document.accept_saved(saved);
                             buffer.dirty = buffer.document.is_dirty();
                             buffer.external_change = false;
                             this.status = format!("Saved {}", buffer.document.name());
-                            let saved_language = syntax::language(buffer.document.path());
+                            let saved_language = if buffer.language_overridden {
+                                language
+                            } else {
+                                syntax::detect(
+                                    buffer.document.path(),
+                                    Some(&first_line(&buffer.document)),
+                                )
+                            };
+                            buffer.language = saved_language;
                             if saved_language != language {
                                 buffer.editor.update(cx, |editor, cx| {
                                     editor.set_highlighter(saved_language, cx)
@@ -1870,6 +1901,13 @@ impl IdeShell {
         let completion = (mode == SearchMode::Completion)
             .then(|| self.ranked_completions(query).get(ix).copied())
             .flatten();
+        let language = (mode == SearchMode::Languages)
+            .then(|| {
+                self.ranked_languages(query)
+                    .get(ix)
+                    .map(|language| language.id)
+            })
+            .flatten();
         let hit = self.search_hits.get(ix).cloned();
         self.search_mode = None;
         match mode {
@@ -1892,6 +1930,12 @@ impl IdeShell {
                 if let Some(index) = completion {
                     self.insert_completion(index, window, cx);
                 }
+            }
+            SearchMode::Languages => {
+                if let Some(language) = language {
+                    self.set_buffer_language(self.active, language, cx);
+                }
+                self.focus_editor(window, cx);
             }
             SearchMode::Line => {
                 let parts: Vec<_> = query.split(':').collect();
@@ -1981,7 +2025,8 @@ impl IdeShell {
 
     fn ranked_commands(&self, query: &str) -> Vec<Command> {
         Command::ALL
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|command| search::rank(Path::new(&command.name()), query).is_some())
             .collect()
     }
@@ -2144,6 +2189,11 @@ impl IdeShell {
                 .map(|&ix| self.completions[ix].0.clone())
                 .collect(),
             SearchMode::Line => vec!["Enter line or line:column, then press Enter".into()],
+            SearchMode::Languages => self
+                .ranked_languages(query)
+                .into_iter()
+                .map(Self::language_label)
+                .collect(),
             SearchMode::File | SearchMode::Project | SearchMode::Diagnostics => self
                 .search_hits
                 .iter()
@@ -2514,7 +2564,7 @@ impl IdeShell {
         cx: &mut Context<Self>,
     ) -> bool {
         let buffer = self.buffer();
-        let language = syntax::language(buffer.document.path());
+        let language = buffer.language;
         let offset = folding::display_to_source(&buffer.folds, display_offset, false);
         let position = position_at(&buffer.document.text().to_string(), offset);
         let request = buffer
@@ -2574,7 +2624,7 @@ impl IdeShell {
         let cursor = editor.read(cx).cursor();
         let offset = folding::display_to_source(&buffer.folds, cursor, false);
         let source = buffer.document.text().to_string();
-        let language = syntax::language(buffer.document.path());
+        let language = buffer.language;
         let origin = buffer.document.path().map(Path::to_path_buf);
         let request = origin.as_deref().and_then(|path| {
             self.servers
@@ -2621,7 +2671,7 @@ impl IdeShell {
         let offset =
             folding::display_to_source(&buffer.folds, buffer.editor.read(cx).cursor(), false);
         let position = position_at(&buffer.document.text().to_string(), offset);
-        let language = syntax::language(buffer.document.path());
+        let language = buffer.language;
         let buffer_id = buffer.id;
         let request = buffer
             .document
@@ -2674,7 +2724,7 @@ impl IdeShell {
         let buffer = self.buffer();
         let source = buffer.document.text().to_string();
         let offset = folding::display_to_source(&buffer.folds, display_offset, false);
-        let language = syntax::language(buffer.document.path());
+        let language = buffer.language;
         let Some(lookup) = navigation::lookup(language, &source, offset) else {
             return false;
         };
@@ -3938,11 +3988,7 @@ impl IdeShell {
         });
         let divider = || div().w_px().h(px(12.)).flex_shrink_0().bg(theme::border());
         let server = (!self.show_diff)
-            .then(|| {
-                self.servers
-                    .read(cx)
-                    .state(syntax::language(self.document().path()))
-            })
+            .then(|| self.servers.read(cx).state(self.buffer().language))
             .flatten();
         div()
             .h(px(26.))
@@ -4032,6 +4078,13 @@ impl IdeShell {
             })
             .when(!self.show_diff, |bar| {
                 bar.child(divider())
+                    .child(
+                        status_item("quick-language-mode", false)
+                            .child(ide_core::language::get(self.buffer().language).name)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.change_language_mode(&ChangeLanguageMode, window, cx)
+                            })),
+                    )
                     .child(div().flex_shrink_0().px_1p5().child("UTF-8"))
                     .child(
                         div()
@@ -4109,6 +4162,7 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::go_to_line))
+            .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))
             .on_action(cx.listener(Self::stop_command))

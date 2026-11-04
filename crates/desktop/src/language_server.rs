@@ -385,19 +385,7 @@ fn first_location(response: GotoDefinitionResponse) -> Option<(PathBuf, Position
 }
 
 fn language_id(language: &str) -> &'static str {
-    match language {
-        "c" => "c",
-        "c_sharp" => "csharp",
-        "go" => "go",
-        "java" => "java",
-        "javascript" => "javascript",
-        "jsx" => "javascriptreact",
-        "rust" => "rust",
-        "typescript" => "typescript",
-        "tsx" => "typescriptreact",
-        "zig" => "zig",
-        _ => "plaintext",
-    }
+    ide_core::language::get(language).lsp_id
 }
 
 pub fn position_at(text: &str, offset: usize) -> Position {

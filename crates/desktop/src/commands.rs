@@ -58,176 +58,90 @@ actions!(
         DebugRestart,
         GoBack,
         GoForward,
-        GoToLine
+        GoToLine,
+        ChangeLanguageMode
     ]
 );
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[allow(clippy::enum_variant_names)]
-pub enum Command {
-    NewFile,
-    OpenFile,
-    OpenFolder,
-    CloneRepository,
-    SaveFile,
-    SaveFileAs,
-    CloseTab,
-    NextTab,
-    PreviousTab,
-    CloseWindow,
-    OpenSettings,
-    EditSettings,
-    ReloadSettings,
-    ShowFolderPanel,
-    ShowGitPanel,
-    ToggleTerminal,
-    ShowDebugPanel,
-    ToggleVimMode,
-    ToggleFold,
-    Commit,
-    StageAll,
-    Pull,
-    Push,
-    Fetch,
-    TerminalCopy,
-    TerminalPaste,
-    QuickOpen,
-    CommandPalette,
-    SearchProject,
-    FindInFile,
-    RunCommand,
-    StopCommand,
-    StartDebugger,
-    ReloadFile,
-    ShowDiagnostics,
-    GoToDefinition,
-    HoverInfo,
-    CompleteCode,
-    ToggleBreakpoint,
-    DebugContinue,
-    DebugStepOver,
-    DebugStepInto,
-    DebugStepOut,
-    DebugInterrupt,
-    DebugStop,
-    DebugRestart,
-    GoBack,
-    GoForward,
-    GoToLine,
+macro_rules! commands {
+    ($($variant:ident => $action:expr,)*) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(clippy::enum_variant_names)]
+        pub enum Command {
+            $($variant,)*
+        }
+
+        impl Command {
+            pub const ALL: &'static [Self] = &[$(Self::$variant,)*];
+
+            pub(crate) fn action(self) -> Box<dyn Action> {
+                match self {
+                    $(Self::$variant => Box::new($action),)*
+                }
+            }
+        }
+    };
+}
+
+commands! {
+    NewFile => NewFile,
+    OpenFile => OpenFile,
+    OpenFolder => OpenFolder,
+    CloneRepository => CloneRepository,
+    SaveFile => SaveFile,
+    SaveFileAs => SaveFileAs,
+    CloseTab => CloseTab,
+    NextTab => NextTab,
+    PreviousTab => PreviousTab,
+    CloseWindow => CloseWindow,
+    OpenSettings => OpenSettings,
+    EditSettings => EditSettings,
+    ReloadSettings => ReloadSettings,
+    ShowFolderPanel => ShowFolderPanel,
+    ShowGitPanel => ShowGitPanel,
+    ToggleTerminal => ToggleTerminal,
+    ShowDebugPanel => ShowDebugPanel,
+    ToggleVimMode => ToggleVimMode,
+    ToggleFold => ToggleFold,
+    Commit => git_panel::Commit,
+    StageAll => git_panel::StageAll,
+    Pull => git_panel::Pull,
+    Push => git_panel::Push,
+    Fetch => git_panel::Fetch,
+    TerminalCopy => terminal_view::Copy,
+    TerminalPaste => terminal_view::Paste,
+    QuickOpen => QuickOpen,
+    CommandPalette => CommandPalette,
+    SearchProject => SearchProject,
+    FindInFile => FindInFile,
+    RunCommand => RunCommand,
+    StopCommand => StopCommand,
+    StartDebugger => StartDebugger,
+    ReloadFile => ReloadFile,
+    ShowDiagnostics => ShowDiagnostics,
+    GoToDefinition => GoToDefinition,
+    HoverInfo => HoverInfo,
+    CompleteCode => CompleteCode,
+    ToggleBreakpoint => ToggleBreakpoint,
+    DebugContinue => DebugContinue,
+    DebugStepOver => DebugStepOver,
+    DebugStepInto => DebugStepInto,
+    DebugStepOut => DebugStepOut,
+    DebugInterrupt => DebugInterrupt,
+    DebugStop => DebugStop,
+    DebugRestart => DebugRestart,
+    GoBack => GoBack,
+    GoForward => GoForward,
+    GoToLine => GoToLine,
+    ChangeLanguageMode => ChangeLanguageMode,
 }
 
 impl Command {
-    pub const ALL: [Self; 49] = [
-        Self::NewFile,
-        Self::OpenFile,
-        Self::OpenFolder,
-        Self::CloneRepository,
-        Self::SaveFile,
-        Self::SaveFileAs,
-        Self::CloseTab,
-        Self::NextTab,
-        Self::PreviousTab,
-        Self::CloseWindow,
-        Self::OpenSettings,
-        Self::EditSettings,
-        Self::ReloadSettings,
-        Self::ShowFolderPanel,
-        Self::ShowGitPanel,
-        Self::ToggleTerminal,
-        Self::ShowDebugPanel,
-        Self::ToggleVimMode,
-        Self::ToggleFold,
-        Self::Commit,
-        Self::StageAll,
-        Self::Pull,
-        Self::Push,
-        Self::Fetch,
-        Self::TerminalCopy,
-        Self::TerminalPaste,
-        Self::QuickOpen,
-        Self::CommandPalette,
-        Self::SearchProject,
-        Self::FindInFile,
-        Self::RunCommand,
-        Self::StopCommand,
-        Self::StartDebugger,
-        Self::ReloadFile,
-        Self::ShowDiagnostics,
-        Self::GoToDefinition,
-        Self::HoverInfo,
-        Self::CompleteCode,
-        Self::ToggleBreakpoint,
-        Self::DebugContinue,
-        Self::DebugStepOver,
-        Self::DebugStepInto,
-        Self::DebugStepOut,
-        Self::DebugInterrupt,
-        Self::DebugStop,
-        Self::DebugRestart,
-        Self::GoBack,
-        Self::GoForward,
-        Self::GoToLine,
-    ];
-
     pub fn name(self) -> String {
         match serde_json::to_value(self) {
             Ok(serde_json::Value::String(name)) => name,
             _ => format!("{self:?}"),
-        }
-    }
-
-    pub(crate) fn action(self) -> Box<dyn Action> {
-        match self {
-            Self::NewFile => Box::new(NewFile),
-            Self::OpenFile => Box::new(OpenFile),
-            Self::OpenFolder => Box::new(OpenFolder),
-            Self::CloneRepository => Box::new(CloneRepository),
-            Self::SaveFile => Box::new(SaveFile),
-            Self::SaveFileAs => Box::new(SaveFileAs),
-            Self::CloseTab => Box::new(CloseTab),
-            Self::NextTab => Box::new(NextTab),
-            Self::PreviousTab => Box::new(PreviousTab),
-            Self::CloseWindow => Box::new(CloseWindow),
-            Self::OpenSettings => Box::new(OpenSettings),
-            Self::EditSettings => Box::new(EditSettings),
-            Self::ReloadSettings => Box::new(ReloadSettings),
-            Self::ShowFolderPanel => Box::new(ShowFolderPanel),
-            Self::ShowGitPanel => Box::new(ShowGitPanel),
-            Self::ToggleTerminal => Box::new(ToggleTerminal),
-            Self::ShowDebugPanel => Box::new(ShowDebugPanel),
-            Self::ToggleVimMode => Box::new(ToggleVimMode),
-            Self::ToggleFold => Box::new(ToggleFold),
-            Self::Commit => Box::new(git_panel::Commit),
-            Self::StageAll => Box::new(git_panel::StageAll),
-            Self::Pull => Box::new(git_panel::Pull),
-            Self::Push => Box::new(git_panel::Push),
-            Self::Fetch => Box::new(git_panel::Fetch),
-            Self::TerminalCopy => Box::new(terminal_view::Copy),
-            Self::TerminalPaste => Box::new(terminal_view::Paste),
-            Self::QuickOpen => Box::new(QuickOpen),
-            Self::CommandPalette => Box::new(CommandPalette),
-            Self::SearchProject => Box::new(SearchProject),
-            Self::FindInFile => Box::new(FindInFile),
-            Self::RunCommand => Box::new(RunCommand),
-            Self::StopCommand => Box::new(StopCommand),
-            Self::StartDebugger => Box::new(StartDebugger),
-            Self::ReloadFile => Box::new(ReloadFile),
-            Self::ShowDiagnostics => Box::new(ShowDiagnostics),
-            Self::GoToDefinition => Box::new(GoToDefinition),
-            Self::HoverInfo => Box::new(HoverInfo),
-            Self::CompleteCode => Box::new(CompleteCode),
-            Self::ToggleBreakpoint => Box::new(ToggleBreakpoint),
-            Self::DebugContinue => Box::new(DebugContinue),
-            Self::DebugStepOver => Box::new(DebugStepOver),
-            Self::DebugStepInto => Box::new(DebugStepInto),
-            Self::DebugStepOut => Box::new(DebugStepOut),
-            Self::DebugInterrupt => Box::new(DebugInterrupt),
-            Self::DebugStop => Box::new(DebugStop),
-            Self::DebugRestart => Box::new(DebugRestart),
-            Self::GoBack => Box::new(GoBack),
-            Self::GoForward => Box::new(GoForward),
-            Self::GoToLine => Box::new(GoToLine),
         }
     }
 
@@ -292,6 +206,7 @@ impl Command {
             Self::GoBack => &["alt-left"],
             Self::GoForward => &["alt-right"],
             Self::GoToLine => &["secondary-g"],
+            Self::ChangeLanguageMode => &["secondary-k m"],
         };
         let primary = if mac { "cmd" } else { "ctrl" };
         keys.iter()
@@ -344,8 +259,8 @@ pub fn shortcut(action: &dyn Action, cx: &App) -> Option<String> {
 
 pub fn default_keybindings() -> Keybindings {
     Command::ALL
-        .into_iter()
-        .map(|command| (command, command.default_keys().into()))
+        .iter()
+        .map(|&command| (command, command.default_keys().into()))
         .collect()
 }
 
@@ -370,7 +285,7 @@ pub fn rebind(cx: &mut App, keybindings: &Keybindings) -> Vec<String> {
     let keyboard_mapper = cx.keyboard_mapper().clone();
     let mut problems = Vec::new();
     let mut bindings = Vec::new();
-    for command in Command::ALL {
+    for &command in Command::ALL {
         let context = command
             .context()
             .map(|context| Rc::new(KeyBindingContextPredicate::parse(&context).unwrap()));

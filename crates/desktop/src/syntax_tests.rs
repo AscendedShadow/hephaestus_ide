@@ -267,7 +267,8 @@ fn file_extensions_select_their_language() {
     assert_eq!(language(Some(Path::new("view.tsx"))), "tsx");
     assert_eq!(language(Some(Path::new("main.zig"))), "zig");
     assert_eq!(language(Some(Path::new("notes.txt"))), "plain_text");
-    assert_eq!(language(Some(Path::new("Makefile"))), "plain_text");
+    assert_eq!(language(Some(Path::new("Makefile"))), "makefile");
+    assert_eq!(language(Some(Path::new("Cargo.toml"))), "toml");
     assert_eq!(language(None), "plain_text");
 }
 
@@ -371,4 +372,54 @@ fn each_mode_gives_every_kind_of_token_its_own_color(cx: &mut TestAppContext) {
             assert!(colors.insert(theme::hex(theme::text())), "{mode:?}");
         }
     });
+}
+
+#[test]
+fn every_registered_language_has_a_compiling_highlight_query() {
+    let mut highlighted = 0;
+    for language in ide_core::language::all() {
+        let (Some(grammar), Some(query)) = (grammar(language.id), highlights(language.id)) else {
+            assert!(
+                language.support == ide_core::language::Support::Recognized,
+                "{} claims highlighting without a grammar",
+                language.id
+            );
+            continue;
+        };
+        tree_sitter::Query::new(&grammar, &query)
+            .unwrap_or_else(|error| panic!("{}: {error}", language.id));
+        highlighted += 1;
+    }
+    assert!(highlighted >= 20);
+}
+
+#[test]
+fn project_files_are_highlighted() {
+    let toml = byte_tokens("toml", "[package]\nname = \"demo\" # comment\n");
+    assert_eq!(
+        toml[find_word("[package]\nname = \"demo\" # comment\n", "\"demo\"", 0)],
+        Some(String)
+    );
+    let python = "def greet(name):\n    return 'hi'  # done\n";
+    let tokens = byte_tokens("python", python);
+    assert_eq!(tokens[find_word(python, "def", 0)], Some(Keyword));
+    assert_eq!(tokens[find_word(python, "# done", 0)], Some(Comment));
+    let shell = "#!/bin/sh\necho \"hi\" # note\n";
+    assert_eq!(
+        byte_tokens("shell", shell)[find_word(shell, "# note", 0)],
+        Some(Comment)
+    );
+}
+
+#[test]
+fn detection_uses_associations_and_shebangs() {
+    assert_eq!(detect(Some(Path::new("Makefile")), None), "makefile");
+    assert_eq!(
+        detect(Some(Path::new("run")), Some("#!/usr/bin/env bash")),
+        "shell"
+    );
+    assert!(set_associations([("*.inc", "c")]).is_empty());
+    assert_eq!(language(Some(Path::new("lib/defs.inc"))), "c");
+    assert_eq!(set_associations([("*.x", "nope")]).len(), 1);
+    assert_eq!(language(Some(Path::new("lib/defs.inc"))), "plain_text");
 }

@@ -1699,6 +1699,77 @@ impl InputState {
         cx.notify()
     }
 
+    /// The selected byte range (UTF-8 offsets), ordered `start <= end`.
+    pub fn selected_byte_range(&self) -> Range<usize> {
+        self.selected_range.start..self.selected_range.end
+    }
+
+    /// Whether the selection extends backwards (the cursor sits at its start).
+    pub fn is_selection_reversed(&self) -> bool {
+        self.selection_reversed
+    }
+
+    /// Select a byte range (UTF-8 offsets). With `reversed`, the cursor is placed at the
+    /// start of the range.
+    pub fn select_byte_range(
+        &mut self,
+        range: Range<usize>,
+        reversed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let clamp = |offset: usize| {
+            self.text
+                .clip_offset(offset.min(self.text.len()), Bias::Left)
+        };
+        let (start, end) = (clamp(range.start), clamp(range.end));
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        self.selected_range = (start..end).into();
+        self.selection_reversed = reversed && start != end;
+        self.selected_word_range = None;
+        self.update_preferred_column();
+        let cursor = self.cursor();
+        self.focus(window, cx);
+        self.center_on(cursor, cx);
+        cx.notify();
+    }
+
+    /// Replace several byte ranges (UTF-8 offsets of the current text) as a single undo
+    /// step. Ranges must not overlap; they are applied from last to first so earlier
+    /// offsets stay valid. Afterwards `selection` (offsets in the edited text) is selected
+    /// when provided.
+    pub fn apply_edits(
+        &mut self,
+        edits: &[(Range<usize>, String)],
+        selection: Option<(Range<usize>, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut ordered: Vec<_> = edits
+            .iter()
+            .filter(|(range, text)| !(range.is_empty() && text.is_empty()))
+            .collect();
+        ordered.sort_by(|a, b| b.0.start.cmp(&a.0.start).then(b.0.end.cmp(&a.0.end)));
+        let was_disabled = self.disabled;
+        self.disabled = false;
+        self.history.break_group();
+        for (ix, (range, text)) in ordered.into_iter().enumerate() {
+            if ix > 0 {
+                self.history.start_grouping();
+            }
+            let end = range.end.min(self.text.len());
+            let start = range.start.min(end);
+            let range_utf16 = self.range_to_utf16(&(start..end));
+            self.replace_text_in_range_silent(Some(range_utf16), text, window, cx);
+        }
+        self.history.end_grouping();
+        self.history.break_group();
+        self.disabled = was_disabled;
+        if let Some((range, reversed)) = selection {
+            self.select_byte_range(range, reversed, window, cx);
+        }
+    }
+
     /// Unselects the currently selected text.
     pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.cursor();

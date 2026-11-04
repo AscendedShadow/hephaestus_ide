@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -28,6 +28,9 @@ pub struct Settings {
     pub commands: Vec<RunConfig>,
     pub debugger: Option<DebuggerConfig>,
     pub language_servers: Vec<LanguageServer>,
+    /// File associations: glob pattern (matched against the file name, or the
+    /// workspace-relative path when it contains `/`) to language mode id or name.
+    pub file_associations: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -100,7 +103,7 @@ impl LanguageServer {
 pub fn default_language_servers() -> Vec<LanguageServer> {
     vec![
         LanguageServer::new(&["rust"], "rust-analyzer", &[]),
-        LanguageServer::new(&["c"], "clangd", &[]),
+        LanguageServer::new(&["c", "cpp"], "clangd", &[]),
         LanguageServer::new(&["go"], "gopls", &[]),
         LanguageServer::new(&["zig"], "zls", &[]),
         LanguageServer::new(&["java"], "jdtls", &[]),
@@ -122,6 +125,7 @@ impl Settings {
             commands: Vec::new(),
             debugger: None,
             language_servers: default_language_servers(),
+            file_associations: BTreeMap::new(),
         }
     }
 
@@ -166,9 +170,15 @@ impl Settings {
 
     pub fn apply(&self, window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
         cx.set_global(ActiveLanguageServers(self.servers()));
+        let mut problems = crate::syntax::set_associations(
+            self.file_associations
+                .iter()
+                .map(|(pattern, language)| (pattern.as_str(), language.as_str())),
+        );
         theme::set_themes(self.theme.clone());
         theme::set_mode(theme::mode(), window, cx);
-        commands::rebind(cx, &self.keybindings)
+        problems.extend(commands::rebind(cx, &self.keybindings));
+        problems
     }
 }
 
