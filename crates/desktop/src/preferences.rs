@@ -40,6 +40,25 @@ pub enum AutoSaveMode {
     OnFocusChange,
 }
 
+/// Mouse modifier for adding carets (IDE-013).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiCursorModifier {
+    #[default]
+    Alt,
+    /// Cmd on macOS, Ctrl elsewhere.
+    Secondary,
+}
+
+impl MultiCursorModifier {
+    pub fn pressed(self, modifiers: &gpui::Modifiers) -> bool {
+        match self {
+            Self::Alt => modifiers.alt && !modifiers.control && !modifiers.platform,
+            Self::Secondary => modifiers.secondary() && !modifiers.alt,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AutoSave {

@@ -455,7 +455,6 @@ impl IdeShell {
                             .result
                             .failure
                             .clone()
-                            .map(|(path, line, column)| (path, line, column))
                             .or_else(|| location.clone().map(|(path, line)| (path, line, 1)));
                         if let Some((path, line, column)) = target {
                             let hit = SearchMatch {

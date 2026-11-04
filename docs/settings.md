@@ -111,6 +111,33 @@ indentation; trailing-whitespace and final-newline policies run when a file is s
 effective indentation. Whitespace markers are drawn for the first visual row of each
 line when word wrap is on.
 
+## Multiple cursors
+
+```json
+{ "multi_cursor_modifier": "alt" }
+```
+
+`multi_cursor_modifier` (`"alt"` or `"secondary"`, i.e. Cmd on macOS and Ctrl elsewhere)
+plus a click adds a caret, or removes a secondary one; with Shift added, click and drag to
+make a column (rectangular) selection from the primary caret. Commands: Add Cursor
+Above/Below (`secondary-alt-up`/`down`), Select Next Occurrence (`secondary-d`) and
+Select All Occurrences (`secondary-f2`).
+
+- Typing, Backspace/Delete, accepted completions, Tab/Shift-Tab indentation and paste are
+  repeated at every caret and undo as one step. An edit that cannot be repeated (e.g. a
+  format) returns to a single caret.
+- Arrow keys, Home and End move every caret; other navigation, Escape, a plain click,
+  Undo/Redo and folding return to the primary caret. Folds are expanded when cursors
+  are added.
+- Copy and Cut join the selections with newlines. Paste gives each caret one line when
+  the clipboard has exactly one line per caret, otherwise the whole text at each.
+- Columns are visual: tabs expand to the tab width and wide (CJK) characters take two
+  columns. Lines shorter than the left column are skipped by a column selection, and
+  Add Cursor Above/Below clamps to the line end while remembering the column. Both work
+  on logical lines; with word wrap on, secondary carets are drawn on the first visual row.
+- IME composition is shown at the primary caret only and returns to a single caret when
+  it is committed. Vim mode keeps a single caret.
+
 ## Saving
 
 **Save All** (File menu, palette, `Ctrl/Cmd+Alt+S`) saves every modified file-backed

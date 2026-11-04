@@ -6,6 +6,7 @@ pub mod git_ops;
 pub mod glob;
 pub mod language;
 pub mod merge;
+pub mod multicursor;
 pub mod output;
 pub mod problems;
 pub mod project_search;

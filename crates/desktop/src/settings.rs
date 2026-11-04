@@ -47,6 +47,9 @@ pub struct Settings {
     pub default_terminal_profile: Option<String>,
     /// Auto-save policy: `{"mode": "off" | "after_delay" | "on_focus_change", "delay_ms": 1000}`.
     pub auto_save: crate::preferences::AutoSave,
+    /// Mouse modifier that adds or removes a caret on click (`"alt"` or `"secondary"`,
+    /// i.e. Cmd on macOS / Ctrl elsewhere); with Shift it starts a column selection.
+    pub multi_cursor_modifier: crate::preferences::MultiCursorModifier,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -232,6 +235,7 @@ impl Settings {
             file_associations: BTreeMap::new(),
             editor: Default::default(),
             auto_save: Default::default(),
+            multi_cursor_modifier: Default::default(),
             terminal_profiles: Vec::new(),
             default_terminal_profile: None,
             tasks: Vec::new(),

@@ -56,6 +56,7 @@ use crate::{
 
 mod autosave;
 mod completion;
+mod cursors;
 mod debugging;
 mod editor_preferences;
 mod edits;
@@ -366,6 +367,7 @@ pub struct IdeShell {
     problems: problems::ProblemsState,
     git_state: git_features::GitState,
     testing: testing::TestingState,
+    cursors: cursors::CursorState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -445,8 +447,10 @@ impl IdeShell {
             problems: Default::default(),
             git_state: Default::default(),
             testing: Default::default(),
+            cursors: Default::default(),
             _subscriptions: Vec::new(),
         };
+        let shell_cursors_live = shell.cursors_live();
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
         shell._subscriptions = vec![
             search_subscription,
@@ -513,6 +517,20 @@ impl IdeShell {
                 }
                 cx.notify();
             }),
+            {
+                // Runs before key bindings resolve, so bound editing keys are seen too.
+                let shell = cx.entity().downgrade();
+                let live = shell_cursors_live.clone();
+                cx.intercept_keystrokes(move |event, window, cx| {
+                    if live.get()
+                        && let Some(shell) = shell.upgrade()
+                    {
+                        shell.update(cx, |this, cx| {
+                            this.cursors_keystroke(&event.keystroke, window, cx)
+                        });
+                    }
+                })
+            },
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.refresh_git(cx);
@@ -688,6 +706,7 @@ impl IdeShell {
                 if matches!(event, InputEvent::Change)
                     && let Some(ix) = this.buffer_index(id)
                 {
+                    this.cursors_after_change(ix, window, cx);
                     let buffer = &mut this.buffers[ix];
                     let displayed = editor.read(cx).text().to_string();
                     let source = buffer.document.text().to_string();
@@ -2652,6 +2671,7 @@ impl IdeShell {
         if self.blocked() || self.show_diff {
             return;
         }
+        self.clear_secondary_cursors(cx);
         let editor = self.editor().clone();
         let cursor = editor.read(cx).cursor();
         let buffer = &mut self.buffers[self.active];
@@ -2684,6 +2704,9 @@ impl IdeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cursors_mouse_down(event, window, cx) {
+            return;
+        }
         if event.button != MouseButton::Left
             || event.modifiers != Modifiers::shift()
             || self.blocked()
@@ -3857,6 +3880,7 @@ impl IdeShell {
                 .min_h_0()
                 .overflow_hidden()
                 .capture_any_mouse_down(cx.listener(Self::editor_mouse_down))
+                .map(|editor| self.cursor_listeners(editor, cx))
                 .when_some(vim_context, |editor, context| editor.key_context(context))
                 .when(self.snippet_active(), |editor| {
                     editor.key_context(SNIPPET_CONTEXT)
@@ -3881,6 +3905,7 @@ impl IdeShell {
                 .when(self.buffer().preferences.show_whitespace, |editor| {
                     editor.child(self.render_whitespace(cx))
                 })
+                .children(self.render_secondary_cursors(cx))
                 .child(self.render_debug_markers(cx))
                 .child(
                     div()
@@ -4500,6 +4525,10 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::run_all_tests))
             .on_action(cx.listener(Self::rerun_failed_tests))
             .on_action(cx.listener(Self::cancel_tests))
+            .on_action(cx.listener(Self::add_cursor_above))
+            .on_action(cx.listener(Self::add_cursor_below))
+            .on_action(cx.listener(Self::select_next_occurrence))
+            .on_action(cx.listener(Self::select_all_occurrences))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

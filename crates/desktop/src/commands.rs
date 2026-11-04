@@ -131,7 +131,11 @@ actions!(
         RefreshTests,
         RunAllTests,
         RerunFailedTests,
-        CancelTests
+        CancelTests,
+        AddCursorAbove,
+        AddCursorBelow,
+        SelectNextOccurrence,
+        SelectAllOccurrences
     ]
 );
 
@@ -285,6 +289,10 @@ commands! {
     RunAllTests => RunAllTests,
     RerunFailedTests => RerunFailedTests,
     CancelTests => CancelTests,
+    AddCursorAbove => AddCursorAbove,
+    AddCursorBelow => AddCursorBelow,
+    SelectNextOccurrence => SelectNextOccurrence,
+    SelectAllOccurrences => SelectAllOccurrences,
 }
 
 impl Command {
@@ -320,6 +328,10 @@ impl Command {
             Self::PreviousSignature => Some(EDITOR_INPUT.into()),
             Self::NextTabStop => Some(SNIPPET_INPUT.into()),
             Self::PreviousTabStop => Some(SNIPPET_INPUT.into()),
+            Self::AddCursorAbove => Some(EDITOR_INPUT.into()),
+            Self::AddCursorBelow => Some(EDITOR_INPUT.into()),
+            Self::SelectNextOccurrence => Some(EDITOR_INPUT.into()),
+            Self::SelectAllOccurrences => Some(EDITOR_INPUT.into()),
             _ => None,
         }
     }
@@ -407,6 +419,10 @@ impl Command {
             Self::NewTerminal => &["ctrl-shift-`"],
             Self::NextProblem => &["f8"],
             Self::PreviousProblem => &["shift-f8"],
+            Self::AddCursorAbove => &["secondary-alt-up"],
+            Self::AddCursorBelow => &["secondary-alt-down"],
+            Self::SelectNextOccurrence => &["secondary-d"],
+            Self::SelectAllOccurrences => &["secondary-f2"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };

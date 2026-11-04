@@ -285,6 +285,8 @@ pub struct InputState {
     pub(super) selection_reversed: bool,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<Selection>,
+    /// Whether the last text change committed an IME composition.
+    ime_committed: bool,
     pub(super) last_layout: Option<LastLayout>,
     pub(super) last_cursor: Option<usize>,
     /// The input container bounds
@@ -386,6 +388,7 @@ impl InputState {
             selected_word_range: None,
             selection_reversed: false,
             ime_marked_range: None,
+            ime_committed: false,
             input_bounds: Bounds::default(),
             selecting: false,
             disabled: false,
@@ -1724,6 +1727,28 @@ impl InputState {
         Some(Bounds::new(bounds.origin + self.scroll_handle.offset(), bounds.size))
     }
 
+    /// The window position (top-left of the caret) of a byte offset on a visible line,
+    /// after the last layout; `None` when the offset is scrolled out of view.
+    pub fn offset_position_in_window(&self, offset: usize) -> Option<Point<Pixels>> {
+        let layout = self.last_layout.as_ref()?;
+        let bounds = self.last_bounds?;
+        if offset < layout.visible_range_offset.start || offset > layout.visible_range_offset.end {
+            return None;
+        }
+        let (_, _, position) = self.line_and_position_for_offset(offset);
+        position.map(|position| bounds.origin + position)
+    }
+
+    /// Whether an IME composition (marked text) is in progress.
+    pub fn is_composing(&self) -> bool {
+        self.ime_marked_range.is_some()
+    }
+
+    /// Whether the last text change committed an IME composition.
+    pub fn last_change_committed_composition(&self) -> bool {
+        self.ime_committed
+    }
+
     /// Undo the last change group.
     pub fn undo_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.undo(&Undo, window, cx);
@@ -1775,6 +1800,19 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.apply_edits_with(edits, selection, false, window, cx);
+    }
+
+    /// Like [`Self::apply_edits`]; with `join_previous`, the edits become part of the
+    /// previous undo step (e.g. replicating a keystroke at secondary cursors).
+    pub fn apply_edits_with(
+        &mut self,
+        edits: &[(Range<usize>, String)],
+        selection: Option<(Range<usize>, bool)>,
+        join_previous: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Apply from the end of the document backwards; for edits starting at the same
         // offset, later edits go first so same-offset insertions keep their list order.
         let mut ordered: Vec<_> = edits
@@ -1791,9 +1829,11 @@ impl InputState {
         let ordered = ordered.into_iter().map(|(_, edit)| edit);
         let was_disabled = self.disabled;
         self.disabled = false;
-        self.history.break_group();
+        if !join_previous {
+            self.history.break_group();
+        }
         for (ix, (range, text)) in ordered.into_iter().enumerate() {
-            if ix > 0 {
+            if ix > 0 || join_previous {
                 self.history.start_grouping();
             }
             let end = range.end.min(self.text.len());
@@ -1802,7 +1842,9 @@ impl InputState {
             self.replace_text_in_range_silent(Some(range_utf16), text, window, cx);
         }
         self.history.end_grouping();
-        self.history.break_group();
+        if !join_previous {
+            self.history.break_group();
+        }
         self.disabled = was_disabled;
         if let Some((range, reversed)) = selection {
             self.select_byte_range(range, reversed, window, cx);
@@ -2168,7 +2210,7 @@ impl EntityInputHandler for InputState {
             .update_highlighter(&range, &self.text, &new_text, true, cx);
         self.lsp.update(&self.text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
-        self.ime_marked_range.take();
+        self.ime_committed = self.ime_marked_range.take().is_some();
         self.update_preferred_column();
         self.update_search(cx);
         self.mode.update_auto_grow(&self.text_wrapper);
