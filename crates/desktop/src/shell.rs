@@ -67,6 +67,7 @@ mod lsp_features;
 mod outline;
 mod picker;
 mod project_search;
+mod recovery;
 mod settings_commands;
 mod signature_help;
 mod terminals;
@@ -264,6 +265,10 @@ struct Buffer {
     external_change: bool,
     /// The file was deleted on disk while open.
     deleted_on_disk: bool,
+    /// Restored from a recovery snapshot.
+    recovered: bool,
+    /// Tab title for buffers without a file (e.g. recovered copies).
+    title_override: Option<String>,
     _subscription: Subscription,
 }
 
@@ -345,6 +350,7 @@ pub struct IdeShell {
     snippet: Option<completion::SnippetSession>,
     signature: signature_help::SignatureState,
     fs_sync: fs_sync::FsSync,
+    recovery: recovery::RecoveryState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -417,6 +423,7 @@ impl IdeShell {
             snippet: None,
             signature: Default::default(),
             fs_sync: Default::default(),
+            recovery: recovery::RecoveryState::new(Self::recovery_directory(cx)),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
@@ -546,7 +553,7 @@ impl IdeShell {
         {
             self.set_workspace(workspace, cx);
         }
-        for (ix, file) in snapshot.files.into_iter().take(12).enumerate() {
+        for (ix, file) in snapshot.files.into_iter().enumerate() {
             if let Ok(document) = Document::open(&file) {
                 self.open_document(document, window, cx);
                 if let Some((line, column)) = snapshot.cursors.get(ix).copied() {
@@ -565,6 +572,7 @@ impl IdeShell {
             .filter(|path| path.is_file())
             .take(100)
             .collect();
+        self.restore_recovery(window, cx);
     }
 
     fn save_session(&self, cx: &App) {
@@ -669,6 +677,7 @@ impl IdeShell {
                         this.schedule_auto_save(id, cx);
                     }
                     this.track_snippet(ix);
+                    this.schedule_recovery_snapshot(cx);
                     if ix == this.active {
                         this.schedule_outline_refresh(window, cx);
                         this.signature_help_after_edit(ix, window, cx);
@@ -687,6 +696,8 @@ impl IdeShell {
             folds: Vec::new(),
             external_change: false,
             deleted_on_disk: false,
+            recovered: false,
+            title_override: None,
             _subscription: subscription,
         }
     }
@@ -1223,6 +1234,7 @@ impl IdeShell {
             self.servers.update(cx, |servers, _| servers.close(&path));
         }
         self.buffers.remove(ix);
+        self.write_recovery_snapshots(cx);
         if self.buffers.is_empty() {
             let buffer = self.new_buffer(Document::default(), window, cx);
             self.buffers.push(buffer);
@@ -1305,6 +1317,7 @@ impl IdeShell {
             false
         } else {
             self.save_session(cx);
+            self.clear_recovery();
             true
         }
     }
@@ -1344,6 +1357,7 @@ impl IdeShell {
             PendingAction::LeaveDiff => self.leave_diff(window, cx),
             PendingAction::CloseWindow => {
                 self.save_session(cx);
+                self.clear_recovery();
                 window.remove_window();
             }
         }
@@ -1602,6 +1616,7 @@ impl IdeShell {
                             }
                         }
                         this.refresh_parent(saved_path.as_deref(), cx);
+                        this.write_recovery_snapshots(cx);
                         this.refresh_git(cx);
                         if saved_path
                             .as_deref()
@@ -1703,6 +1718,7 @@ impl IdeShell {
                 }
                 if saved > 0 {
                     this.refresh_git(cx);
+                    this.write_recovery_snapshots(cx);
                 }
                 let settings_status = settings_saved.then(|| this.apply_settings(window, cx));
                 match failures.first() {
@@ -3427,6 +3443,18 @@ impl IdeShell {
     }
 
     fn tab_title(&self, buffer: &Buffer) -> String {
+        if let Some(title) = &buffer.title_override {
+            return title.clone();
+        }
+        let title = self.plain_tab_title(buffer);
+        if buffer.recovered && buffer.dirty {
+            format!("{title} (recovered)")
+        } else {
+            title
+        }
+    }
+
+    fn plain_tab_title(&self, buffer: &Buffer) -> String {
         let name = buffer.document.name();
         let shared = self
             .buffers

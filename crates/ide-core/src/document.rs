@@ -94,7 +94,7 @@ impl Encoding {
                 if bytes.len() % 2 != 0 {
                     return Err(invalid());
                 }
-                let units = bytes.chunks_exact(2).map(|pair| {
+                let units = bytes.as_chunks::<2>().0.iter().map(|pair| {
                     if swap {
                         u16::from_be_bytes([pair[0], pair[1]])
                     } else {
@@ -262,6 +262,16 @@ impl Document {
         self.text != self.saved_text
             || self.encoding != self.saved_encoding
             || self.line_ending != self.saved_line_ending
+    }
+
+    /// Hash of the file content last read or written (for recovery conflict checks).
+    pub fn disk_hash(&self) -> Option<u64> {
+        self.disk_hash
+    }
+
+    /// Hash of the file's current content on disk.
+    pub fn current_disk_hash(path: &Path) -> Option<u64> {
+        fs::read(path).ok().map(|bytes| hash_bytes(&bytes))
     }
 
     pub fn encoding(&self) -> Encoding {

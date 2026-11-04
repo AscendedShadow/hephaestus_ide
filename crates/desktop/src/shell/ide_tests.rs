@@ -771,3 +771,91 @@ fn encodings_and_line_endings_convert_explicitly(cx: &mut TestAppContext) {
     });
     assert_eq!(std::fs::read(root.join("latin.txt")).unwrap(), expected);
 }
+
+#[gpui::test]
+fn unsaved_buffers_are_recovered_after_a_crash(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let store = root.join("recovery-store");
+    write(&root.join("a.rs"), "fn a() {}\n");
+    write(&root.join("b.rs"), "fn b() {}\n");
+    let (first, cx1) = setup(cx);
+    first.update(cx1, |shell, _| {
+        shell.recovery = recovery::RecoveryState::new(Some(store.clone()))
+    });
+    open_file(&first, &root.join("a.rs"), cx1);
+    set_cursor(&first, 0, 3, cx1);
+    cx1.simulate_input("new_");
+    open_file(&first, &root.join("b.rs"), cx1);
+    cx1.simulate_input("// mine\n");
+    cx1.dispatch_action(NewFile);
+    cx1.simulate_input("scratch 😀");
+    first.update(cx1, |shell, cx| shell.write_recovery_snapshots(cx));
+    cx1.run_until_parked();
+    assert_eq!(ide_core::recovery::load(&store).0.len(), 3);
+    // The process "crashes" here; meanwhile b.rs changes on disk.
+    std::fs::write(root.join("b.rs"), "fn b() { changed }\n").unwrap();
+
+    let (second, cx2) = setup(&mut cx1.cx);
+    second.update_in(cx2, |shell, window, cx| {
+        shell.recovery = recovery::RecoveryState::new(Some(store.clone()));
+        shell.restore_recovery(window, cx);
+    });
+    cx2.run_until_parked();
+    let tabs: Vec<(String, String, bool)> = cx2.read(|cx| {
+        let shell = second.read(cx);
+        shell
+            .buffers
+            .iter()
+            .map(|buffer| {
+                (
+                    shell.tab_title(buffer),
+                    buffer.document.text().to_string(),
+                    buffer.dirty,
+                )
+            })
+            .collect()
+    });
+    assert!(
+        tabs.contains(&("a.rs (recovered)".into(), "fn new_a() {}\n".into(), true)),
+        "{tabs:?}"
+    );
+    assert!(
+        tabs.contains(&("b.rs".into(), "fn b() { changed }\n".into(), false)),
+        "{tabs:?}"
+    );
+    assert!(
+        tabs.contains(&(
+            "b.rs (recovered)".into(),
+            "// mine\nfn b() {}\n".into(),
+            true
+        )),
+        "{tabs:?}"
+    );
+    assert!(
+        tabs.contains(&("Untitled (recovered)".into(), "scratch 😀".into(), true)),
+        "{tabs:?}"
+    );
+    cx2.read(|cx| {
+        let status = &second.read(cx).status;
+        assert!(
+            status.contains("Recovered 3") && status.contains("b.rs changed on disk"),
+            "{status}"
+        );
+    });
+
+    // Saving clears that buffer's snapshot.
+    second.update_in(cx2, |shell, window, cx| {
+        let ix = shell.buffer_for_path(&root.join("a.rs")).unwrap();
+        shell.activate(ix, window, cx);
+    });
+    cx2.simulate_keystrokes(&primary("s"));
+    cx2.run_until_parked();
+    let remaining = ide_core::recovery::load(&store).0;
+    assert_eq!(remaining.len(), 2, "{remaining:?}");
+    assert!(
+        remaining
+            .iter()
+            .all(|entry| entry.path.as_deref() != Some(root.join("a.rs").as_path()))
+    );
+}

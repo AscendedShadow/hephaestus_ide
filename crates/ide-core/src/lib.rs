@@ -7,6 +7,7 @@ pub mod language;
 pub mod merge;
 pub mod output;
 pub mod project_search;
+pub mod recovery;
 pub mod search;
 pub mod snippet;
 pub mod text_edit;
