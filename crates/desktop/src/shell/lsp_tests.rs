@@ -597,11 +597,9 @@ fn completion_applies_exact_edits_snippets_and_auto_imports_as_one_step(cx: &mut
     // Literal dollar text stays literal when the item is not a snippet.
     set_cursor(&shell, 2, 4, cx);
     accept(item(json!({"label": "$money", "insertText": "$money"})), cx);
-    assert!(
-        text(&shell, cx).contains("    $moneyv.push(item);"),
-        "{}",
-        text(&shell, cx)
-    );
+    wait_until(cx, |cx| {
+        text(&shell, cx).contains("    $moneyv.push(item);")
+    });
 
     // Insert/replace edits extend over characters typed since the request.
     set_cursor(&shell, 2, 4, cx);
@@ -612,11 +610,7 @@ fn completion_applies_exact_edits_snippets_and_auto_imports_as_one_step(cx: &mut
             "insert": range(2, 4, 10), "replace": range(2, 4, 10), "newText": "cash"}})),
         cx,
     );
-    assert!(
-        text(&shell, cx).contains("    cashv.push(item);"),
-        "{}",
-        text(&shell, cx)
-    );
+    wait_until(cx, |cx| text(&shell, cx).contains("    cashv.push(item);"));
 }
 
 #[gpui::test]
