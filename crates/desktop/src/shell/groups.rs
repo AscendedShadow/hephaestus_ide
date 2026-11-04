@@ -144,29 +144,57 @@ impl IdeShell {
         let Some(ix) = self.buffer_index(id) else {
             return;
         };
-        let displayed = editor.read(cx).text().to_string();
         {
             // Echo of an edit mirrored from another view: nothing new.
             let buffer = &self.buffers[ix];
-            if buffer.views.len() > 1
-                && buffer.editor != *editor
-                && displayed
-                    == folding::projected(&buffer.document.text().to_string(), &buffer.folds)
-            {
-                return;
+            if buffer.views.len() > 1 && buffer.editor != *editor {
+                let displayed = editor.read(cx).text();
+                let echo = if buffer.folds.is_empty() {
+                    displayed == buffer.document.text()
+                } else {
+                    *displayed
+                        == folding::projected(&buffer.document.text().to_string(), &buffer.folds)
+                };
+                if echo {
+                    return;
+                }
             }
         }
         if self.buffers[ix].editor == *editor {
             self.cursors_after_change(ix, window, cx);
         }
+        // Ropes clone in O(1) (shared); the common unfolded case never copies the text.
+        let displayed = editor.read(cx).text().clone();
         let buffer = &mut self.buffers[ix];
-        let displayed = editor.read(cx).text().to_string();
-        let source = buffer.document.text().to_string();
-        if let Some(text) = folding::apply_edit(&source, &mut buffer.folds, &displayed) {
-            buffer.document.set_text(text.into());
-            self.shift_breakpoints_for_edit(ix, &source, cx);
+        let old = buffer.document.text().clone();
+        let fast = if buffer.folds.is_empty() {
+            folding::apply_unfolded_edit(&old, &displayed)
+        } else {
+            Some(None)
+        };
+        let changed = match fast {
+            None => false,
+            Some(Some(text)) => {
+                buffer.document.set_text(text);
+                true
+            }
+            Some(None) => {
+                let source = old.to_string();
+                match folding::apply_edit(&source, &mut buffer.folds, &displayed.to_string()) {
+                    Some(text) => {
+                        buffer.document.set_text(text.into());
+                        true
+                    }
+                    None => false,
+                }
+            }
+        };
+        if changed {
+            self.shift_breakpoints_for_edit(ix, &old, cx);
         }
-        self.mirror_to_other_views(ix, editor, &displayed, window, cx);
+        if self.buffers[ix].views.len() > 1 {
+            self.mirror_to_other_views(ix, editor, &displayed.to_string(), window, cx);
+        }
         let buffer = &mut self.buffers[ix];
         buffer.dirty = buffer.document.is_dirty();
         self.sync_lsp_buffer(ix, cx);

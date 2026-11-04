@@ -4,6 +4,7 @@ use gpui::{AppContext as _, TestAppContext};
 
 use super::*;
 use crate::settings;
+use gpui_component::Rope;
 
 const SOURCE: &str = r#"/// Adds one to `value`.
 ///
@@ -117,16 +118,31 @@ fn servers_start_only_for_configured_languages_inside_a_project(cx: &mut TestApp
             Some((configs[0].program.clone(), State::Starting))
         );
 
-        servers.sync(&root.join("main.rs"), "rust", "fn main() {}", cx);
+        servers.sync(
+            &root.join("main.rs"),
+            "rust",
+            &Rope::from("fn main() {}"),
+            cx,
+        );
         assert!(servers.documents.is_empty(), "no project root yet");
 
         servers.set_root(Some(root.clone()), cx);
-        servers.sync(&root.join("main.rs"), "rust", "fn main() {}", cx);
+        servers.sync(
+            &root.join("main.rs"),
+            "rust",
+            &Rope::from("fn main() {}"),
+            cx,
+        );
         assert!(servers.documents.is_empty(), "the program cannot be run");
         assert!(servers.hover(&root, "rust", Position::new(0, 0)).is_none());
         assert!(matches!(servers.state("rust"), Some((_, State::Failed(_)))));
 
-        servers.sync(&root.join("main.rs"), "rust", "fn main() {}", cx);
+        servers.sync(
+            &root.join("main.rs"),
+            "rust",
+            &Rope::from("fn main() {}"),
+            cx,
+        );
         assert_eq!(servers.failures.len(), 1, "a failed program is not retried");
         servers.stop(cx);
         assert!(servers.failures.is_empty(), "restarting clears failures");

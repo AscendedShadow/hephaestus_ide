@@ -93,8 +93,9 @@ impl IdeShell {
             return;
         };
         let (selection, _) = self.source_selection(ix, cx);
-        let text = buffer.document.text().to_string();
-        let Some(character) = text[..selection.end.min(text.len())].chars().next_back() else {
+        let text = buffer.document.text();
+        // Only the character before the caret matters; read it from the rope.
+        let Some(character) = text.chars_at(selection.end.min(text.len())).prev() else {
             return;
         };
         let character = character.to_string();

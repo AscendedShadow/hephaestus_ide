@@ -352,6 +352,7 @@ impl IdeShell {
                 *path = new;
             }
         }
+        self.bump_search_paths();
         for location in &mut self.locations {
             if let Some(new) = moved(&location.path) {
                 location.path = new;

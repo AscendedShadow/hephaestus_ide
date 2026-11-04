@@ -179,22 +179,17 @@ impl Workspace {
     /// `path` for display: relative to its root, prefixed with the root's label when the
     /// workspace has several roots.
     pub fn qualified(&self, path: &Path) -> String {
-        let Some(root) = self.root_of(path) else {
-            return path.display().to_string();
-        };
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        if self.roots.len() > 1 {
-            if relative.is_empty() {
-                self.label(root)
-            } else {
-                format!("{}/{}", self.label(root), relative)
-            }
-        } else {
-            relative
+        self.qualifier().qualify(path)
+    }
+
+    /// Precomputed root labels for qualifying many paths (e.g. Quick Open).
+    pub fn qualifier(&self) -> Qualifier {
+        Qualifier {
+            roots: self
+                .roots
+                .iter()
+                .map(|root| (root.path.clone(), self.label(&root.path)))
+                .collect(),
         }
     }
 
@@ -410,6 +405,34 @@ impl Workspace {
         let roots = self.root_paths();
         self.listings
             .retain(|path, _| roots.contains(path) || path.is_dir());
+    }
+}
+
+/// Qualifies paths like [`Workspace::qualified`] with the root labels computed once.
+pub struct Qualifier {
+    roots: Vec<(PathBuf, String)>,
+}
+
+impl Qualifier {
+    pub fn qualify(&self, path: &Path) -> String {
+        let Some((root, label)) = self
+            .roots
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+        else {
+            return path.display().to_string();
+        };
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        match (self.roots.len() > 1, relative.is_empty()) {
+            (false, _) => relative,
+            (true, true) => label.clone(),
+            (true, false) => format!("{label}/{relative}"),
+        }
     }
 }
 

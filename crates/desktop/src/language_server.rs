@@ -65,6 +65,8 @@ struct Document {
     server: String,
     language: &'static str,
     version: i32,
+    /// The text last sent to the server (ropes share storage, so this is cheap).
+    text: Rope,
 }
 
 #[derive(Default)]
@@ -295,7 +297,7 @@ impl Servers {
         &mut self,
         path: &Path,
         language: &'static str,
-        text: &str,
+        text: &Rope,
         cx: &mut Context<Self>,
     ) {
         let Some(name) = self.start(language, cx) else {
@@ -307,6 +309,14 @@ impl Servers {
         let Some(uri) = lsp::path_to_uri(path) else {
             return;
         };
+        // Re-syncing unchanged text (e.g. switching tabs) sends nothing.
+        if self
+            .documents
+            .get(path)
+            .is_some_and(|document| document.text == *text)
+        {
+            return;
+        }
         let opened = self.documents.contains_key(path);
         let document = self
             .documents
@@ -315,8 +325,10 @@ impl Servers {
                 server: name,
                 language,
                 version: 0,
+                text: Rope::new(),
             });
         document.version += 1;
+        document.text = text.clone();
         let version = document.version;
         let Some(client) = self.client(language) else {
             return;

@@ -76,8 +76,15 @@ pub fn files(root: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 pub fn rank(path: &Path, query: &str) -> Option<usize> {
-    let text = path.to_string_lossy().to_lowercase();
-    let query = query.to_lowercase();
+    rank_lowercase(
+        &path.to_string_lossy().to_lowercase(),
+        &query.to_lowercase(),
+    )
+}
+
+/// [`rank`] for text and query that are already lowercase (lets callers lowercase the
+/// query once when ranking many candidates).
+pub fn rank_lowercase(text: &str, query: &str) -> Option<usize> {
     if query.is_empty() {
         return Some(0);
     }
@@ -91,7 +98,7 @@ pub fn rank(path: &Path, query: &str) -> Option<usize> {
     if text
         .rsplit(['/', '\\'])
         .next()
-        .is_some_and(|name| name.contains(&query))
+        .is_some_and(|name| name.contains(query))
     {
         score = score.saturating_sub(5);
     }

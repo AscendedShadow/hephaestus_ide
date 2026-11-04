@@ -5,7 +5,7 @@
 //! row of each line is marked (documented limitation).
 
 use gpui::{App, Bounds, ContentMask, Font, Hsla, Pixels, TextRun, Window, point};
-use gpui_component::input::TextGeometry;
+use gpui_component::{Rope, RopeExt as _, input::TextGeometry};
 
 use crate::theme;
 
@@ -21,8 +21,9 @@ pub fn markers(line: &str) -> Vec<(usize, char)> {
         .collect()
 }
 
+/// Paint markers for the visible rows of `text` (only those lines are read).
 pub fn paint(
-    text: &str,
+    text: &Rope,
     geometry: TextGeometry,
     bounds: Bounds<Pixels>,
     font: Font,
@@ -52,8 +53,9 @@ pub fn paint(
         bounds.bottom_right(),
     );
     window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
-        let visible = last.saturating_sub(first) + 1;
-        for (row, line) in text.split('\n').enumerate().skip(first).take(visible) {
+        for row in first..=last.min(text.lines_len().saturating_sub(1)) {
+            let line = text.slice_line(row).to_string();
+            let line = line.as_str();
             let found = markers(line);
             if found.is_empty() {
                 continue;

@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     fs,
     ops::Range,
@@ -256,6 +256,13 @@ fn tab_close_button(id: impl Into<ElementId>, hidden: bool) -> Stateful<Div> {
 
 type BufferId = u64;
 
+/// Quick Open memo key: query, `search_paths` generation, most recent file.
+type RankedPathsKey = (String, u64, Option<PathBuf>);
+/// Brace-pair memo key: editor entity and its text revision.
+type BracePairsKey = (gpui::EntityId, usize);
+/// `{`/`}` byte offsets of an editor's text (see `folding::brace_pairs`).
+type BracePairs = Rc<Vec<(usize, usize)>>;
+
 /// Marks a picked file that is a workspace definition (handled after the picker).
 const OPEN_WORKSPACE_MARKER: &str = "\u{0}open-workspace:";
 
@@ -377,6 +384,11 @@ pub struct IdeShell {
     cursors: cursors::CursorState,
     groups: groups::Groups,
     roots: roots::RootsState,
+    /// Bumped whenever `search_paths` changes (invalidates `ranked_paths_cache`).
+    search_paths_generation: Cell<u64>,
+    ranked_paths_cache: RefCell<Option<(RankedPathsKey, Vec<PathBuf>)>>,
+    /// Brace pairs of an editor at a text revision (for the brace guide).
+    brace_pairs_cache: RefCell<Option<(BracePairsKey, BracePairs)>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -459,6 +471,9 @@ impl IdeShell {
             cursors: Default::default(),
             groups: Default::default(),
             roots: Default::default(),
+            brace_pairs_cache: RefCell::new(None),
+            search_paths_generation: Cell::new(0),
+            ranked_paths_cache: RefCell::new(None),
             _subscriptions: Vec::new(),
         };
         let shell_cursors_live = shell.cursors_live();
@@ -800,7 +815,7 @@ impl IdeShell {
         let Some(path) = buffer.document.path().map(Path::to_path_buf) else {
             return;
         };
-        let text = buffer.document.text().to_string();
+        let text = buffer.document.text().clone();
         self.servers
             .update(cx, |servers, cx| servers.sync(&path, language, &text, cx));
     }
@@ -1999,6 +2014,7 @@ impl IdeShell {
 
     fn index_workspace(&mut self, cx: &mut Context<Self>) {
         self.search_paths.clear();
+        self.bump_search_paths();
         self.invalidate_search_files();
         let roots: Vec<PathBuf> = self
             .workspace
@@ -2028,7 +2044,10 @@ impl IdeShell {
             let _ = this.update(cx, |this, cx| {
                 if this.workspace.root_paths() == all {
                     match paths {
-                        Ok(paths) => this.search_paths = paths,
+                        Ok(paths) => {
+                            this.search_paths = paths;
+                            this.bump_search_paths();
+                        }
                         Err(error) => this.status = format!("Could not index files: {error}"),
                     }
                     cx.notify();
@@ -2208,37 +2227,58 @@ impl IdeShell {
         cx.notify();
     }
 
+    /// Quick Open candidates for `query`, best first (at most 30). Memoized per query,
+    /// since render and key handling ask for the same list repeatedly.
     fn ranked_paths(&self, query: &str) -> Vec<PathBuf> {
-        let mut files: Vec<_> = self
+        let key = (
+            query.to_string(),
+            self.search_paths_generation.get(),
+            self.recent_paths.first().cloned(),
+        );
+        if let Some((cached, paths)) = &*self.ranked_paths_cache.borrow()
+            && *cached == key
+        {
+            return paths.clone();
+        }
+        let paths = self.rank_paths(query);
+        *self.ranked_paths_cache.borrow_mut() = Some((key, paths.clone()));
+        paths
+    }
+
+    fn rank_paths(&self, query: &str) -> Vec<PathBuf> {
+        const LIMIT: usize = 30;
+        let query = query.to_lowercase();
+        let qualifier = self.workspace.qualifier();
+        let recent: HashMap<&Path, usize> = self
+            .recent_paths
+            .iter()
+            .enumerate()
+            .map(|(ix, path)| (path.as_path(), ix))
+            .collect();
+        let mut files: Vec<(usize, usize, &PathBuf)> = self
             .search_paths
             .iter()
             .filter_map(|path| {
-                search::rank(Path::new(&self.workspace.qualified(path)), query).map(|score| {
-                    (
-                        score,
-                        self.recent_paths
-                            .iter()
-                            .position(|recent| recent == path)
-                            .unwrap_or(usize::MAX),
-                        path.clone(),
-                    )
+                let name = qualifier.qualify(path).to_lowercase();
+                search::rank_lowercase(&name, &query).map(|score| {
+                    let recency = recent.get(path.as_path()).copied().unwrap_or(usize::MAX);
+                    (score, recency, path)
                 })
             })
             .collect();
-        files.sort_by(|a, b| {
-            if query.is_empty() {
-                a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2))
-            } else {
-                a.0.cmp(&b.0)
-                    .then_with(|| a.1.cmp(&b.1))
-                    .then_with(|| a.2.cmp(&b.2))
-            }
-        });
-        files
-            .into_iter()
-            .take(30)
-            .map(|(_, _, path)| path)
-            .collect()
+        // Only the best LIMIT entries are shown: select them, then sort just those.
+        if files.len() > LIMIT {
+            files.select_nth_unstable(LIMIT);
+            files.truncate(LIMIT);
+        }
+        files.sort();
+        files.into_iter().map(|(_, _, path)| path.clone()).collect()
+    }
+
+    /// Note that `search_paths` changed.
+    fn bump_search_paths(&self) {
+        self.search_paths_generation
+            .set(self.search_paths_generation.get() + 1);
     }
 
     fn ranked_commands(&self, query: &str) -> Vec<Command> {
@@ -3737,7 +3777,21 @@ impl IdeShell {
     fn render_brace_guide(&self, cx: &App) -> impl IntoElement {
         let editor = self.editor().clone();
         let state = editor.read(cx);
-        let guide = BraceGuide::find(&state.text().to_string(), state.cursor());
+        // Brace pairs need a full scan; cache them per editor text revision so cursor
+        // moves and redraws reuse them.
+        let key = (editor.entity_id(), state.text_revision());
+        let pairs = {
+            let mut cache = self.brace_pairs_cache.borrow_mut();
+            match &*cache {
+                Some((cached, pairs)) if *cached == key => pairs.clone(),
+                _ => {
+                    let pairs = Rc::new(folding::brace_pairs(&state.text().to_string()));
+                    *cache = Some((key, pairs.clone()));
+                    pairs
+                }
+            }
+        };
+        let guide = BraceGuide::locate(state.text(), &pairs, state.cursor());
         let text_size = self.editor_text_size();
         canvas(
             |_, _, _| {},
@@ -3755,9 +3809,8 @@ impl IdeShell {
         .size_full()
     }
 
-    fn render_whitespace(&self, cx: &App) -> impl IntoElement {
+    fn render_whitespace(&self) -> impl IntoElement {
         let editor = self.editor().clone();
-        let text = editor.read(cx).text().to_string();
         let font = gpui::Font {
             fallbacks: theme::monospace_font().fallbacks,
             ..gpui::font(self.editor_font_family())
@@ -3766,7 +3819,10 @@ impl IdeShell {
         canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
-                if let Some(geometry) = editor.read(cx).text_geometry() {
+                let state = editor.read(cx);
+                // Cloning a rope is cheap (shared); only visible lines are read.
+                let text = state.text().clone();
+                if let Some(geometry) = state.text_geometry() {
                     crate::whitespace::paint(
                         &text,
                         geometry,
@@ -3948,7 +4004,7 @@ impl IdeShell {
                 .children(self.render_signature_help(cx))
                 .child(self.render_brace_guide(cx))
                 .when(self.buffer().preferences.show_whitespace, |editor| {
-                    editor.child(self.render_whitespace(cx))
+                    editor.child(self.render_whitespace())
                 })
                 .children(self.render_secondary_cursors(cx))
                 .child(self.render_debug_markers(cx))

@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use gpui_component::Rope;
+
 pub const PLACEHOLDER: &str = "...";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +78,41 @@ pub fn unfold_range(source: &str, folds: &mut Vec<Fold>, range: Range<usize>) ->
         cursor: source_to_display(folds, range.start),
         folded: false,
     })
+}
+
+/// The changed span between two ropes, as (range in `old`, range in `new`) byte
+/// ranges, found by comparing from both ends without copying either text.
+pub fn rope_difference(old: &Rope, new: &Rope) -> (Range<usize>, Range<usize>) {
+    let prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let longest_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old
+        .bytes_at(old.len())
+        .reversed()
+        .zip(new.bytes_at(new.len()).reversed())
+        .take(longest_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    (prefix..old.len() - suffix, prefix..new.len() - suffix)
+}
+
+/// Bring the source in line with an edit shown in the editor when nothing is folded:
+/// the editor text *is* the new source, so the rope is shared instead of copied.
+/// Returns `None` when the text is unchanged, and `Some(None)` when the edit needs the
+/// general path ([`apply_edit`]) because it may (re)insert a fold placeholder.
+pub fn apply_unfolded_edit(source: &Rope, displayed: &Rope) -> Option<Option<Rope>> {
+    let (_, inserted) = rope_difference(source, displayed);
+    if inserted.is_empty() && source.len() == displayed.len() {
+        return None;
+    }
+    let touches_placeholder = displayed
+        .bytes_at(inserted.start)
+        .take(inserted.len())
+        .any(|byte| byte == b'.');
+    Some((!touches_placeholder).then(|| displayed.clone()))
 }
 
 pub fn apply_edit(source: &str, folds: &mut Vec<Fold>, displayed: &str) -> Option<String> {
@@ -242,9 +279,16 @@ fn common_suffix(a: &str, b: &str) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 pub fn active_pair(source: &str, cursor: usize) -> Option<(usize, usize)> {
-    brace_pairs(source)
-        .into_iter()
+    innermost_pair(&brace_pairs(source), cursor)
+}
+
+/// The innermost of `pairs` around (or touching) `cursor`.
+pub fn innermost_pair(pairs: &[(usize, usize)], cursor: usize) -> Option<(usize, usize)> {
+    pairs
+        .iter()
+        .copied()
         .filter(|&(open, close)| open <= cursor && cursor <= close + 1)
         .min_by_key(|&(open, close)| close - open)
 }
@@ -256,7 +300,8 @@ fn foldable_ranges(source: &str) -> impl Iterator<Item = Range<usize>> + '_ {
         .filter(|range| source[range.clone()].contains('\n'))
 }
 
-fn brace_pairs(source: &str) -> Vec<(usize, usize)> {
+/// Matching `{`/`}` byte offsets, skipping strings, character literals and comments.
+pub fn brace_pairs(source: &str) -> Vec<(usize, usize)> {
     #[derive(Clone, Copy)]
     enum State {
         Code,
@@ -287,10 +332,14 @@ fn brace_pairs(source: &str) -> Vec<(usize, usize)> {
                         escaped: false,
                     }
                 }
+                // A quote starts a character literal only when it closes on the same
+                // line (lifetimes like `'a` do not). Look no further than the line end,
+                // so files with many lifetimes stay linear.
                 b'\''
-                    if source[ix + 1..].find('\'').is_some_and(|distance| {
-                        !source[ix + 1..ix + 1 + distance].contains('\n')
-                    }) =>
+                    if bytes[ix + 1..]
+                        .iter()
+                        .position(|byte| *byte == b'\'' || *byte == b'\n')
+                        .is_some_and(|distance| bytes[ix + 1 + distance] == b'\'') =>
                 {
                     state = State::String {
                         quote: b'\'',
@@ -526,6 +575,19 @@ mod tests {
     }
 
     #[test]
+    fn lifetimes_are_not_character_literals() {
+        let source = "fn f<'a>(x: &'a str) -> &'a str {\n    let c = '}';\n    x\n}\n";
+        assert_eq!(
+            brace_pairs(source),
+            [(source.find('{').unwrap(), source.rfind('}').unwrap())]
+        );
+        // Many unmatched quotes stay fast (each looks only to its line end).
+        let long = "x: &'a T,\n".repeat(20_000);
+        let source = format!("{{\n{long}}}");
+        assert_eq!(brace_pairs(&source).len(), 1);
+    }
+
+    #[test]
     fn active_pair_ignores_braces_in_strings_and_comments() {
         let source = "fn f() {\n  let text = \"{\"; // }\n  work();\n}";
         let cursor = source.find("work").unwrap();
@@ -534,5 +596,19 @@ mod tests {
             pair_text(source, source.find("\"{").unwrap() + 1),
             Some(&source[7..])
         );
+    }
+
+    #[test]
+    fn rope_difference_finds_the_changed_span() {
+        let old = Rope::from("let a = 1;\nlet b = 2;\n");
+        let new = Rope::from("let a = 1;\nlet bee = 2;\n");
+        assert_eq!(rope_difference(&old, &new), (16..16, 16..18));
+        assert_eq!(rope_difference(&old, &old), (22..22, 22..22));
+        let shorter = Rope::from("aa");
+        assert_eq!(rope_difference(&Rope::from("aaa"), &shorter), (2..3, 2..2));
+        assert_eq!(apply_unfolded_edit(&old, &old), None);
+        assert_eq!(apply_unfolded_edit(&old, &new), Some(Some(new.clone())));
+        let dotted = Rope::from("let a = 1;\nlet b...= 2;\n");
+        assert_eq!(apply_unfolded_edit(&old, &dotted), Some(None));
     }
 }

@@ -4,7 +4,7 @@ use gpui::{
     BorderStyle, Bounds, ContentMask, Hsla, PathBuilder, Pixels, TextRun, Window, point, px, quad,
     size,
 };
-use gpui_component::input::TextGeometry;
+use gpui_component::{Rope, RopeExt as _, input::TextGeometry};
 
 use crate::{folding, theme};
 
@@ -26,12 +26,12 @@ struct Brace {
 }
 
 impl Brace {
-    fn at(text: &str, offset: usize) -> Self {
-        let before = &text[..offset];
-        let line_start = before.rfind('\n').map_or(0, |ix| ix + 1);
+    fn at(text: &Rope, offset: usize) -> Self {
+        let line = text.offset_to_point(offset).row;
+        let line_start = text.line_start_offset(line);
         Self {
-            line: before.bytes().filter(|byte| *byte == b'\n').count(),
-            prefix: before[line_start..].to_string(),
+            line,
+            prefix: text.slice(line_start..offset).to_string(),
         }
     }
 
@@ -42,8 +42,15 @@ impl Brace {
 }
 
 impl BraceGuide {
+    #[cfg(test)]
     pub fn find(text: &str, cursor: usize) -> Option<Self> {
-        let (open, close) = folding::active_pair(text, cursor)?;
+        Self::locate(&Rope::from(text), &folding::brace_pairs(text), cursor)
+    }
+
+    /// The guide for the innermost of `pairs` (see `folding::brace_pairs`) around
+    /// `cursor`; only the two brace lines are read from `text`.
+    pub fn locate(text: &Rope, pairs: &[(usize, usize)], cursor: usize) -> Option<Self> {
+        let (open, close) = folding::innermost_pair(pairs, cursor)?;
         let open = Brace::at(text, open);
         let close = Brace::at(text, close);
         let indent = [open.indent(), close.indent()]

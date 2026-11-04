@@ -3,6 +3,8 @@
 
 use std::process::Command as Process;
 
+use gpui_component::Rope;
+
 use crate::{
     debugger::{self, BreakpointOptions, PersistedState},
     settings::{DebugRequest, DebuggerConfig},
@@ -424,7 +426,7 @@ impl IdeShell {
     pub(super) fn shift_breakpoints_for_edit(
         &mut self,
         ix: usize,
-        old: &str,
+        old: &Rope,
         cx: &mut Context<Self>,
     ) {
         let buffer = &self.buffers[ix];
@@ -434,24 +436,20 @@ impl IdeShell {
         if self.debugger.read(cx).lines(&path).is_none() {
             return;
         }
-        let new = buffer.document.text().to_string();
-        let prefix = old
-            .bytes()
-            .zip(new.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let suffix = old[prefix..]
-            .bytes()
-            .rev()
-            .zip(new[prefix..].bytes().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let removed = old[prefix..old.len() - suffix].matches('\n').count();
-        let added = new[prefix..new.len() - suffix].matches('\n').count();
+        let new = buffer.document.text();
+        let (removed_range, added_range) = folding::rope_difference(old, new);
+        let newlines = |text: &Rope, range: Range<usize>| {
+            text.bytes_at(range.start)
+                .take(range.len())
+                .filter(|byte| *byte == b'\n')
+                .count()
+        };
+        let removed = newlines(old, removed_range.clone());
+        let added = newlines(new, added_range);
         if removed == added {
             return;
         }
-        let line = old[..prefix].matches('\n').count() + 1;
+        let line = newlines(old, 0..removed_range.start) + 1;
         self.debugger.update(cx, |debugger, cx| {
             debugger.shift_breakpoints(&path, line, removed, added, cx)
         });

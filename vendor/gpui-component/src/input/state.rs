@@ -288,6 +288,8 @@ pub struct InputState {
     pub(super) ime_marked_range: Option<Selection>,
     /// Whether the last text change committed an IME composition.
     ime_committed: bool,
+    /// Bumped on every text change, so callers can cache work per revision.
+    text_revision: usize,
     pub(super) last_layout: Option<LastLayout>,
     pub(super) last_cursor: Option<usize>,
     /// The input container bounds
@@ -390,6 +392,7 @@ impl InputState {
             selection_reversed: false,
             ime_marked_range: None,
             ime_committed: false,
+            text_revision: 0,
             input_bounds: Bounds::default(),
             selecting: false,
             disabled: false,
@@ -1748,6 +1751,11 @@ impl InputState {
         self.ime_marked_range.is_some()
     }
 
+    /// A counter bumped on every text change (cheap cache key for derived data).
+    pub fn text_revision(&self) -> usize {
+        self.text_revision
+    }
+
     /// Whether the last text change committed an IME composition.
     pub fn last_change_committed_composition(&self) -> bool {
         self.ime_committed
@@ -2231,6 +2239,7 @@ impl EntityInputHandler for InputState {
 
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
+        self.text_revision += 1;
 
         let mut new_offset = (range.start + new_text.len()).min(self.text.len());
 
@@ -2299,6 +2308,7 @@ impl EntityInputHandler for InputState {
 
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
+        self.text_revision += 1;
 
         if self.mode.is_single_line() {
             let pending_text = self.text.to_string();
