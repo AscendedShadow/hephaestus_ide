@@ -12,6 +12,7 @@ use gpui::{
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 use sum_tree::Bias;
@@ -270,7 +271,7 @@ pub struct InputState {
     pub(super) mode: InputMode,
     pub(super) text: Rope,
     pub(super) text_wrapper: TextWrapper,
-    pub(super) history: History<Change>,
+    pub(super) history: Rc<RefCell<History<Change>>>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
     pub(super) loading: bool,
     /// Range in UTF-8 length for the selected text.
@@ -381,7 +382,7 @@ impl InputState {
             text: "".into(),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
-            history,
+            history: Rc::new(RefCell::new(history)),
             selected_range: Selection::default(),
             search_panel: None,
             searchable: false,
@@ -619,12 +620,12 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.history.ignore = true;
+        self.history.borrow_mut().ignore = true;
         let was_disabled = self.disabled;
         self.disabled = false;
         self.replace_text(value, window, cx);
         self.disabled = was_disabled;
-        self.history.ignore = false;
+        self.history.borrow_mut().ignore = false;
 
         // Ensure cursor to start when set text
         if self.mode.is_single_line() {
@@ -1521,7 +1522,7 @@ impl InputState {
     }
 
     fn push_history(&mut self, text: &Rope, range: &Range<usize>, new_text: &str) {
-        if self.history.ignore {
+        if self.history.borrow().ignore {
             return;
         }
 
@@ -1529,29 +1530,32 @@ impl InputState {
         let new_range = range.start..range.start + new_text.len();
 
         self.history
+            .borrow_mut()
             .push(Change::new(range.clone(), &old_text, new_range, new_text));
     }
 
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        self.history.ignore = true;
-        if let Some(changes) = self.history.undo() {
+        self.history.borrow_mut().ignore = true;
+        let changes = self.history.borrow_mut().undo();
+        if let Some(changes) = changes {
             for change in changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
             }
         }
-        self.history.ignore = false;
+        self.history.borrow_mut().ignore = false;
     }
 
     pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        self.history.ignore = true;
-        if let Some(changes) = self.history.redo() {
+        self.history.borrow_mut().ignore = true;
+        let changes = self.history.borrow_mut().redo();
+        if let Some(changes) = changes {
             for change in changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
         }
-        self.history.ignore = false;
+        self.history.borrow_mut().ignore = false;
     }
 
     /// Get byte offset of the cursor.
@@ -1754,6 +1758,54 @@ impl InputState {
         self.undo(&Undo, window, cx);
     }
 
+    /// Redo the last undone change group.
+    pub fn redo_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.redo(&Redo, window, cx);
+    }
+
+    /// Share `other`'s undo history, so several views of one document undo together.
+    /// Edits mirrored with [`Self::apply_external_edit`] are not recorded twice.
+    pub fn share_history_with(&mut self, other: &InputState) {
+        self.history = other.history.clone();
+    }
+
+    /// Apply an edit made through another view of the same document: it is not
+    /// recorded in the (shared) history, does not scroll, and keeps this view's
+    /// selection where it was relative to the surrounding text.
+    pub fn apply_external_edit(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = range.end.min(self.text.len());
+        let start = range.start.min(end);
+        let delta = new_text.len() as isize - (end - start) as isize;
+        let map = |offset: usize| {
+            if offset >= end {
+                offset.saturating_add_signed(delta)
+            } else if offset > start {
+                start + new_text.len()
+            } else {
+                offset
+            }
+        };
+        let selection = (map(self.selected_range.start), map(self.selected_range.end));
+        let reversed = self.selection_reversed;
+        let was_disabled = self.disabled;
+        self.disabled = false;
+        let ignored = std::mem::replace(&mut self.history.borrow_mut().ignore, true);
+        let range_utf16 = self.range_to_utf16(&(start..end));
+        self.replace_text_in_range_silent(Some(range_utf16), new_text, window, cx);
+        self.history.borrow_mut().ignore = ignored;
+        self.disabled = was_disabled;
+        let len = self.text.len();
+        self.selected_range = (selection.0.min(len)..selection.1.min(len)).into();
+        self.selection_reversed = reversed;
+        cx.notify();
+    }
+
     /// The selected byte range (UTF-8 offsets), ordered `start <= end`.
     pub fn selected_byte_range(&self) -> Range<usize> {
         self.selected_range.start..self.selected_range.end
@@ -1830,20 +1882,20 @@ impl InputState {
         let was_disabled = self.disabled;
         self.disabled = false;
         if !join_previous {
-            self.history.break_group();
+            self.history.borrow_mut().break_group();
         }
         for (ix, (range, text)) in ordered.into_iter().enumerate() {
             if ix > 0 || join_previous {
-                self.history.start_grouping();
+                self.history.borrow_mut().start_grouping();
             }
             let end = range.end.min(self.text.len());
             let start = range.start.min(end);
             let range_utf16 = self.range_to_utf16(&(start..end));
             self.replace_text_in_range_silent(Some(range_utf16), text, window, cx);
         }
-        self.history.end_grouping();
+        self.history.borrow_mut().end_grouping();
         if !join_previous {
-            self.history.break_group();
+            self.history.borrow_mut().break_group();
         }
         self.disabled = was_disabled;
         if let Some((range, reversed)) = selection {
@@ -2200,7 +2252,7 @@ impl EntityInputHandler for InputState {
         }
 
         self.push_history(&old_text, &range, &new_text);
-        self.history.end_grouping();
+        self.history.borrow_mut().end_grouping();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
@@ -2278,7 +2330,7 @@ impl EntityInputHandler for InputState {
                 .into();
         }
         self.mode.update_auto_grow(&self.text_wrapper);
-        self.history.start_grouping();
+        self.history.borrow_mut().start_grouping();
         self.push_history(&old_text, &range, new_text);
         cx.notify();
     }

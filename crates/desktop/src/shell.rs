@@ -64,6 +64,7 @@ mod encoding;
 mod explorer;
 mod fs_sync;
 mod git_features;
+mod groups;
 mod language_mode;
 mod line_commands;
 mod lsp_features;
@@ -279,7 +280,9 @@ struct Buffer {
     recovered: bool,
     /// Tab title for buffers without a file (e.g. recovered copies).
     title_override: Option<String>,
-    _subscription: Subscription,
+    /// One view per editor group showing this document (IDE-012). `editor` is the view
+    /// commands act on: the one in the focused group, or the last focused one.
+    views: Vec<groups::BufferView>,
 }
 
 impl Buffer {
@@ -368,6 +371,7 @@ pub struct IdeShell {
     git_state: git_features::GitState,
     testing: testing::TestingState,
     cursors: cursors::CursorState,
+    groups: groups::Groups,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -448,6 +452,7 @@ impl IdeShell {
             git_state: Default::default(),
             testing: Default::default(),
             cursors: Default::default(),
+            groups: Default::default(),
             _subscriptions: Vec::new(),
         };
         let shell_cursors_live = shell.cursors_live();
@@ -595,8 +600,8 @@ impl IdeShell {
         {
             self.set_workspace(workspace, cx);
         }
-        for (ix, file) in snapshot.files.into_iter().enumerate() {
-            if let Ok(document) = Document::open(&file) {
+        for (ix, file) in snapshot.files.iter().enumerate() {
+            if let Ok(document) = Document::open(file) {
                 self.open_document(document, window, cx);
                 if let Some((line, column)) = snapshot.cursors.get(ix).copied() {
                     self.editor().update(cx, |editor, cx| {
@@ -607,6 +612,15 @@ impl IdeShell {
         }
         if snapshot.active < self.buffers.len() {
             self.activate(snapshot.active, window, cx);
+        }
+        if snapshot.groups.len() > 1 {
+            self.restore_groups(
+                &snapshot.files,
+                &snapshot.groups,
+                snapshot.focused_group,
+                window,
+                cx,
+            );
         }
         self.recent_paths = snapshot
             .recent
@@ -642,6 +656,8 @@ impl IdeShell {
                 })
                 .collect(),
             recent: self.recent_paths.clone(),
+            groups: self.session_groups(cx),
+            focused_group: self.groups.focused,
         };
         let _ = session::save(&path, &snapshot);
     }
@@ -682,54 +698,18 @@ impl IdeShell {
         self.next_buffer_id += 1;
         let language = syntax::detect(document.path(), Some(&first_line(&document)));
         let preferences = Self::resolve_preferences(&document, language, cx);
-        let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor(language)
-                .line_number(preferences.line_numbers)
-                .soft_wrap(preferences.word_wrap)
-                .tab_size(TabSize {
-                    tab_size: preferences.tab_width,
-                    hard_tabs: !preferences.insert_spaces,
-                })
-                .default_value(document.text().to_string())
-        });
-        language_server::attach(
-            &editor,
-            &self.servers,
-            document.path().map(Path::to_path_buf),
+        let group = self.groups.focused_id();
+        let view = self.create_view(
+            id,
+            document.text().to_string(),
             language,
+            &preferences,
+            document.path().map(Path::to_path_buf),
+            group,
+            window,
             cx,
         );
-        self.attach_completion(id, &editor, cx);
-        let subscription =
-            cx.subscribe_in(&editor, window, move |this, editor, event, window, cx| {
-                if matches!(event, InputEvent::Change)
-                    && let Some(ix) = this.buffer_index(id)
-                {
-                    this.cursors_after_change(ix, window, cx);
-                    let buffer = &mut this.buffers[ix];
-                    let displayed = editor.read(cx).text().to_string();
-                    let source = buffer.document.text().to_string();
-                    if let Some(text) = folding::apply_edit(&source, &mut buffer.folds, &displayed)
-                    {
-                        buffer.document.set_text(text.into());
-                        this.shift_breakpoints_for_edit(ix, &source, cx);
-                    }
-                    let buffer = &mut this.buffers[ix];
-                    buffer.dirty = buffer.document.is_dirty();
-                    this.sync_lsp_buffer(ix, cx);
-                    if this.buffers[ix].dirty {
-                        this.schedule_auto_save(id, cx);
-                    }
-                    this.track_snippet(ix);
-                    this.schedule_recovery_snapshot(cx);
-                    if ix == this.active {
-                        this.schedule_outline_refresh(window, cx);
-                        this.signature_help_after_edit(ix, window, cx);
-                    }
-                    cx.notify();
-                }
-            });
+        let editor = view.editor.clone();
         Buffer {
             id,
             document,
@@ -743,7 +723,7 @@ impl IdeShell {
             deleted_on_disk: false,
             recovered: false,
             title_override: None,
-            _subscription: subscription,
+            views: vec![view],
         }
     }
 
@@ -757,6 +737,7 @@ impl IdeShell {
             self.auto_save_on_focus_change(Some(previous), cx);
         }
         self.active = ix;
+        self.ensure_focused_view(ix, window, cx);
         self.dismiss_signature_help();
         if let Some(path) = self.document().path().map(Path::to_path_buf) {
             self.recent_paths.retain(|recent| recent != &path);
@@ -1261,15 +1242,26 @@ impl IdeShell {
         }
         self.buffers.remove(ix);
         self.write_recovery_snapshots(cx);
+        let tabs = self.focused_tabs();
+        if tabs.is_empty() && self.groups.list.len() > 1 {
+            if self.active >= self.buffers.len() || self.active > ix {
+                self.active = self.active.saturating_sub(1);
+            }
+            self.remove_group(self.groups.focused_id(), window, cx);
+            return;
+        }
         if self.buffers.is_empty() {
             let buffer = self.new_buffer(Document::default(), window, cx);
             self.buffers.push(buffer);
         }
-        let active = if self.active > ix {
-            self.active - 1
-        } else {
-            self.active.min(self.buffers.len() - 1)
-        };
+        let tabs = self.focused_tabs();
+        let active = tabs
+            .iter()
+            .rev()
+            .find(|tab| **tab < ix)
+            .or(tabs.first())
+            .copied()
+            .unwrap_or_else(|| self.buffers.len() - 1);
         let show_diff = self.show_diff;
         self.activate(active, window, cx);
         if show_diff {
@@ -1363,7 +1355,7 @@ impl IdeShell {
             PendingAction::CloseWindow => self.buffers.iter().position(|buffer| buffer.dirty),
         };
         if let Some(ix) = unsaved {
-            self.activate(ix, window, cx);
+            self.reveal_buffer(ix, window, cx);
             self.pending = Some(action);
             cx.notify();
             return;
@@ -2615,7 +2607,7 @@ impl IdeShell {
         if self.show_diff {
             self.request(PendingAction::LeaveDiff, window, cx);
         } else {
-            self.request(PendingAction::CloseBuffer(self.buffer().id), window, cx);
+            self.close_tab_in(self.groups.focused_id(), self.buffer().id, window, cx);
         }
     }
 
@@ -2623,15 +2615,23 @@ impl IdeShell {
         if self.blocked() {
             return;
         }
-        let files = self.buffers.len();
+        let tabs = self.focused_tabs();
+        let files = tabs.len();
         let has_diff = self.diff_view.read(cx).target().is_some();
-        let current = if self.show_diff { files } else { self.active };
+        let current = if self.show_diff {
+            files
+        } else {
+            tabs.iter().position(|tab| *tab == self.active).unwrap_or(0)
+        };
         let len = (files + usize::from(has_diff)) as isize;
+        if len == 0 {
+            return;
+        }
         let ix = (current as isize + step).rem_euclid(len) as usize;
         if ix == files {
             self.focus_diff(window, cx);
         } else {
-            self.activate(ix, window, cx);
+            self.activate(tabs[ix], window, cx);
         }
     }
 
@@ -3570,32 +3570,46 @@ impl IdeShell {
     }
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = (!self.show_diff).then_some(self.active);
+        self.render_group_tabs(self.groups.focused_id(), active, cx)
+            .when_some(self.diff_view.read(cx).title(), |tabs, title| {
+                tabs.child(self.render_diff_tab(title, cx))
+            })
+    }
+
+    fn render_group_tabs(
+        &self,
+        group: groups::GroupId,
+        active: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         div()
-            .id("tabs")
-            .debug_selector(|| "tabs".into())
+            .id(("tabs", group))
+            .debug_selector(move || format!("tabs-{group}"))
             .h(px(HEADER_HEIGHT + 2.))
             .flex_shrink_0()
             .flex()
             .overflow_x_scroll()
             .bg(theme::panel())
             .children(
-                self.buffers
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, buffer)| self.render_tab(ix, buffer, cx)),
+                self.group_tabs(group)
+                    .into_iter()
+                    .map(|ix| self.render_tab(group, active == Some(ix), &self.buffers[ix], cx)),
             )
-            .when_some(self.diff_view.read(cx).title(), |tabs, title| {
-                tabs.child(self.render_diff_tab(title, cx))
-            })
     }
 
-    fn render_tab(&self, ix: usize, buffer: &Buffer, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn render_tab(
+        &self,
+        group: groups::GroupId,
+        active: bool,
+        buffer: &Buffer,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let id = buffer.id;
-        let active = ix == self.active && !self.show_diff;
         let dirty = buffer.dirty;
         let close_hidden = dirty || !active;
         editor_tab(
-            ("tab", id),
+            ("tab", id * 1000 + group as u64),
             active,
             Icon::new(FileKind::of(buffer.document.path().unwrap_or(Path::new(""))).icon()),
             self.tab_title(buffer),
@@ -3618,26 +3632,23 @@ impl IdeShell {
                     )
                 })
                 .child(
-                    tab_close_button(("close-tab", id), close_hidden).on_click(cx.listener(
-                        move |this, _, window, cx| {
+                    tab_close_button(("close-tab", id * 1000 + group as u64), close_hidden)
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.request(PendingAction::CloseBuffer(id), window, cx);
-                        },
-                    )),
+                            this.close_tab_in(group, id, window, cx);
+                        })),
                 ),
         )
         .on_click(cx.listener(move |this, _, window, cx| {
             if !this.blocked()
                 && let Some(ix) = this.buffer_index(id)
             {
-                this.activate(ix, window, cx);
+                this.focus_group_buffer(group, ix, window, cx);
             }
         }))
         .on_mouse_down(
             MouseButton::Middle,
-            cx.listener(move |this, _, window, cx| {
-                this.request(PendingAction::CloseBuffer(id), window, cx)
-            }),
+            cx.listener(move |this, _, window, cx| this.close_tab_in(group, id, window, cx)),
         )
     }
 
@@ -4529,6 +4540,12 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::add_cursor_below))
             .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::select_all_occurrences))
+            .on_action(cx.listener(Self::split_editor_right))
+            .on_action(cx.listener(Self::split_editor_down))
+            .on_action(cx.listener(Self::close_editor_group))
+            .on_action(cx.listener(Self::focus_next_group))
+            .on_action(cx.listener(Self::focus_previous_group))
+            .on_action(cx.listener(Self::move_tab_to_next_group))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))
@@ -4594,7 +4611,11 @@ impl Render for IdeShell {
                             .child(
                                 v_resizable("tool-panel-split")
                                     .with_state(&self.tool_panel_split)
-                                    .child(resizable_panel().child(self.render_editor(window, cx)))
+                                    .child(resizable_panel().child({
+                                        let editor =
+                                            self.render_editor(window, cx).into_any_element();
+                                        self.render_groups(editor, cx)
+                                    }))
                                     .child(
                                         resizable_panel()
                                             .size(px(200.))

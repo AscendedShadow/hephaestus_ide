@@ -70,6 +70,11 @@ impl IdeShell {
         }
     }
 
+    /// The command target view of a buffer changed (editor groups).
+    pub(super) fn cursors_view_changed(&mut self, cx: &mut Context<Self>) {
+        self.clear_secondary_cursors(cx);
+    }
+
     pub(super) fn clear_secondary_cursors(&mut self, cx: &mut Context<Self>) {
         if self.cursors.active.is_some() {
             self.set_cursor_state(None);

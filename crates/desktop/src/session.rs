@@ -13,6 +13,21 @@ pub struct Session {
     pub active: usize,
     pub cursors: Vec<(u32, u32)>,
     pub recent: Vec<PathBuf>,
+    /// Editor groups (only stored when the editor is split), in layout order.
+    pub groups: Vec<SessionGroup>,
+    /// Index into `groups` of the focused group.
+    pub focused_group: usize,
+}
+
+/// One editor group: indices into `Session::files` with a cursor for each.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionGroup {
+    /// Split below the previous group (otherwise to its right).
+    pub down: bool,
+    pub files: Vec<usize>,
+    pub cursors: Vec<(u32, u32)>,
+    pub active: Option<usize>,
 }
 
 pub fn path(settings: &Path) -> PathBuf {
@@ -54,6 +69,8 @@ mod tests {
                 active: 0,
                 cursors: vec![(3, 2)],
                 recent: Vec::new(),
+                groups: Vec::new(),
+                focused_group: 0,
             },
         )
         .unwrap();

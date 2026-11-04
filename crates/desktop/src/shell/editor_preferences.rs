@@ -32,8 +32,8 @@ impl IdeShell {
                 continue;
             };
             let preferences = Self::resolve_preferences(&buffer.document, buffer.language, cx);
-            Self::apply_preferences(&buffer.editor, &preferences, cx);
             buffer.preferences = preferences;
+            self.sync_view_settings(ix, cx);
         }
         if let Some(vim) = &mut self.vim {
             vim.set_indent_width(self.buffers[self.active].preferences.tab_width);

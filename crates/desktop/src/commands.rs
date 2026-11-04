@@ -135,7 +135,13 @@ actions!(
         AddCursorAbove,
         AddCursorBelow,
         SelectNextOccurrence,
-        SelectAllOccurrences
+        SelectAllOccurrences,
+        SplitEditorRight,
+        SplitEditorDown,
+        CloseEditorGroup,
+        FocusNextGroup,
+        FocusPreviousGroup,
+        MoveTabToNextGroup
     ]
 );
 
@@ -293,6 +299,12 @@ commands! {
     AddCursorBelow => AddCursorBelow,
     SelectNextOccurrence => SelectNextOccurrence,
     SelectAllOccurrences => SelectAllOccurrences,
+    SplitEditorRight => SplitEditorRight,
+    SplitEditorDown => SplitEditorDown,
+    CloseEditorGroup => CloseEditorGroup,
+    FocusNextGroup => FocusNextGroup,
+    FocusPreviousGroup => FocusPreviousGroup,
+    MoveTabToNextGroup => MoveTabToNextGroup,
 }
 
 impl Command {
@@ -423,6 +435,12 @@ impl Command {
             Self::AddCursorBelow => &["secondary-alt-down"],
             Self::SelectNextOccurrence => &["secondary-d"],
             Self::SelectAllOccurrences => &["secondary-f2"],
+            Self::SplitEditorRight => &["secondary-\\"],
+            Self::SplitEditorDown => &["secondary-k secondary-\\"],
+            Self::CloseEditorGroup => &["secondary-k w"],
+            Self::FocusNextGroup => &["secondary-k secondary-right"],
+            Self::FocusPreviousGroup => &["secondary-k secondary-left"],
+            Self::MoveTabToNextGroup => &["secondary-k shift-right"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };
