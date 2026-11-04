@@ -137,29 +137,6 @@ fn project_search_opens_matching_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn completion_from_server_replaces_word_as_one_edit(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        crate::commands::init(cx);
-    });
-    let mut shell = None;
-    let (_, cx) = cx.add_window_view(|window, cx| {
-        let entity = cx.new(|cx| IdeShell::new(window, cx));
-        shell = Some(entity.clone());
-        Root::new(entity, window, cx)
-    });
-    let shell = shell.unwrap();
-    cx.simulate_input("let greet");
-    shell.update_in(cx, |shell, window, cx| {
-        shell.completions = vec![("greeting".into(), "greeting".into())];
-        shell.show_search(SearchMode::Completion, window, cx);
-        assert_eq!(shell.search_mode, Some(SearchMode::Completion));
-        shell.choose_search_result(0, window, cx);
-    });
-    cx.read(|cx| assert_eq!(shell.read(cx).document().text().to_string(), "let greeting"));
-}
-
-#[gpui::test]
 fn palette_dispatches_existing_action(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);

@@ -76,6 +76,21 @@ pub trait CompletionProvider {
         Task::ready(Ok(false))
     }
 
+    /// Accept a completion item. Return `true` when the provider applied it itself (the
+    /// menu then only closes); `false` uses the built-in insertion.
+    ///
+    /// - `trigger_start`/`cursor` are byte offsets of the current text.
+    fn apply_completion(
+        &self,
+        _item: &CompletionItem,
+        _trigger_start: usize,
+        _cursor: usize,
+        _window: &mut Window,
+        _cx: &mut Context<InputState>,
+    ) -> bool {
+        false
+    }
+
     /// Determines if the completion should be triggered based on the given byte offset.
     ///
     /// This is called on the main thread.
@@ -104,10 +119,27 @@ impl Default for InlineCompletion {
 }
 
 impl InputState {
+    /// Open the completion menu at the cursor (manual invocation).
+    pub fn show_completions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cursor = self.cursor();
+        self.request_completions(&(cursor..cursor), "", true, window, cx);
+    }
+
     pub(crate) fn handle_completion_trigger(
         &mut self,
         range: &Range<usize>,
         new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_completions(range, new_text, false, window, cx);
+    }
+
+    fn request_completions(
+        &mut self,
+        range: &Range<usize>,
+        new_text: &str,
+        invoked: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -121,12 +153,17 @@ impl InputState {
 
         // Always schedule inline completion (debounced).
         // It will check if menu is open before showing the suggestion.
-        self.schedule_inline_completion(window, cx);
+        if !invoked {
+            self.schedule_inline_completion(window, cx);
+        }
 
         let start = range.end;
         let new_offset = self.cursor();
 
-        if !provider.is_completion_trigger(start, new_text, cx) {
+        if !invoked && !provider.is_completion_trigger(start, new_text, cx) {
+            if let Some(ContextMenu::Completion(menu)) = self.context_menu.as_ref() {
+                menu.update(cx, |menu, cx| menu.hide(cx));
+            }
             return;
         }
 
@@ -164,9 +201,14 @@ impl InputState {
         });
 
         let completion_context = CompletionContext {
-            trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
-            trigger_character: Some(query),
+            trigger_kind: if invoked {
+                lsp_types::CompletionTriggerKind::INVOKED
+            } else {
+                lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER
+            },
+            trigger_character: (!invoked).then_some(new_text.to_string()),
         };
+        let _ = query;
 
         let provider_responses =
             provider.completions(&self.text, new_offset, completion_context, window, cx);

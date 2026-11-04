@@ -88,13 +88,19 @@ actions!(
         Refactor,
         SourceAction,
         OrganizeImports,
-        ShowOutline
+        ShowOutline,
+        TriggerParameterHints,
+        NextSignature,
+        PreviousSignature,
+        NextTabStop,
+        PreviousTabStop
     ]
 );
 
 /// Editor-only bindings: active when the code editor's text input is focused, so
 /// terminal and panel shortcuts are unaffected.
 const EDITOR_INPUT: &str = "Editor > Input";
+const SNIPPET_INPUT: &str = "Snippet > Input";
 
 macro_rules! commands {
     ($($variant:ident => $action:expr,)*) => {
@@ -197,6 +203,11 @@ commands! {
     SourceAction => SourceAction,
     OrganizeImports => OrganizeImports,
     ShowOutline => ShowOutline,
+    TriggerParameterHints => TriggerParameterHints,
+    NextSignature => NextSignature,
+    PreviousSignature => PreviousSignature,
+    NextTabStop => NextTabStop,
+    PreviousTabStop => PreviousTabStop,
 }
 
 impl Command {
@@ -227,6 +238,11 @@ impl Command {
             Self::QuickFix => Some(EDITOR_INPUT.into()),
             Self::Refactor => Some(EDITOR_INPUT.into()),
             Self::OrganizeImports => Some(EDITOR_INPUT.into()),
+            Self::TriggerParameterHints => Some(EDITOR_INPUT.into()),
+            Self::NextSignature => Some(EDITOR_INPUT.into()),
+            Self::PreviousSignature => Some(EDITOR_INPUT.into()),
+            Self::NextTabStop => Some(SNIPPET_INPUT.into()),
+            Self::PreviousTabStop => Some(SNIPPET_INPUT.into()),
             _ => None,
         }
     }
@@ -305,6 +321,11 @@ impl Command {
             Self::Refactor => &["ctrl-shift-r"],
             Self::OrganizeImports => &["shift-alt-o"],
             Self::ShowOutline => &["secondary-shift-u"],
+            Self::TriggerParameterHints => &["secondary-shift-space"],
+            Self::NextSignature => &["alt-]"],
+            Self::PreviousSignature => &["alt-["],
+            Self::NextTabStop => &["tab"],
+            Self::PreviousTabStop => &["shift-tab"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };

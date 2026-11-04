@@ -514,3 +514,192 @@ fn document_and_workspace_symbols(cx: &mut TestAppContext) {
     });
     let _ = editor_text(&shell, cx);
 }
+
+fn item(json: Value) -> lsp_types::CompletionItem {
+    serde_json::from_value(json).unwrap()
+}
+
+#[gpui::test]
+fn completion_applies_exact_edits_snippets_and_auto_imports_as_one_step(cx: &mut TestAppContext) {
+    let (shell, cx, _directory, root) = workspace(cx);
+    let lib = root.join("lib.rs");
+    std::fs::write(&lib, "fn main() {\n    let v = Vec::new();\n    v.\n}\n").unwrap();
+    open_file(&shell, &lib, cx);
+    let _server = mock_lsp::install(
+        &shell,
+        "rust",
+        &root,
+        json!({"completionProvider": {"triggerCharacters": ["."], "resolveProvider": true}}),
+        Box::new(|method, params| match method {
+            "completionItem/resolve" if params["label"] == json!("HashMap") => {
+                let mut resolved = params.clone();
+                resolved["additionalTextEdits"] = json!([
+                    {"range": range(0, 0, 0), "newText": "use std::collections::HashMap;\n"}
+                ]);
+                resolved["documentation"] = json!("A hash map.");
+                resolved
+            }
+            "completionItem/resolve" => params.clone(),
+            _ => Value::Null,
+        }),
+        cx,
+    );
+    let id = cx.read(|cx| shell.read(cx).buffer().id);
+    let accept = |item: lsp_types::CompletionItem, cx: &mut gpui::VisualTestContext| {
+        shell.update_in(cx, |shell, window, cx| {
+            shell.accept_completion(id, item, window, cx)
+        });
+        cx.run_until_parked();
+    };
+
+    // A snippet with a placeholder and a final stop.
+    set_cursor(&shell, 2, 6, cx);
+    accept(
+        item(json!({"label": "push", "insertTextFormat": 2,
+            "textEdit": {"range": range(2, 6, 6), "newText": "push(${1:value})$0"}})),
+        cx,
+    );
+    wait_until(cx, |cx| text(&shell, cx).contains("v.push(value)"));
+    cx.read(|cx| {
+        let editor = shell.read(cx).editor().read(cx);
+        let selected = editor.text().to_string()[editor.selected_byte_range()].to_string();
+        assert_eq!(selected, "value", "the first placeholder is selected");
+    });
+    cx.simulate_input("item");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input(";");
+    assert!(
+        text(&shell, cx).contains("    v.push(item);\n"),
+        "{}",
+        text(&shell, cx)
+    );
+    cx.read(|cx| assert!(shell.read(cx).snippet.is_none()));
+
+    // A non-prefix replace range plus a lazily resolved auto-import, undone in one step.
+    let before = text(&shell, cx);
+    set_cursor(&shell, 1, 15, cx);
+    accept(
+        item(json!({"label": "HashMap",
+            "textEdit": {"range": range(1, 12, 15), "newText": "HashMap"}})),
+        cx,
+    );
+    wait_until(cx, |cx| {
+        text(&shell, cx).starts_with("use std::collections::HashMap;\n")
+    });
+    assert!(
+        text(&shell, cx).contains("let v = HashMap::new();"),
+        "{}",
+        text(&shell, cx)
+    );
+    cx.simulate_keystrokes("ctrl-z");
+    assert_eq!(text(&shell, cx), before);
+
+    // Literal dollar text stays literal when the item is not a snippet.
+    set_cursor(&shell, 2, 4, cx);
+    accept(item(json!({"label": "$money", "insertText": "$money"})), cx);
+    assert!(
+        text(&shell, cx).contains("    $moneyv.push(item);"),
+        "{}",
+        text(&shell, cx)
+    );
+
+    // Insert/replace edits extend over characters typed since the request.
+    set_cursor(&shell, 2, 4, cx);
+    let requested = text(&shell, cx);
+    let _ = requested;
+    accept(
+        item(json!({"label": "money2", "textEdit": {
+            "insert": range(2, 4, 10), "replace": range(2, 4, 10), "newText": "cash"}})),
+        cx,
+    );
+    assert!(
+        text(&shell, cx).contains("    cashv.push(item);"),
+        "{}",
+        text(&shell, cx)
+    );
+}
+
+#[gpui::test]
+fn signature_help_follows_triggers_overloads_and_dismissal(cx: &mut TestAppContext) {
+    let (shell, cx, _directory, root) = workspace(cx);
+    let lib = root.join("lib.rs");
+    std::fs::write(&lib, "fn f() {\n    \n}\n").unwrap();
+    open_file(&shell, &lib, cx);
+    let _server = mock_lsp::install(
+        &shell,
+        "rust",
+        &root,
+        json!({"signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [")"]}}),
+        Box::new(|method, params| match method {
+            "textDocument/signatureHelp" => {
+                let character = params["position"]["character"].as_u64().unwrap();
+                if params["context"]["triggerCharacter"] == json!(")") || character > 12 {
+                    return Value::Null;
+                }
+                let active = if character >= 10 { 1 } else { 0 };
+                json!({
+                    "signatures": [
+                        {"label": "max(a: i32, b: i32)", "parameters": [{"label": [4, 10]}, {"label": [12, 18]}],
+                         "documentation": "Largest of two."},
+                        {"label": "max(a: f64, b: f64)", "parameters": [{"label": "a: f64"}, {"label": "b: f64"}]}
+                    ],
+                    "activeSignature": 0,
+                    "activeParameter": active
+                })
+            }
+            _ => Value::Null,
+        }),
+        cx,
+    );
+    set_cursor(&shell, 1, 4, cx);
+    cx.simulate_input("max(");
+    wait_until(cx, |cx| {
+        cx.read(|cx| shell.read(cx).signature.help.is_some())
+    });
+    let parameter = |cx: &mut gpui::VisualTestContext| {
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            let help = shell.signature.help.as_ref().unwrap();
+            signature_help::split_label(help, shell.active_signature().unwrap())
+                .unwrap()
+                .1
+        })
+    };
+    assert_eq!(parameter(cx), "a: i32");
+    cx.simulate_input("1,");
+    wait_until(cx, |cx| parameter(cx) == "b: i32");
+    cx.dispatch_action(NextSignature);
+    assert_eq!(parameter(cx), "b: f64");
+    // Focus stays in the editor while typing.
+    cx.update(|window, cx| {
+        assert!(
+            shell
+                .read(cx)
+                .editor()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        )
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.read(|cx| assert!(shell.read(cx).signature.help.is_none()));
+    // A response for an older request cannot reopen a dismissed popover.
+    cx.dispatch_action(TriggerParameterHints);
+    shell.update(cx, |shell, _| shell.dismiss_signature_help());
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    cx.read(|cx| assert!(shell.read(cx).signature.help.is_none()));
+
+    // Leaving the call (retrigger with no signature) closes it.
+    cx.dispatch_action(TriggerParameterHints);
+    wait_until(cx, |cx| {
+        cx.read(|cx| shell.read(cx).signature.help.is_some())
+    });
+    cx.simulate_input("2)");
+    wait_until(cx, |cx| {
+        cx.read(|cx| shell.read(cx).signature.help.is_none())
+    });
+}

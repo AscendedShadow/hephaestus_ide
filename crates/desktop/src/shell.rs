@@ -55,6 +55,7 @@ use crate::{
 };
 
 mod autosave;
+mod completion;
 mod editor_preferences;
 mod edits;
 mod language_mode;
@@ -64,6 +65,7 @@ mod outline;
 mod picker;
 mod project_search;
 mod settings_commands;
+mod signature_help;
 mod workspace_edits;
 
 #[cfg(test)]
@@ -82,6 +84,8 @@ mod tests;
 mod feature_tests;
 
 pub const EDITOR_CONTEXT: &str = "Editor";
+/// Active while a completion snippet has remaining tab stops.
+pub const SNIPPET_CONTEXT: &str = "Snippet";
 const EDITOR_PADDING_LEFT: Pixels = px(20.);
 const BREAKPOINT_RADIUS: f32 = 4.5;
 const LINE_NUMBER_PADDING: Pixels = px(6.);
@@ -129,7 +133,6 @@ enum SearchMode {
     File,
     Tasks,
     Diagnostics,
-    Completion,
     Line,
     Languages,
     Items,
@@ -310,7 +313,6 @@ pub struct IdeShell {
     run_hits: Vec<SearchMatch>,
     command_directory: Option<PathBuf>,
     lsp_task: Task<()>,
-    completions: Vec<(String, String)>,
     pending_hit: Option<SearchMatch>,
     auto_save: autosave::AutoSaveState,
     /// Appended to the status when the running Save All finishes.
@@ -328,6 +330,8 @@ pub struct IdeShell {
     code_actions: Option<(lsp_features::Target, Vec<lsp_types::CodeActionOrCommand>)>,
     /// Full diagnostics as published by language servers, per file.
     lsp_diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+    snippet: Option<completion::SnippetSession>,
+    signature: signature_help::SignatureState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -379,7 +383,6 @@ impl IdeShell {
             run_hits: Vec::new(),
             command_directory: None,
             lsp_task: Task::ready(()),
-            completions: Vec::new(),
             pending_hit: None,
             auto_save: Default::default(),
             save_all_note: None,
@@ -394,6 +397,8 @@ impl IdeShell {
             workspace_symbol_language: None,
             code_actions: None,
             lsp_diagnostics: HashMap::new(),
+            snippet: None,
+            signature: Default::default(),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
@@ -622,6 +627,7 @@ impl IdeShell {
             language,
             cx,
         );
+        self.attach_completion(id, &editor, cx);
         let subscription =
             cx.subscribe_in(&editor, window, move |this, editor, event, window, cx| {
                 if matches!(event, InputEvent::Change)
@@ -639,8 +645,10 @@ impl IdeShell {
                     if this.buffers[ix].dirty {
                         this.schedule_auto_save(id, cx);
                     }
+                    this.track_snippet(ix);
                     if ix == this.active {
                         this.schedule_outline_refresh(window, cx);
+                        this.signature_help_after_edit(ix, window, cx);
                     }
                     cx.notify();
                 }
@@ -669,6 +677,7 @@ impl IdeShell {
             self.auto_save_on_focus_change(Some(previous), cx);
         }
         self.active = ix;
+        self.dismiss_signature_help();
         if let Some(path) = self.document().path().map(Path::to_path_buf) {
             self.recent_paths.retain(|recent| recent != &path);
             self.recent_paths.insert(0, path);
@@ -1997,9 +2006,6 @@ impl IdeShell {
         let task = (mode == SearchMode::Tasks)
             .then(|| self.ranked_tasks(query).get(ix).copied())
             .flatten();
-        let completion = (mode == SearchMode::Completion)
-            .then(|| self.ranked_completions(query).get(ix).copied())
-            .flatten();
         let language = (mode == SearchMode::Languages)
             .then(|| {
                 self.ranked_languages(query)
@@ -2023,11 +2029,6 @@ impl IdeShell {
             SearchMode::Tasks => {
                 if let Some(index) = task {
                     self.launch_config(index, window, cx);
-                }
-            }
-            SearchMode::Completion => {
-                if let Some(index) = completion {
-                    self.insert_completion(index, window, cx);
                 }
             }
             SearchMode::Items => self.choose_picker_item(ix, query, window, cx),
@@ -2144,40 +2145,6 @@ impl IdeShell {
         ranked.into_iter().take(30).map(|(_, ix)| ix).collect()
     }
 
-    fn ranked_completions(&self, query: &str) -> Vec<usize> {
-        self.completions
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, (label, _))| {
-                search::rank(Path::new(label), query).map(|score| (score, ix))
-            })
-            .take(30)
-            .map(|(_, ix)| ix)
-            .collect()
-    }
-
-    fn insert_completion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let insert = self.completions[index].1.clone();
-        let editor = self.editor().clone();
-        editor.update(cx, |editor, cx| {
-            let source = editor.text().to_string();
-            let end = editor.cursor().min(source.len());
-            if !source.is_char_boundary(end) {
-                return;
-            }
-            let start = source[..end]
-                .char_indices()
-                .rev()
-                .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
-                .last()
-                .map_or(end, |(start, _)| start);
-            let range =
-                source[..start].encode_utf16().count()..source[..end].encode_utf16().count();
-            editor.replace_text_in_range(Some(range), &insert, window, cx);
-            editor.focus(window, cx);
-        });
-    }
-
     fn jump_to_hit(&mut self, hit: &SearchMatch, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.editor().clone();
         editor.update(cx, |editor, cx| {
@@ -2256,7 +2223,6 @@ impl IdeShell {
             Some(SearchMode::Files) => self.ranked_paths(query).len(),
             Some(SearchMode::Commands) => self.ranked_commands(query).len(),
             Some(SearchMode::Tasks) => self.ranked_tasks(query).len(),
-            Some(SearchMode::Completion) => self.ranked_completions(query).len(),
             Some(SearchMode::Languages) => self.ranked_languages(query).len(),
             Some(SearchMode::Items) => self.ranked_items(query).len(),
             Some(SearchMode::File | SearchMode::Diagnostics) => self.search_hits.len().min(1000),
@@ -2297,11 +2263,6 @@ impl IdeShell {
                     let config = &self.task_commands[ix];
                     format!("{}  {}", config.name, config.program)
                 })
-                .collect(),
-            SearchMode::Completion => self
-                .ranked_completions(query)
-                .iter()
-                .map(|&ix| self.completions[ix].0.clone())
                 .collect(),
             SearchMode::Line => vec!["Enter line or line:column, then press Enter".into()],
             SearchMode::Items => self.picker_labels(query),
@@ -2767,55 +2728,6 @@ impl IdeShell {
         cx.notify();
     }
 
-    fn complete_code(&mut self, _: &CompleteCode, window: &mut Window, cx: &mut Context<Self>) {
-        let buffer = self.buffer();
-        let offset =
-            folding::display_to_source(&buffer.folds, buffer.editor.read(cx).cursor(), false);
-        let position = position_at(&buffer.document.text().to_string(), offset);
-        let language = buffer.language;
-        let buffer_id = buffer.id;
-        let request = buffer
-            .document
-            .path()
-            .and_then(|path| self.servers.read(cx).completions(path, language, position));
-        let Some(request) = request else {
-            self.status = "No language server is running for this file".into();
-            cx.notify();
-            return;
-        };
-        self.status = "Loading completions…".into();
-        cx.notify();
-        self.lsp_task = cx.spawn_in(window, async move |this, cx| {
-            let items = request.await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.completions = items
-                    .into_iter()
-                    .filter_map(|item| {
-                        let insert = item
-                            .text_edit
-                            .as_ref()
-                            .map(|edit| match edit {
-                                lsp_types::CompletionTextEdit::Edit(edit) => edit.new_text.clone(),
-                                lsp_types::CompletionTextEdit::InsertAndReplace(edit) => {
-                                    edit.new_text.clone()
-                                }
-                            })
-                            .or_else(|| item.insert_text.clone())
-                            .unwrap_or_else(|| item.label.clone());
-                        (!insert.contains('$')).then_some((item.label, insert))
-                    })
-                    .take(100)
-                    .collect();
-                if this.buffer().id == buffer_id && !this.completions.is_empty() {
-                    this.show_search(SearchMode::Completion, window, cx);
-                } else if this.completions.is_empty() {
-                    this.status = "No completions here".into();
-                }
-                cx.notify();
-            });
-        });
-    }
-
     fn go_to_declaration_fallback(
         &mut self,
         display_offset: usize,
@@ -2980,6 +2892,11 @@ impl IdeShell {
         let editor = self.editor().clone();
         if self.blocked() || !editor.focus_handle(cx).is_focused(window) {
             return;
+        }
+        self.snippet_key_down(event);
+        if event.keystroke.key == "escape" && self.signature.help.is_some() {
+            self.dismiss_signature_help();
+            cx.notify();
         }
         let Some(vim) = &mut self.vim else {
             return;
@@ -3805,11 +3722,11 @@ impl IdeShell {
                 .min_h_0()
                 .overflow_hidden()
                 .capture_any_mouse_down(cx.listener(Self::editor_mouse_down))
-                .when_some(vim_context, |editor, context| {
-                    editor
-                        .key_context(context)
-                        .capture_key_down(cx.listener(Self::editor_key_down))
+                .when_some(vim_context, |editor, context| editor.key_context(context))
+                .when(self.snippet_active(), |editor| {
+                    editor.key_context(SNIPPET_CONTEXT)
                 })
+                .capture_key_down(cx.listener(Self::editor_key_down))
                 .child(
                     Input::new(self.editor())
                         .h_full()
@@ -3824,6 +3741,7 @@ impl IdeShell {
                         .bg(theme::background())
                         .text_color(theme::text()),
                 )
+                .children(self.render_signature_help(cx))
                 .child(self.render_brace_guide(cx))
                 .when(self.buffer().preferences.show_whitespace, |editor| {
                     editor.child(self.render_whitespace(cx))
@@ -4356,6 +4274,11 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::source_action))
             .on_action(cx.listener(Self::organize_imports))
             .on_action(cx.listener(Self::show_outline))
+            .on_action(cx.listener(Self::trigger_parameter_hints))
+            .on_action(cx.listener(Self::next_signature))
+            .on_action(cx.listener(Self::previous_signature))
+            .on_action(cx.listener(Self::next_tab_stop))
+            .on_action(cx.listener(Self::previous_tab_stop))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

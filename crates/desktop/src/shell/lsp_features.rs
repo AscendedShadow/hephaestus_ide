@@ -1355,7 +1355,7 @@ impl IdeShell {
         }
         match action {
             CodeActionOrCommand::Command(command) => {
-                self.execute_command(&target, command, window, cx)
+                self.run_command_for(&target, command, window, cx)
             }
             CodeActionOrCommand::CodeAction(action) => {
                 if let Some(disabled) = &action.disabled {
@@ -1419,14 +1419,14 @@ impl IdeShell {
             }
         }
         if let Some(command) = action.command {
-            self.execute_command(target, command, window, cx);
+            self.run_command_for(target, command, window, cx);
         } else if action.edit.is_none() {
             self.status = format!("{} has nothing to apply", action.title);
         }
         cx.notify();
     }
 
-    fn execute_command(
+    pub(super) fn run_command_for(
         &mut self,
         target: &Target,
         command: lsp_types::Command,

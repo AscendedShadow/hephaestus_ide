@@ -8,9 +8,8 @@ use anyhow::Result;
 use gpui::{App, Context, Entity, EventEmitter, Task, WeakEntity, Window};
 use gpui_component::input::{HoverProvider, InputState, Position, Rope};
 use lsp_types::{
-    CompletionItem, CompletionParams, CompletionResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, MarkupContent, MarkupKind,
-    TextDocumentIdentifier, TextDocumentPositionParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, MarkupContent,
+    MarkupKind, TextDocumentIdentifier, TextDocumentPositionParams,
 };
 
 use crate::{navigation, settings::LanguageServer, syntax};
@@ -372,29 +371,6 @@ impl Servers {
                 partial_result_params: Default::default(),
             });
         Some(async move { request.await.ok().flatten() })
-    }
-
-    pub fn completions(
-        &self,
-        path: &Path,
-        language: &str,
-        position: Position,
-    ) -> Option<impl Future<Output = Vec<CompletionItem>> + use<>> {
-        let request = self
-            .client(language)?
-            .request::<lsp_types::request::Completion>(CompletionParams {
-                text_document_position: self.locate(path, position)?,
-                work_done_progress_params: Default::default(),
-                partial_result_params: Default::default(),
-                context: None,
-            });
-        Some(async move {
-            match request.await {
-                Ok(Some(CompletionResponse::Array(items))) => items,
-                Ok(Some(CompletionResponse::List(list))) => list.items,
-                _ => Vec::new(),
-            }
-        })
     }
 
     fn locate(&self, path: &Path, position: Position) -> Option<TextDocumentPositionParams> {

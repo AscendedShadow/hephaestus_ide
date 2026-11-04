@@ -3,6 +3,7 @@
 mod assets;
 mod brace_guide;
 mod commands;
+mod completion;
 mod debugger;
 mod diff_view;
 mod file_icons;

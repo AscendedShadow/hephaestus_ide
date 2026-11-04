@@ -156,4 +156,19 @@ impl Servers {
             position,
         })
     }
+
+    /// Whether any ready server lists `character` as a completion trigger.
+    pub fn is_trigger_character(&self, character: char) -> bool {
+        self.servers.values().any(|server| {
+            server.state == State::Ready
+                && server
+                    .client
+                    .capabilities()
+                    .and_then(|capabilities| capabilities.completion_provider)
+                    .and_then(|options| options.trigger_characters)
+                    .is_some_and(|triggers| {
+                        triggers.iter().any(|trigger| trigger.ends_with(character))
+                    })
+        })
+    }
 }

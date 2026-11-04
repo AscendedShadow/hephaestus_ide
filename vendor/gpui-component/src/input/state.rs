@@ -1717,6 +1717,13 @@ impl InputState {
         cx.notify()
     }
 
+    /// The cursor's bounds in window coordinates, after the last layout.
+    pub fn cursor_bounds_in_window(&self) -> Option<Bounds<Pixels>> {
+        let layout = self.last_layout.as_ref()?;
+        let bounds = layout.cursor_bounds?;
+        Some(Bounds::new(bounds.origin + self.scroll_handle.offset(), bounds.size))
+    }
+
     /// Undo the last change group.
     pub fn undo_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.undo(&Undo, window, cx);

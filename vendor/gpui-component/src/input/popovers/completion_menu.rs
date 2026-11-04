@@ -235,6 +235,12 @@ impl CompletionMenu {
 
         cx.spawn_in(window, async move |_, cx| {
             editor.update_in(cx, |editor, window, cx| {
+                if let Some(provider) = editor.lsp.completion_provider.clone() {
+                    let cursor = editor.cursor();
+                    if provider.apply_completion(&item, range.start, cursor, window, cx) {
+                        return;
+                    }
+                }
                 editor.completion_inserting = true;
 
                 let mut new_text = item.label.clone();
