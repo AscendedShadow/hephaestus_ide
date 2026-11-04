@@ -6,6 +6,8 @@
 
 use std::{fmt, ops::Range};
 
+use ropey::{LineType, Rope};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditError {
     OutOfBounds { range: Range<usize>, len: usize },
@@ -146,6 +148,41 @@ pub fn position(text: &str, offset: usize) -> (u32, u32) {
     (line, before[start..].encode_utf16().count() as u32)
 }
 
+/// The changed span between two ropes, as (range in `old`, range in `new`) byte ranges,
+/// found by comparing from both ends without copying either text. Both ranges start and
+/// end on character boundaries.
+pub fn rope_difference(old: &Rope, new: &Rope) -> (Range<usize>, Range<usize>) {
+    let mut prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !(old.is_char_boundary(prefix) && new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+    let longest_suffix = old.len().min(new.len()) - prefix;
+    let mut suffix = old
+        .bytes_at(old.len())
+        .reversed()
+        .zip(new.bytes_at(new.len()).reversed())
+        .take(longest_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !(old.is_char_boundary(old.len() - suffix) && new.is_char_boundary(new.len() - suffix)) {
+        suffix -= 1;
+    }
+    (prefix..old.len() - suffix, prefix..new.len() - suffix)
+}
+
+/// The LSP position (zero-based line, UTF-16 column) of byte `offset` in a rope whose
+/// lines end with `\n` (for text containing `\r`, use [`position`] on the string).
+pub fn rope_position(text: &Rope, offset: usize) -> (u32, u32) {
+    let line = text.byte_to_line_idx(offset, LineType::LF);
+    let start = text.line_to_byte_idx(line, LineType::LF);
+    let character = text.byte_to_utf16_idx(offset) - text.byte_to_utf16_idx(start);
+    (line as u32, character as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +251,45 @@ mod tests {
         assert_eq!(map_offset(&edits, 2), 4);
         assert_eq!(map_offset(&edits, 5), 7);
         assert_eq!(map_offset(&edits, 8), 9);
+    }
+
+    #[test]
+    fn rope_difference_finds_the_changed_span_on_char_boundaries() {
+        let old = Rope::from("let a = 1;\nlet b = 2;\n");
+        let new = Rope::from("let a = 1;\nlet bee = 2;\n");
+        assert_eq!(rope_difference(&old, &new), (16..16, 16..18));
+        assert_eq!(rope_difference(&old, &old), (22..22, 22..22));
+        assert_eq!(
+            rope_difference(&Rope::from("aaa"), &Rope::from("aa")),
+            (2..3, 2..2)
+        );
+        // "é" (C3 A9) and "è" (C3 A8) share their first byte: the span covers both bytes.
+        assert_eq!(
+            rope_difference(&Rope::from("café!"), &Rope::from("cafè!")),
+            (3..5, 3..5)
+        );
+        // 😀 (F0 9F 98 80) and 😁 (F0 9F 98 81) differ in the last byte only.
+        assert_eq!(
+            rope_difference(&Rope::from("a😀b"), &Rope::from("a😁b")),
+            (1..5, 1..5)
+        );
+        // "ñ" (C3 B1) replaced by "ó" (C3 B3), both followed by the same text.
+        assert_eq!(
+            rope_difference(&Rope::from("ñu"), &Rope::from("óu")),
+            (0..2, 0..2)
+        );
+    }
+
+    #[test]
+    fn rope_positions_count_utf16_units() {
+        let text = Rope::from("a😀b\nxé\n");
+        for offset in [0, 1, 5, 6, 7, 8, 10, 11] {
+            assert_eq!(
+                rope_position(&text, offset),
+                position(&text.to_string(), offset)
+            );
+        }
+        assert_eq!(rope_position(&text, 5), (0, 3));
+        assert_eq!(rope_position(&text, 11), (2, 0));
     }
 }

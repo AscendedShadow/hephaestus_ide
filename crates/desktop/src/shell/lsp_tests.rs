@@ -746,3 +746,140 @@ fn added_roots_become_workspace_folders(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// Apply `textDocument/didChange` notifications the way a server would.
+fn replay_changes(mut text: String, notifications: &[Value]) -> String {
+    for notification in notifications {
+        for change in notification["contentChanges"].as_array().unwrap() {
+            let replacement = change["text"].as_str().unwrap().to_string();
+            text = match change.get("range") {
+                None | Some(Value::Null) => replacement,
+                Some(range) => {
+                    let offset = |position: &Value| {
+                        ide_core::text_edit::offset(
+                            &text,
+                            position["line"].as_u64().unwrap() as u32,
+                            position["character"].as_u64().unwrap() as u32,
+                        )
+                        .unwrap()
+                    };
+                    let (start, end) = (offset(&range["start"]), offset(&range["end"]));
+                    ide_core::text_edit::apply(&text, &[(start..end, replacement)]).unwrap()
+                }
+            };
+        }
+    }
+    text
+}
+
+#[gpui::test]
+fn document_changes_follow_the_servers_sync_kind(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let original = "fn main() {\n    let 😀 = 1;\n}\n";
+    std::fs::write(root.join("main.rs"), original).unwrap();
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    open_file(&shell, &root.join("main.rs"), cx);
+
+    // Incremental: each keystroke sends only the edited span, in UTF-16 positions.
+    let server = mock_lsp::install(
+        &shell,
+        "rust",
+        &root,
+        json!({"textDocumentSync": 2}),
+        Box::new(|_, _| Value::Null),
+        cx,
+    );
+    // `set_cursor` counts characters: column 9 is right after the emoji.
+    set_cursor(&shell, 1, 9, cx);
+    cx.simulate_input("x");
+    set_cursor(&shell, 2, 1, cx);
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("// done");
+    set_cursor(&shell, 0, 2, cx);
+    cx.simulate_keystrokes("backspace");
+    let expected = text(&shell, cx);
+    wait_until(cx, |_| {
+        replay_changes(
+            original.into(),
+            &server.notifications("textDocument/didChange"),
+        ) == expected
+    });
+    let changes = server.notifications("textDocument/didChange");
+    assert!(
+        changes
+            .iter()
+            .all(|change| !change["contentChanges"][0]["range"].is_null()),
+        "every change is incremental: {changes:?}"
+    );
+    let first = &changes[0]["contentChanges"][0];
+    assert_eq!(first["text"], "x");
+    // "    let 😀" is 10 UTF-16 units (the emoji counts as two).
+    assert_eq!(first["range"]["start"], json!({"line": 1, "character": 10}));
+    let versions: Vec<i64> = changes
+        .iter()
+        .map(|change| change["textDocument"]["version"].as_i64().unwrap())
+        .collect();
+    assert!(
+        versions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "{versions:?}"
+    );
+}
+
+#[gpui::test]
+fn full_and_disabled_sync_kinds(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("lib.rs"), "pub fn lib() {}\n").unwrap();
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    open_file(&shell, &root.join("main.rs"), cx);
+    let server = mock_lsp::install(
+        &shell,
+        "rust",
+        &root,
+        json!({"textDocumentSync": 1}),
+        Box::new(|_, _| Value::Null),
+        cx,
+    );
+    set_cursor(&shell, 0, 0, cx);
+    cx.simulate_input("//");
+    let expected = text(&shell, cx);
+    wait_until(cx, |_| {
+        server
+            .notifications("textDocument/didChange")
+            .last()
+            .is_some_and(|change| change["contentChanges"][0]["text"] == expected.as_str())
+    });
+    assert!(
+        server.notifications("textDocument/didChange")[0]["contentChanges"][0]["range"].is_null()
+    );
+
+    // A server that declares no change notifications gets none.
+    shell.update(cx, |shell, cx| {
+        shell.servers.update(cx, |servers, cx| servers.stop(cx))
+    });
+    let quiet = mock_lsp::install(
+        &shell,
+        "rust",
+        &root,
+        json!({"textDocumentSync": {"openClose": true, "change": 0}}),
+        Box::new(|_, _| Value::Null),
+        cx,
+    );
+    wait_until(cx, |_| {
+        !quiet.notifications("textDocument/didOpen").is_empty()
+    });
+    cx.simulate_input("x");
+    open_file(&shell, &root.join("lib.rs"), cx);
+    wait_until(cx, |_| {
+        quiet.notifications("textDocument/didOpen").len() == 2
+    });
+    assert!(quiet.notifications("textDocument/didChange").is_empty());
+}

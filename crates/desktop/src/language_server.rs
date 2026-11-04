@@ -15,6 +15,7 @@ use lsp_types::{
 use crate::{navigation, settings::LanguageServer, syntax};
 
 mod features;
+mod sync;
 
 pub use features::{Features, RequestOrigin};
 
@@ -67,6 +68,8 @@ struct Document {
     version: i32,
     /// The text last sent to the server (ropes share storage, so this is cheap).
     text: Rope,
+    /// The text sent so far may contain `\r` (then changes are sent as full text).
+    may_contain_cr: bool,
 }
 
 #[derive(Default)]
@@ -317,6 +320,11 @@ impl Servers {
         {
             return;
         }
+        let kind = sync::change_kind(
+            self.client(language)
+                .and_then(lsp::Client::capabilities)
+                .as_ref(),
+        );
         let opened = self.documents.contains_key(path);
         let document = self
             .documents
@@ -326,35 +334,48 @@ impl Servers {
                 language,
                 version: 0,
                 text: Rope::new(),
+                may_contain_cr: false,
             });
+        let previous = std::mem::replace(&mut document.text, text.clone());
+        let changes = if opened {
+            sync::content_changes(&previous, text, kind, document.may_contain_cr)
+        } else {
+            None
+        };
+        if let Some(changes) = &changes {
+            document.may_contain_cr |= changes.iter().any(|change| change.text.contains('\r'));
+        } else if !opened {
+            document.may_contain_cr = text.bytes().any(|byte| byte == b'\r');
+        } else {
+            // The server does not want changes (sync kind `None`).
+            return;
+        }
         document.version += 1;
-        document.text = text.clone();
         let version = document.version;
         let Some(client) = self.client(language) else {
             return;
         };
-        if opened {
-            client.notify::<lsp_types::notification::DidChangeTextDocument>(
-                lsp_types::DidChangeTextDocumentParams {
-                    text_document: lsp_types::VersionedTextDocumentIdentifier { uri, version },
-                    content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
-                        range: None,
-                        range_length: None,
-                        text: text.to_string(),
-                    }],
-                },
-            );
-        } else {
-            client.notify::<lsp_types::notification::DidOpenTextDocument>(
-                lsp_types::DidOpenTextDocumentParams {
-                    text_document: lsp_types::TextDocumentItem {
-                        uri,
-                        language_id: language_id(language).into(),
-                        version,
-                        text: text.to_string(),
+        match changes {
+            Some(content_changes) => {
+                client.notify::<lsp_types::notification::DidChangeTextDocument>(
+                    lsp_types::DidChangeTextDocumentParams {
+                        text_document: lsp_types::VersionedTextDocumentIdentifier { uri, version },
+                        content_changes,
                     },
-                },
-            );
+                );
+            }
+            None => {
+                client.notify::<lsp_types::notification::DidOpenTextDocument>(
+                    lsp_types::DidOpenTextDocumentParams {
+                        text_document: lsp_types::TextDocumentItem {
+                            uri,
+                            language_id: language_id(language).into(),
+                            version,
+                            text: text.to_string(),
+                        },
+                    },
+                );
+            }
         }
     }
 

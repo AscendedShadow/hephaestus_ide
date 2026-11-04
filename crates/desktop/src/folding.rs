@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use gpui_component::Rope;
+pub use ide_core::text_edit::rope_difference;
 
 pub const PLACEHOLDER: &str = "...";
 
@@ -78,25 +79,6 @@ pub fn unfold_range(source: &str, folds: &mut Vec<Fold>, range: Range<usize>) ->
         cursor: source_to_display(folds, range.start),
         folded: false,
     })
-}
-
-/// The changed span between two ropes, as (range in `old`, range in `new`) byte
-/// ranges, found by comparing from both ends without copying either text.
-pub fn rope_difference(old: &Rope, new: &Rope) -> (Range<usize>, Range<usize>) {
-    let prefix = old
-        .bytes()
-        .zip(new.bytes())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let longest_suffix = old.len().min(new.len()) - prefix;
-    let suffix = old
-        .bytes_at(old.len())
-        .reversed()
-        .zip(new.bytes_at(new.len()).reversed())
-        .take(longest_suffix)
-        .take_while(|(a, b)| a == b)
-        .count();
-    (prefix..old.len() - suffix, prefix..new.len() - suffix)
 }
 
 /// Bring the source in line with an edit shown in the editor when nothing is folded:
@@ -599,13 +581,9 @@ mod tests {
     }
 
     #[test]
-    fn rope_difference_finds_the_changed_span() {
+    fn unfolded_edits_share_the_rope_unless_they_touch_a_placeholder() {
         let old = Rope::from("let a = 1;\nlet b = 2;\n");
         let new = Rope::from("let a = 1;\nlet bee = 2;\n");
-        assert_eq!(rope_difference(&old, &new), (16..16, 16..18));
-        assert_eq!(rope_difference(&old, &old), (22..22, 22..22));
-        let shorter = Rope::from("aa");
-        assert_eq!(rope_difference(&Rope::from("aaa"), &shorter), (2..3, 2..2));
         assert_eq!(apply_unfolded_edit(&old, &old), None);
         assert_eq!(apply_unfolded_edit(&old, &new), Some(Some(new.clone())));
         let dotted = Rope::from("let a = 1;\nlet b...= 2;\n");
