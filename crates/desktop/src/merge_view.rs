@@ -2,8 +2,8 @@ use std::{io, ops::Range, path::PathBuf};
 
 use gpui::{
     AnyElement, Context, Entity, EntityInputHandler as _, EventEmitter, FontWeight, Hsla,
-    IntoElement, ListHorizontalSizingBehavior, Pixels, Render, ScrollStrategy, Subscription,
-    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    IntoElement, ListHorizontalSizingBehavior, Pixels, Render, ScrollStrategy, Subscription, Task,
+    UniformListScrollHandle, Window, canvas, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
     Disableable as _, Icon, IconName, RopeExt as _, Sizable as _,
@@ -139,6 +139,8 @@ pub struct MergeView {
     result: Entity<InputState>,
     panes: [Pane; 2],
     active: usize,
+    cursor_conflict: Option<usize>,
+    scroll_top: Option<Pixels>,
     notice: Option<Notice>,
     busy: bool,
     vertical_split: Entity<ResizableState>,
@@ -186,6 +188,8 @@ impl MergeView {
             merge,
             result,
             active: 0,
+            cursor_conflict: None,
+            scroll_top: None,
             notice: None,
             busy: false,
             vertical_split: cx.new(|_| ResizableState::default()),
@@ -194,6 +198,14 @@ impl MergeView {
         };
         view.mark_conflicts(cx);
         view
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.merge.text() != self.document.text()
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy
     }
 
     fn sync_result(&mut self, cx: &mut Context<Self>) {
@@ -289,6 +301,8 @@ impl MergeView {
         self.result
             .update(cx, |editor, cx| editor.set_value(text, window, cx));
         self.active = 0;
+        self.cursor_conflict = None;
+        self.scroll_top = None;
         self.notice = Some(Notice::Info("Reset the result to the file on disk".into()));
         self.mark_conflicts(cx);
         cx.notify();
@@ -304,30 +318,85 @@ impl MergeView {
     }
 
     fn reveal(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_panes(ix, ScrollStrategy::Center, cx);
+        self.sync_result(cx);
+        let offset = self.merge.range(ix).start;
+        self.cursor_conflict = self.conflict_at(offset);
+        self.result
+            .update(cx, |editor, cx| editor.reveal(offset, window, cx));
+    }
+
+    fn scroll_panes(&mut self, ix: usize, strategy: ScrollStrategy, cx: &mut Context<Self>) {
         self.active = ix;
         for pane in &self.panes {
             if let Some(row) = pane.header_row(ix) {
-                pane.scroll.scroll_to_item(row, ScrollStrategy::Center);
+                pane.scroll.scroll_to_item(row, strategy);
             }
         }
-        self.sync_result(cx);
-        let offset = self.merge.range(ix).start;
-        self.result
-            .update(cx, |editor, cx| editor.reveal(offset, window, cx));
         cx.notify();
     }
 
+    fn conflict_at(&self, offset: usize) -> Option<usize> {
+        (0..self.merge.conflicts().len()).find(|&ix| {
+            let range = self.merge.range(ix);
+            range.contains(&offset) || (range.is_empty() && range.start == offset)
+        })
+    }
+
+    fn follow_result(&mut self, cx: &mut Context<Self>) {
+        if self.merge.conflicts().is_empty() {
+            return;
+        }
+        let editor = self.result.read(cx);
+        let cursor = self.conflict_at(editor.cursor());
+        let viewport = editor.text_geometry().map(|geometry| {
+            let top = editor.index_for_mouse_position(geometry.viewport.origin);
+            let bottom = editor.index_for_mouse_position(geometry.viewport.bottom_left());
+            (geometry.origin.y - geometry.viewport.top(), top..bottom)
+        });
+        let moved = cursor != self.cursor_conflict;
+        self.cursor_conflict = cursor;
+        let scrolled = match &viewport {
+            Some((top, _)) => self.scroll_top.replace(*top) != Some(*top),
+            None => false,
+        };
+        if moved && let Some(ix) = cursor {
+            self.scroll_panes(ix, ScrollStrategy::Top, cx);
+            return;
+        }
+        let Some((_, visible)) = viewport.filter(|_| scrolled) else {
+            return;
+        };
+        let shown = |ix: usize| {
+            let range = self.merge.range(ix);
+            range.start <= visible.end && range.end >= visible.start
+        };
+        if !shown(self.active)
+            && let Some(ix) = (0..self.merge.conflicts().len()).find(|&ix| shown(ix))
+        {
+            self.scroll_panes(ix, ScrollStrategy::Top, cx);
+        }
+    }
+
     pub(crate) fn save(&mut self, cx: &mut Context<Self>) {
-        self.write(false, cx);
+        if let Some(task) = self.write(false, cx) {
+            task.detach();
+        }
+    }
+
+    pub(crate) fn save_task(&mut self, cx: &mut Context<Self>) -> Option<Task<bool>> {
+        self.write(false, cx)
     }
 
     pub(crate) fn complete(&mut self, cx: &mut Context<Self>) {
-        self.write(true, cx);
+        if let Some(task) = self.write(true, cx) {
+            task.detach();
+        }
     }
 
-    fn write(&mut self, stage: bool, cx: &mut Context<Self>) {
+    fn write(&mut self, stage: bool, cx: &mut Context<Self>) -> Option<Task<bool>> {
         if self.busy {
-            return;
+            return None;
         }
         self.sync_result(cx);
         if stage {
@@ -339,14 +408,14 @@ impl MergeView {
                     conflicts(remaining)
                 )));
                 cx.notify();
-                return;
+                return None;
             }
             if leftover > 0 {
                 self.notice = Some(Notice::Error(
                     "The result still contains conflict markers".into(),
                 ));
                 cx.notify();
-                return;
+                return None;
             }
         }
         let mut document = self.document.clone();
@@ -356,7 +425,7 @@ impl MergeView {
             self.repository.clone(),
             self.file.clone(),
         );
-        self.run(
+        Some(self.run(
             move || {
                 let document = document.save_to(&path)?;
                 if stage {
@@ -366,7 +435,7 @@ impl MergeView {
             },
             stage,
             cx,
-        );
+        ))
     }
 
     fn mark_resolved(&mut self, cx: &mut Context<Self>) {
@@ -374,7 +443,8 @@ impl MergeView {
             return;
         }
         let (repository, file) = (self.repository.clone(), self.file.clone());
-        self.run(move || repository.stage(&[file]).map(|()| None), true, cx);
+        self.run(move || repository.stage(&[file]).map(|()| None), true, cx)
+            .detach();
     }
 
     fn run(
@@ -382,15 +452,16 @@ impl MergeView {
         operation: impl FnOnce() -> io::Result<Option<Document>> + Send + 'static,
         resolved: bool,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<bool> {
         self.busy = true;
         self.notice = None;
         cx.notify();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let result = executor.spawn(async move { operation() }).await;
-            let _ = this.update(cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.busy = false;
+                let written = result.is_ok();
                 match result {
                     Ok(document) => {
                         if let Some(document) = document {
@@ -407,9 +478,10 @@ impl MergeView {
                     Err(error) => this.notice = Some(Notice::Error(error.to_string())),
                 }
                 cx.notify();
-            });
+                written
+            })
+            .unwrap_or(false)
         })
-        .detach();
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -703,6 +775,7 @@ impl MergeView {
                 theme::git_change(ide_core::git::Change::Conflicted),
             )
         };
+        let view = cx.entity().downgrade();
         div()
             .size_full()
             .flex()
@@ -750,19 +823,33 @@ impl MergeView {
                     ),
             )
             .child(
-                div().flex_1().min_h_0().child(
-                    Input::new(&self.result)
-                        .h_full()
-                        .w_full()
-                        .bordered(false)
-                        .focus_bordered(false)
-                        .appearance(false)
-                        .disabled(self.busy)
-                        .font_family(theme::mono_family())
-                        .text_size(px(TEXT_SIZE))
-                        .bg(theme::background())
-                        .text_color(theme::text()),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        Input::new(&self.result)
+                            .h_full()
+                            .w_full()
+                            .bordered(false)
+                            .focus_bordered(false)
+                            .appearance(false)
+                            .disabled(self.busy)
+                            .font_family(theme::mono_family())
+                            .text_size(px(TEXT_SIZE))
+                            .bg(theme::background())
+                            .text_color(theme::text()),
+                    )
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, _, cx| {
+                                cx.defer(move |cx| {
+                                    let _ = view.update(cx, |view, cx| view.follow_result(cx));
+                                })
+                            },
+                        )
+                        .absolute(),
+                    ),
             )
     }
 

@@ -2,7 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use super::*;
 use crate::git_panel::tests::{git, repository};
-use gpui::{TestAppContext, VisualTestContext};
+use gpui::{ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext, point, size};
 use gpui_component::{Root, ThemeMode, input::Position};
 
 const BASE: &str = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
@@ -26,23 +26,27 @@ fn merge_fails(root: &Path, branch: &str) {
 }
 
 pub(crate) fn conflicted_repository() -> (tempfile::TempDir, std::path::PathBuf) {
+    conflicted_repository_with(BASE)
+}
+
+fn conflicted_repository_with(base: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = repository();
     let root = directory.path().canonicalize().unwrap();
     git(&root, &["config", "merge.conflictStyle", "merge"]);
-    fs::write(root.join("notes.txt"), BASE).unwrap();
+    fs::write(root.join("notes.txt"), base).unwrap();
     git(&root, &["add", "-A"]);
     git(&root, &["commit", "-q", "-m", "Notes"]);
     git(&root, &["checkout", "-q", "-b", "feature"]);
     fs::write(
         root.join("notes.txt"),
-        edit(BASE, "beta feature", "theta feature"),
+        edit(base, "beta feature", "theta feature"),
     )
     .unwrap();
     git(&root, &["commit", "-q", "-am", "Feature"]);
     git(&root, &["checkout", "-q", "main"]);
     fs::write(
         root.join("notes.txt"),
-        edit(BASE, "beta main", "theta main"),
+        edit(base, "beta main", "theta main"),
     )
     .unwrap();
     git(&root, &["commit", "-q", "-am", "Main"]);
@@ -223,4 +227,125 @@ fn files_without_markers_can_be_marked_resolved(cx: &mut TestAppContext) {
         fs::read_to_string(root.join("notes.txt")).unwrap(),
         "resolved by hand\n"
     );
+}
+
+fn spaced_base() -> String {
+    let filler = |name: &str| {
+        (0..100)
+            .map(|ix| format!("{name} {ix}\n"))
+            .collect::<String>()
+    };
+    format!("alpha\nbeta\n{}theta\n{}", filler("middle"), filler("tail"))
+}
+
+fn active(view: &Entity<MergeView>, cx: &mut VisualTestContext) -> usize {
+    cx.read(|cx| view.read(cx).active)
+}
+
+fn pane_tops(view: &Entity<MergeView>, cx: &mut VisualTestContext) -> Vec<usize> {
+    cx.read(|cx| {
+        view.read(cx)
+            .panes
+            .iter()
+            .map(|pane| {
+                let offset = pane.scroll.0.borrow().base_handle.offset();
+                (-offset.y / px(ROW_HEIGHT)).round() as usize
+            })
+            .collect()
+    })
+}
+
+fn headers(view: &Entity<MergeView>, conflict: usize, cx: &mut VisualTestContext) -> Vec<usize> {
+    cx.read(|cx| {
+        view.read(cx)
+            .panes
+            .iter()
+            .map(|pane| pane.header_row(conflict).unwrap())
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn side_panes_follow_the_result_cursor_and_scroll(cx: &mut TestAppContext) {
+    let (_directory, root) = conflicted_repository_with(&spaced_base());
+    let (view, cx) = open(cx, &root);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    cx.run_until_parked();
+    assert_eq!(active(&view, cx), 0);
+    assert_eq!(pane_tops(&view, cx), [0, 0]);
+
+    let text = result(&view, cx);
+    let second = text[..text.rfind("<<<<<<<").unwrap()].matches('\n').count() as u32;
+    let editor = cx.read(|cx| view.read(cx).result.clone());
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_cursor_position(Position::new(second + 1, 2), window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(active(&view, cx), 1);
+    assert_eq!(pane_tops(&view, cx), headers(&view, 1, cx));
+
+    let scroll = |lines: f32, cx: &mut VisualTestContext| {
+        let viewport = cx
+            .read(|cx| editor.read(cx).text_geometry())
+            .unwrap()
+            .viewport;
+        cx.simulate_event(ScrollWheelEvent {
+            position: viewport.center(),
+            delta: ScrollDelta::Lines(point(0., lines)),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+    };
+    scroll(1000., cx);
+    assert_eq!(active(&view, cx), 0);
+    assert_eq!(pane_tops(&view, cx), headers(&view, 0, cx));
+
+    scroll(-(second as f32 - 3.), cx);
+    assert_eq!(active(&view, cx), 1);
+    assert_eq!(pane_tops(&view, cx), headers(&view, 1, cx));
+
+    view.update_in(cx, |view, window, cx| view.navigate(-1, window, cx));
+    cx.run_until_parked();
+    assert_eq!(active(&view, cx), 0);
+    cx.read(|cx| {
+        let editor = view.read(cx).result.read(cx);
+        assert_eq!(editor.cursor_position().line, 1);
+    });
+}
+
+#[gpui::test]
+fn the_result_is_dirty_until_it_matches_the_saved_file(cx: &mut TestAppContext) {
+    let (_directory, root) = conflicted_repository();
+    let (view, cx) = open(cx, &root);
+    let dirty = |cx: &mut VisualTestContext| cx.read(|cx| view.read(cx).is_dirty());
+    assert!(!dirty(cx));
+
+    view.update_in(cx, |view, window, cx| {
+        view.resolve(0, Choice::Incoming, window, cx)
+    });
+    assert!(dirty(cx));
+    view.update_in(cx, |view, window, cx| {
+        view.resolve(0, Choice::Unresolved, window, cx)
+    });
+    assert!(!dirty(cx));
+
+    view.update_in(cx, |view, window, cx| {
+        view.resolve(1, Choice::Current, window, cx)
+    });
+    let saved = view.update(cx, |view, cx| view.save_task(cx)).unwrap();
+    assert!(cx.read(|cx| view.read(cx).is_busy()));
+    assert!(view.update(cx, |view, cx| view.save_task(cx)).is_none());
+    cx.run_until_parked();
+    assert!(cx.executor().block_test(saved));
+    assert!(!dirty(cx));
+
+    let editor = cx.read(|cx| view.read(cx).result.clone());
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_cursor_position(Position::new(0, 0), window, cx)
+    });
+    cx.simulate_input("X");
+    cx.run_until_parked();
+    assert!(dirty(cx));
+    view.update_in(cx, |view, window, cx| view.reset(window, cx));
+    assert!(!dirty(cx));
 }

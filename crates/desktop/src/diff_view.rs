@@ -37,6 +37,7 @@ pub struct DiffView {
     conflicted: bool,
     merge_source: Option<MergeSource>,
     merge: Option<(Selection, Entity<MergeView>, Subscription)>,
+    deferred: Option<(Repository, Selection, FileStatus)>,
     widest_line: usize,
     scroll: UniformListScrollHandle,
     task: Option<Task<()>>,
@@ -59,6 +60,7 @@ impl DiffView {
             conflicted: false,
             merge_source: None,
             merge: None,
+            deferred: None,
             widest_line: 0,
             scroll: UniformListScrollHandle::new(),
             task: None,
@@ -82,6 +84,39 @@ impl DiffView {
             (Some(target), Some((shown, view, _))) if target == shown => Some(view),
             _ => None,
         }
+    }
+
+    pub(crate) fn has_unsaved_merge(&self, cx: &App) -> bool {
+        self.merge_view()
+            .is_some_and(|view| view.read(cx).is_dirty())
+    }
+
+    pub(crate) fn merge_busy(&self, cx: &App) -> bool {
+        self.merge_view()
+            .is_some_and(|view| view.read(cx).is_busy())
+    }
+
+    pub(crate) fn switching(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    pub(crate) fn save_merge(&mut self, cx: &mut Context<Self>) -> Option<Task<bool>> {
+        self.merge_view()
+            .cloned()?
+            .update(cx, |view, cx| view.save_task(cx))
+    }
+
+    pub(crate) fn finish_switch(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((repository, target, file)) = self.deferred.take() else {
+            return false;
+        };
+        self.show(repository, target, file, cx);
+        true
+    }
+
+    pub(crate) fn cancel_switch(&mut self) -> Option<Selection> {
+        self.deferred.take()?;
+        self.target.clone()
     }
 
     pub fn title(&self) -> Option<String> {
@@ -108,6 +143,21 @@ impl DiffView {
         file: FileStatus,
         cx: &mut Context<Self>,
     ) {
+        if self.target.as_ref() != Some(&target) && self.has_unsaved_merge(cx) {
+            self.deferred = Some((repository, target, file));
+            return;
+        }
+        self.show(repository, target, file, cx);
+    }
+
+    fn show(
+        &mut self,
+        repository: Repository,
+        target: Selection,
+        file: FileStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.deferred = None;
         if !target.staged && file.unstaged == Some(Change::Conflicted) {
             self.load_merge(repository, target, file, cx);
             return;
@@ -211,6 +261,7 @@ impl DiffView {
         self.conflicted = false;
         self.merge_source = None;
         self.merge = None;
+        self.deferred = None;
         self.task = None;
         cx.notify();
     }

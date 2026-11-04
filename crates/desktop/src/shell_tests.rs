@@ -987,6 +987,135 @@ fn conflicted_files_open_in_the_merge_editor(cx: &mut TestAppContext) {
     assert_eq!(git(&root, &["diff", "--name-only", "--diff-filter=U"]), "");
 }
 
+fn open_merge<'a>(
+    root: &Path,
+    cx: &'a mut TestAppContext,
+) -> (
+    Entity<IdeShell>,
+    Entity<crate::merge_view::MergeView>,
+    &'a mut VisualTestContext,
+) {
+    let (shell, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(800.)));
+    let workspace = ide_core::workspace::Workspace::open(root).unwrap();
+    shell.update(cx, |shell, cx| shell.set_workspace(workspace, cx));
+    cx.simulate_keystrokes(&primary("shift-g"));
+    cx.run_until_parked();
+    click_git_row(cx, "git-row-1");
+    let view = merge_view(&shell, cx).unwrap();
+    view.update_in(cx, |view, window, cx| {
+        view.accept_all(ide_core::merge::Side::Incoming, window, cx)
+    });
+    (shell, view, cx)
+}
+
+fn click_git_row(cx: &mut VisualTestContext, selector: &'static str) {
+    let row = cx.debug_bounds(selector).unwrap();
+    cx.simulate_click(row.center(), Modifiers::none());
+    cx.run_until_parked();
+}
+
+fn merge_view(
+    shell: &Entity<IdeShell>,
+    cx: &mut VisualTestContext,
+) -> Option<Entity<crate::merge_view::MergeView>> {
+    cx.read(|cx| shell.read(cx).diff_view.read(cx).merge_view().cloned())
+}
+
+fn pending(shell: &Entity<IdeShell>, cx: &mut VisualTestContext) -> Option<PendingAction> {
+    cx.read(|cx| shell.read(cx).pending)
+}
+
+#[gpui::test]
+fn closing_a_merge_with_unsaved_picks_asks_to_save(cx: &mut TestAppContext) {
+    use crate::merge_view::tests::conflicted_repository;
+
+    let (_directory, root) = conflicted_repository();
+    let (shell, view, cx) = open_merge(&root, cx);
+    let on_disk = || std::fs::read_to_string(root.join("notes.txt")).unwrap();
+    let original = on_disk();
+
+    cx.simulate_keystrokes(&primary("w"));
+    assert_eq!(pending(&shell, cx), Some(PendingAction::LeaveDiff));
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*notes.txt (Merging)"]);
+    shell.update_in(cx, |shell, window, cx| shell.cancel_pending(window, cx));
+    assert_eq!(pending(&shell, cx), None);
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*notes.txt (Merging)"]);
+    assert_eq!(merge_view(&shell, cx), Some(view.clone()));
+
+    let diff_tab = cx.debug_bounds("diff-tab").unwrap();
+    cx.simulate_mouse_down(diff_tab.center(), MouseButton::Middle, Modifiers::none());
+    cx.simulate_mouse_up(diff_tab.center(), MouseButton::Middle, Modifiers::none());
+    assert_eq!(pending(&shell, cx), Some(PendingAction::LeaveDiff));
+    shell.update_in(cx, |shell, window, cx| shell.discard(window, cx));
+    cx.run_until_parked();
+    assert_eq!(pending(&shell, cx), None);
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
+    assert_eq!(on_disk(), original);
+
+    click_git_row(cx, "git-row-1");
+    let view = merge_view(&shell, cx).unwrap();
+    cx.simulate_keystrokes(&primary("w"));
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
+    click_git_row(cx, "git-row-1");
+    let view = {
+        let reopened = merge_view(&shell, cx).unwrap();
+        assert_ne!(reopened, view);
+        reopened
+    };
+    view.update_in(cx, |view, window, cx| {
+        view.accept_all(ide_core::merge::Side::Incoming, window, cx)
+    });
+    cx.simulate_keystrokes(&primary("w"));
+    assert_eq!(pending(&shell, cx), Some(PendingAction::LeaveDiff));
+    shell.update_in(cx, |shell, window, cx| shell.save_pending(window, cx));
+    cx.run_until_parked();
+    assert_eq!(pending(&shell, cx), None);
+    assert_eq!(tabs(&shell, cx), ["*Untitled"]);
+    let saved = on_disk();
+    assert!(saved.contains("beta feature\n") && !saved.contains("<<<<<<<"));
+}
+
+#[gpui::test]
+fn switching_git_files_asks_before_dropping_merge_picks(cx: &mut TestAppContext) {
+    use crate::merge_view::tests::conflicted_repository;
+
+    let (_directory, root) = conflicted_repository();
+    std::fs::write(root.join("zzz.txt"), "new\n").unwrap();
+    let (shell, view, cx) = open_merge(&root, cx);
+    let switching =
+        |cx: &mut VisualTestContext| cx.read(|cx| shell.read(cx).diff_view.read(cx).switching());
+
+    click_git_row(cx, "git-row-2");
+    assert_eq!(pending(&shell, cx), Some(PendingAction::LeaveDiff));
+    assert!(switching(cx));
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*notes.txt (Merging)"]);
+    assert_eq!(merge_view(&shell, cx), Some(view.clone()));
+
+    shell.update_in(cx, |shell, window, cx| shell.cancel_pending(window, cx));
+    cx.run_until_parked();
+    assert_eq!(pending(&shell, cx), None);
+    assert!(!switching(cx));
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*notes.txt (Merging)"]);
+    assert_eq!(merge_view(&shell, cx), Some(view.clone()));
+    shell.update(cx, |shell, cx| shell.refresh_git(cx));
+    cx.run_until_parked();
+    assert_eq!(merge_view(&shell, cx), Some(view.clone()));
+
+    click_git_row(cx, "git-row-2");
+    assert_eq!(pending(&shell, cx), Some(PendingAction::LeaveDiff));
+    shell.update_in(cx, |shell, window, cx| shell.discard(window, cx));
+    cx.run_until_parked();
+    assert_eq!(pending(&shell, cx), None);
+    assert_eq!(tabs(&shell, cx), ["Untitled", "*zzz.txt (Unstaged)"]);
+    assert_eq!(merge_view(&shell, cx), None);
+    assert!(
+        std::fs::read_to_string(root.join("notes.txt"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+}
+
 #[gpui::test]
 fn panel_shortcuts_do_not_enter_vim_commands(cx: &mut TestAppContext) {
     let (shell, cx) = setup(cx);
