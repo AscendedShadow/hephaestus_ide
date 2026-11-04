@@ -2,6 +2,7 @@ pub mod document;
 pub mod editing;
 pub mod editorconfig;
 pub mod git;
+pub mod git_ops;
 pub mod glob;
 pub mod language;
 pub mod merge;

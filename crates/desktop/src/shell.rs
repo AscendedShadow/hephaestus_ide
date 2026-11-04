@@ -62,6 +62,7 @@ mod edits;
 mod encoding;
 mod explorer;
 mod fs_sync;
+mod git_features;
 mod language_mode;
 mod line_commands;
 mod lsp_features;
@@ -361,6 +362,7 @@ pub struct IdeShell {
     attach_profile: Option<settings::DebuggerConfig>,
     tasks: tasks::TaskState,
     problems: problems::ProblemsState,
+    git_state: git_features::GitState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -438,6 +440,7 @@ impl IdeShell {
             attach_profile: None,
             tasks: Default::default(),
             problems: Default::default(),
+            git_state: Default::default(),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
@@ -1733,6 +1736,7 @@ impl IdeShell {
                         if let Some(action) = then {
                             this.perform(action, window, cx);
                         }
+                        this.resume_pending_switch(window, cx);
                     }
                 }
                 this.focus_editor(window, cx);
@@ -4222,7 +4226,12 @@ impl IdeShell {
                     self.show_sidebar && self.active_sidebar == SidebarPanel::Git,
                 )
                 .child(Icon::new(AppIcon::GitBranch).size(px(13.)))
-                .child("Git")
+                .child(
+                    self.git
+                        .read(cx)
+                        .branch_label()
+                        .unwrap_or_else(|| "Git".into()),
+                )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(SidebarPanel::Git, cx))),
             )
             .child(
@@ -4461,6 +4470,13 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::show_problems))
             .on_action(cx.listener(Self::next_problem))
             .on_action(cx.listener(Self::previous_problem))
+            .on_action(cx.listener(Self::switch_branch))
+            .on_action(cx.listener(Self::show_history))
+            .on_action(cx.listener(Self::show_file_history))
+            .on_action(cx.listener(Self::blame_line))
+            .on_action(cx.listener(Self::blame_file))
+            .on_action(cx.listener(Self::stage_hunk))
+            .on_action(cx.listener(Self::unstage_hunk))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

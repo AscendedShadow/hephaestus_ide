@@ -119,7 +119,14 @@ actions!(
         RerunLastTask,
         ShowProblems,
         NextProblem,
-        PreviousProblem
+        PreviousProblem,
+        SwitchBranch,
+        ShowHistory,
+        ShowFileHistory,
+        BlameLine,
+        BlameFile,
+        StageHunk,
+        UnstageHunk
     ]
 );
 
@@ -260,6 +267,13 @@ commands! {
     ShowProblems => ShowProblems,
     NextProblem => NextProblem,
     PreviousProblem => PreviousProblem,
+    SwitchBranch => SwitchBranch,
+    ShowHistory => ShowHistory,
+    ShowFileHistory => ShowFileHistory,
+    BlameLine => BlameLine,
+    BlameFile => BlameFile,
+    StageHunk => StageHunk,
+    UnstageHunk => UnstageHunk,
 }
 
 impl Command {

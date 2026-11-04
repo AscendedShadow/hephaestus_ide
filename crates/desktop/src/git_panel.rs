@@ -318,6 +318,23 @@ impl GitPanel {
         cx.notify();
     }
 
+    pub(crate) fn repository_handle(&self) -> Option<Repository> {
+        self.repository.clone()
+    }
+
+    /// The status of a file by repository-relative path.
+    pub(crate) fn file_status(&self, relative: &str) -> Option<FileStatus> {
+        self.status
+            .files
+            .iter()
+            .find(|file| file.relative == relative)
+            .cloned()
+    }
+
+    pub(crate) fn branch_label(&self) -> Option<String> {
+        self.repository.as_ref().map(|_| self.status.branch.label())
+    }
+
     fn file(&self, selection: &Selection) -> Option<&FileStatus> {
         self.status.files.iter().find(|file| {
             file.relative == selection.relative && side(file, selection.staged).is_some()
@@ -474,8 +491,22 @@ impl GitPanel {
         } else {
             self.run(
                 move || {
-                    repository.stage(&files)?;
-                    repository.commit_files(&files, &message)
+                    // A partially staged file (hunks staged individually) is committed as
+                    // staged: re-adding it would include its unstaged hunks. In that case
+                    // the commit takes exactly the index.
+                    let (partial, whole): (Vec<_>, Vec<_>) = files
+                        .iter()
+                        .cloned()
+                        .partition(|file| file.staged.is_some() && file.unstaged.is_some());
+                    if partial.is_empty() {
+                        repository.stage(&files)?;
+                        repository.commit_files(&files, &message)
+                    } else {
+                        if !whole.is_empty() {
+                            repository.stage(&whole)?;
+                        }
+                        repository.commit_staged(&message)
+                    }
                 },
                 |this, summary, window, cx| {
                     this.notice = Some(Notice::Info(summary));

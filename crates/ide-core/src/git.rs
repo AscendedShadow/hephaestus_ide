@@ -530,7 +530,7 @@ impl Repository {
         self.write_commit(message, &paths)
     }
 
-    fn write_commit(&self, message: &str, paths: &[&str]) -> io::Result<String> {
+    pub(crate) fn write_commit(&self, message: &str, paths: &[&str]) -> io::Result<String> {
         let mut command = self.command();
         command.args(["commit", "--file=-"]);
         if !paths.is_empty() {
@@ -643,11 +643,11 @@ impl Repository {
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
     }
 
-    fn command(&self) -> Command {
+    pub(crate) fn command(&self) -> Command {
         git(&self.root)
     }
 
-    fn output<I, S>(&self, args: I) -> io::Result<Output>
+    pub(crate) fn output<I, S>(&self, args: I) -> io::Result<Output>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -655,7 +655,7 @@ impl Repository {
         self.command().args(args).output().map_err(not_installed)
     }
 
-    fn run<I, S>(&self, args: I) -> io::Result<Vec<u8>>
+    pub(crate) fn run<I, S>(&self, args: I) -> io::Result<Vec<u8>>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -692,7 +692,7 @@ fn git(directory: &Path) -> Command {
     command
 }
 
-fn not_installed(error: io::Error) -> io::Error {
+pub(crate) fn not_installed(error: io::Error) -> io::Error {
     if error.kind() == io::ErrorKind::NotFound {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -703,7 +703,7 @@ fn not_installed(error: io::Error) -> io::Error {
     }
 }
 
-fn failure(output: &Output) -> io::Error {
+pub(crate) fn failure(output: &Output) -> io::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines = || {
