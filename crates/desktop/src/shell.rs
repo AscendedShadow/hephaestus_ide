@@ -59,6 +59,7 @@ mod editor_preferences;
 mod edits;
 mod language_mode;
 mod line_commands;
+mod project_search;
 mod settings_commands;
 
 #[cfg(test)]
@@ -101,6 +102,7 @@ enum SidebarPanel {
     #[default]
     Folder,
     Git,
+    Search,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -115,7 +117,6 @@ enum ToolPanel {
 enum SearchMode {
     Files,
     Commands,
-    Project,
     File,
     Tasks,
     Diagnostics,
@@ -304,6 +305,8 @@ pub struct IdeShell {
     auto_save: autosave::AutoSaveState,
     /// Appended to the status when the running Save All finishes.
     save_all_note: Option<String>,
+    search_panel: Entity<crate::search_panel::SearchPanel>,
+    search_state: project_search::SearchState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -359,9 +362,13 @@ impl IdeShell {
             pending_hit: None,
             auto_save: Default::default(),
             save_all_note: None,
+            search_panel: cx.new(|cx| crate::search_panel::SearchPanel::new(window, cx)),
+            search_state: Default::default(),
             _subscriptions: Vec::new(),
         };
+        let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
         shell._subscriptions = vec![
+            search_subscription,
             cx.subscribe_in(&shell.servers.clone(), window, |this, _, event, _, cx| {
                 this.handle_server_event(event, cx)
             }),
@@ -1778,6 +1785,7 @@ impl IdeShell {
 
     fn index_workspace(&mut self, cx: &mut Context<Self>) {
         self.search_paths.clear();
+        self.invalidate_search_files();
         let Some(root) = self.workspace.root().map(Path::to_path_buf) else {
             return;
         };
@@ -1821,10 +1829,6 @@ impl IdeShell {
         self.show_search(SearchMode::Commands, window, cx);
     }
 
-    fn search_project(&mut self, _: &SearchProject, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_search(SearchMode::Project, window, cx);
-    }
-
     fn show_diagnostics(
         &mut self,
         _: &ShowDiagnostics,
@@ -1847,55 +1851,6 @@ impl IdeShell {
         self.search_hits.clear();
         self.search_selected = 0;
         match self.search_mode {
-            Some(SearchMode::Project) if !query.is_empty() => {
-                let paths = self.search_paths.clone();
-                let open: Vec<_> =
-                    self.buffers
-                        .iter()
-                        .filter_map(|buffer| {
-                            buffer.document.path().map(|path| {
-                                (path.to_path_buf(), buffer.document.text().to_string())
-                            })
-                        })
-                        .collect();
-                let executor = cx.background_executor().clone();
-                let search_query = query.clone();
-                self.search_task = cx.spawn(async move |this, cx| {
-                    let hits = executor
-                        .spawn({
-                            let query = search_query.clone();
-                            async move {
-                                let mut hits = Vec::new();
-                                for (path, source) in &open {
-                                    hits.extend(search::search_source(
-                                        path,
-                                        source,
-                                        &query,
-                                        200 - hits.len(),
-                                    ));
-                                    if hits.len() == 200 {
-                                        return hits;
-                                    }
-                                }
-                                let closed: Vec<_> = paths
-                                    .into_iter()
-                                    .filter(|path| !open.iter().any(|(opened, _)| opened == path))
-                                    .collect();
-                                hits.extend(search::search_text(&closed, &query, 200 - hits.len()));
-                                hits
-                            }
-                        })
-                        .await;
-                    let _ = this.update(cx, |this, cx| {
-                        if this.search_mode == Some(SearchMode::Project)
-                            && *this.search_input.read(cx).text() == search_query
-                        {
-                            this.search_hits = hits;
-                            cx.notify();
-                        }
-                    });
-                });
-            }
             Some(SearchMode::File) if !query.is_empty() => {
                 let text = self.document().text().to_string();
                 let path = self
@@ -2009,7 +1964,7 @@ impl IdeShell {
                     self.jump_to_hit(&hit, window, cx);
                 }
             }
-            SearchMode::Project | SearchMode::Diagnostics => {
+            SearchMode::Diagnostics => {
                 if let Some(hit) = hit {
                     self.record_location(&hit, cx);
                     if self.document().path() == Some(hit.path.as_path()) {
@@ -2233,7 +2188,7 @@ impl IdeShell {
                 .into_iter()
                 .map(Self::language_label)
                 .collect(),
-            SearchMode::File | SearchMode::Project | SearchMode::Diagnostics => self
+            SearchMode::File | SearchMode::Diagnostics => self
                 .search_hits
                 .iter()
                 .take(30)
@@ -3144,6 +3099,7 @@ impl IdeShell {
             .child(match self.active_sidebar {
                 SidebarPanel::Folder => self.render_project_sidebar(cx).into_any_element(),
                 SidebarPanel::Git => self.git.clone().into_any_element(),
+                SidebarPanel::Search => self.search_panel.clone().into_any_element(),
             })
     }
 
@@ -3320,7 +3276,15 @@ impl IdeShell {
             )
             .context_menu(move |menu, _, _| {
                 if !is_file {
-                    return menu;
+                    let search_shell = shell.clone();
+                    let search_path = path.clone();
+                    return menu.item(PopupMenuItem::new("Find in Folder…").on_click(
+                        move |_, window, cx| {
+                            let _ = search_shell.update(cx, |shell, cx| {
+                                shell.search_in_folder(search_path.clone(), window, cx)
+                            });
+                        },
+                    ));
                 }
                 let open_shell = shell.clone();
                 let open_path = path.clone();
@@ -4091,6 +4055,21 @@ impl IdeShell {
                 .child("Git")
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(SidebarPanel::Git, cx))),
             )
+            .child(
+                status_item(
+                    "quick-search",
+                    self.show_sidebar && self.active_sidebar == SidebarPanel::Search,
+                )
+                .child(Icon::new(IconName::Search).size(px(13.)))
+                .child("Search")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.show_sidebar && this.active_sidebar == SidebarPanel::Search {
+                        this.toggle_sidebar(SidebarPanel::Search, cx);
+                    } else {
+                        this.search_project(&SearchProject, window, cx);
+                    }
+                })),
+            )
             .child(divider())
             .child(div().flex_1().min_w_0().px_1p5().truncate().child(status))
             .when_some(Self::auto_save_settings(cx).label(), |bar, label| {
@@ -4253,6 +4232,7 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::open_user_settings))
             .on_action(cx.listener(Self::show_effective_settings))
             .on_action(cx.listener(Self::save_all_action))
+            .on_action(cx.listener(Self::undo_workspace_replace))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

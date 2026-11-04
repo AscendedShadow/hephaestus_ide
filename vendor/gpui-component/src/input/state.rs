@@ -1717,6 +1717,11 @@ impl InputState {
         cx.notify()
     }
 
+    /// Undo the last change group.
+    pub fn undo_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.undo(&Undo, window, cx);
+    }
+
     /// The selected byte range (UTF-8 offsets), ordered `start <= end`.
     pub fn selected_byte_range(&self) -> Range<usize> {
         self.selected_range.start..self.selected_range.end

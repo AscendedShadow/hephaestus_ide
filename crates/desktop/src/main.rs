@@ -12,6 +12,7 @@ mod language_server;
 mod merge_view;
 mod navigation;
 mod preferences;
+mod search_panel;
 mod session;
 mod settings;
 mod shell;

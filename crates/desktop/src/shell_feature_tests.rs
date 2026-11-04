@@ -106,7 +106,7 @@ fn project_search_opens_matching_line(cx: &mut TestAppContext) {
     cx.dispatch_action(SearchProject);
     cx.simulate_input("needle");
     cx.run_until_parked();
-    cx.read(|cx| assert_eq!(shell.read(cx).search_hits.len(), 1));
+    cx.read(|cx| assert_eq!(shell.read(cx).search_panel.read(cx).hit_count(), 1));
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     cx.read(|cx| {

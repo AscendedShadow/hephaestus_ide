@@ -72,7 +72,8 @@ actions!(
         OpenWorkspaceSettings,
         OpenUserSettings,
         ShowEffectiveSettings,
-        SaveAll
+        SaveAll,
+        UndoWorkspaceReplace
     ]
 );
 
@@ -165,6 +166,7 @@ commands! {
     OpenUserSettings => OpenUserSettings,
     ShowEffectiveSettings => ShowEffectiveSettings,
     SaveAll => SaveAll,
+    UndoWorkspaceReplace => UndoWorkspaceReplace,
 }
 
 impl Command {

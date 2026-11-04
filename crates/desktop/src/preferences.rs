@@ -62,7 +62,7 @@ impl AutoSave {
             AutoSaveMode::Off => None,
             AutoSaveMode::AfterDelay => Some(format!(
                 "Auto Save: {}",
-                if self.delay_ms % 1000 == 0 {
+                if self.delay_ms.is_multiple_of(1000) {
                     format!("{}s", self.delay_ms / 1000)
                 } else {
                     format!("{}ms", self.delay_ms)

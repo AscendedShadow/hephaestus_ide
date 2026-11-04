@@ -16,6 +16,7 @@ dap = { path = "crates/dap" }
 lsp-types = { version = "=0.97.0", features = ["proposed"] }
 terminal = { path = "crates/terminal" }
 anyhow = "1"
+regex = "1.11"
 alacritty_terminal = { version = "=0.26.0", default-features = false }
 async-channel = "2"
 embed-resource = "3"

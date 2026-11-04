@@ -6,6 +6,7 @@ pub mod glob;
 pub mod language;
 pub mod merge;
 pub mod output;
+pub mod project_search;
 pub mod search;
 pub mod text_edit;
 pub mod vim;
