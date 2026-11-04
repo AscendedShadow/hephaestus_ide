@@ -59,6 +59,25 @@ pub fn reveal(source: &str, folds: &mut Vec<Fold>, offset: usize) -> Option<Togg
     Some(toggle)
 }
 
+/// Remove every fold overlapping `range` (source offsets, inclusive of touching folds) and
+/// return the display edit that expands them, or `None` when nothing was folded there.
+pub fn unfold_range(source: &str, folds: &mut Vec<Fold>, range: Range<usize>) -> Option<Toggle> {
+    let before = projected(source, folds);
+    let count = folds.len();
+    folds.retain(|fold| fold.range.end < range.start || fold.range.start > range.end);
+    if folds.len() == count {
+        return None;
+    }
+    let after = projected(source, folds);
+    let (edit, text) = difference(&before, &after);
+    Some(Toggle {
+        edit,
+        text: text.to_string(),
+        cursor: source_to_display(folds, range.start),
+        folded: false,
+    })
+}
+
 pub fn apply_edit(source: &str, folds: &mut Vec<Fold>, displayed: &str) -> Option<String> {
     let previous = projected(source, folds);
     if previous == displayed {

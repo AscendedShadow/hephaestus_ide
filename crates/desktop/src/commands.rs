@@ -59,9 +59,22 @@ actions!(
         GoBack,
         GoForward,
         GoToLine,
-        ChangeLanguageMode
+        ChangeLanguageMode,
+        ToggleLineComment,
+        ToggleBlockComment,
+        MoveLinesUp,
+        MoveLinesDown,
+        DuplicateLinesUp,
+        DuplicateLinesDown,
+        DeleteLines,
+        InsertLineAbove,
+        InsertLineBelow
     ]
 );
+
+/// Editor-only bindings: active when the code editor's text input is focused, so
+/// terminal and panel shortcuts are unaffected.
+const EDITOR_INPUT: &str = "Editor > Input";
 
 macro_rules! commands {
     ($($variant:ident => $action:expr,)*) => {
@@ -135,6 +148,15 @@ commands! {
     GoForward => GoForward,
     GoToLine => GoToLine,
     ChangeLanguageMode => ChangeLanguageMode,
+    ToggleLineComment => ToggleLineComment,
+    ToggleBlockComment => ToggleBlockComment,
+    MoveLinesUp => MoveLinesUp,
+    MoveLinesDown => MoveLinesDown,
+    DuplicateLinesUp => DuplicateLinesUp,
+    DuplicateLinesDown => DuplicateLinesDown,
+    DeleteLines => DeleteLines,
+    InsertLineAbove => InsertLineAbove,
+    InsertLineBelow => InsertLineBelow,
 }
 
 impl Command {
@@ -150,6 +172,15 @@ impl Command {
             Self::ToggleFold => Some(EDITOR_CONTEXT.into()),
             Self::Commit => Some(format!("{} > Input", git_panel::COMMIT_CONTEXT)),
             Self::TerminalCopy | Self::TerminalPaste => Some(TERMINAL.into()),
+            Self::ToggleLineComment => Some(EDITOR_INPUT.into()),
+            Self::ToggleBlockComment => Some(EDITOR_INPUT.into()),
+            Self::MoveLinesUp => Some(EDITOR_INPUT.into()),
+            Self::MoveLinesDown => Some(EDITOR_INPUT.into()),
+            Self::DuplicateLinesUp => Some(EDITOR_INPUT.into()),
+            Self::DuplicateLinesDown => Some(EDITOR_INPUT.into()),
+            Self::DeleteLines => Some(EDITOR_INPUT.into()),
+            Self::InsertLineAbove => Some(EDITOR_INPUT.into()),
+            Self::InsertLineBelow => Some(EDITOR_INPUT.into()),
             _ => None,
         }
     }
@@ -207,6 +238,17 @@ impl Command {
             Self::GoForward => &["alt-right"],
             Self::GoToLine => &["secondary-g"],
             Self::ChangeLanguageMode => &["secondary-k m"],
+            Self::ToggleLineComment => &["secondary-/"],
+            Self::ToggleBlockComment => &["shift-alt-a"],
+            Self::MoveLinesUp => &["alt-up"],
+            Self::MoveLinesDown => &["alt-down"],
+            Self::DuplicateLinesUp => &["shift-alt-up"],
+            Self::DuplicateLinesDown => &["shift-alt-down"],
+            Self::DeleteLines => &["secondary-shift-backspace"],
+            Self::InsertLineAbove => &["secondary-shift-enter"],
+            Self::InsertLineBelow => &["secondary-enter"],
+            #[allow(unreachable_patterns)]
+            _ => &[],
         };
         let primary = if mac { "cmd" } else { "ctrl" };
         keys.iter()
@@ -362,6 +404,23 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Close Tab", CloseTab),
         ],
     };
+    let edit_menu = Menu {
+        name: "Edit".into(),
+        items: vec![
+            MenuItem::action("Toggle Line Comment", ToggleLineComment),
+            MenuItem::action("Toggle Block Comment", ToggleBlockComment),
+            MenuItem::separator(),
+            MenuItem::action("Move Line Up", MoveLinesUp),
+            MenuItem::action("Move Line Down", MoveLinesDown),
+            MenuItem::action("Duplicate Line Up", DuplicateLinesUp),
+            MenuItem::action("Duplicate Line Down", DuplicateLinesDown),
+            MenuItem::action("Delete Line", DeleteLines),
+            MenuItem::action("Insert Line Above", InsertLineAbove),
+            MenuItem::action("Insert Line Below", InsertLineBelow),
+            MenuItem::separator(),
+            MenuItem::action("Change Language Mode…", ChangeLanguageMode),
+        ],
+    };
     let view_menu = Menu {
         name: "View".into(),
         items: vec![MenuItem::action("Toggle Fold", ToggleFold)],
@@ -382,11 +441,13 @@ fn menus() -> Vec<Menu> {
                 items: settings_items("Settings…"),
             },
             file_menu,
+            edit_menu,
             view_menu,
         ]
     } else {
         vec![
             file_menu,
+            edit_menu,
             view_menu,
             Menu {
                 name: "Settings".into(),

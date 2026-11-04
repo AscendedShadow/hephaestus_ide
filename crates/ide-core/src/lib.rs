@@ -1,9 +1,11 @@
 pub mod document;
+pub mod editing;
 pub mod git;
 pub mod glob;
 pub mod language;
 pub mod merge;
 pub mod output;
 pub mod search;
+pub mod text_edit;
 pub mod vim;
 pub mod workspace;

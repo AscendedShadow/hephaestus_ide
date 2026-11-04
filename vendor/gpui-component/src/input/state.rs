@@ -1745,11 +1745,20 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Apply from the end of the document backwards; for edits starting at the same
+        // offset, later edits go first so same-offset insertions keep their list order.
         let mut ordered: Vec<_> = edits
             .iter()
-            .filter(|(range, text)| !(range.is_empty() && text.is_empty()))
+            .enumerate()
+            .filter(|(_, (range, text))| !(range.is_empty() && text.is_empty()))
             .collect();
-        ordered.sort_by(|a, b| b.0.start.cmp(&a.0.start).then(b.0.end.cmp(&a.0.end)));
+        ordered.sort_by(|(a_ix, a), (b_ix, b)| {
+            b.0.start
+                .cmp(&a.0.start)
+                .then(b.0.end.cmp(&a.0.end))
+                .then(b_ix.cmp(a_ix))
+        });
+        let ordered = ordered.into_iter().map(|(_, edit)| edit);
         let was_disabled = self.disabled;
         self.disabled = false;
         self.history.break_group();

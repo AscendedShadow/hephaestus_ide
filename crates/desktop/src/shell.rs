@@ -54,7 +54,9 @@ use crate::{
     vim::VimInput,
 };
 
+mod edits;
 mod language_mode;
+mod line_commands;
 
 #[cfg(test)]
 mod ide_tests;
@@ -4162,6 +4164,15 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::go_back))
             .on_action(cx.listener(Self::go_forward))
             .on_action(cx.listener(Self::go_to_line))
+            .on_action(cx.listener(Self::toggle_line_comment))
+            .on_action(cx.listener(Self::toggle_block_comment))
+            .on_action(cx.listener(Self::move_lines_up))
+            .on_action(cx.listener(Self::move_lines_down))
+            .on_action(cx.listener(Self::duplicate_lines_up))
+            .on_action(cx.listener(Self::duplicate_lines_down))
+            .on_action(cx.listener(Self::delete_lines))
+            .on_action(cx.listener(Self::insert_line_above))
+            .on_action(cx.listener(Self::insert_line_below))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

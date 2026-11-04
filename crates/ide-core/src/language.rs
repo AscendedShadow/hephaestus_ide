@@ -235,9 +235,9 @@ pub fn from_path(path: &Path) -> Option<&'static str> {
     }
     // Dockerfile.dev, Makefile.am …
     if let Some((stem, _)) = name.split_once('.')
-        && let Some(language) = LANGUAGES.iter().find(|language| {
-            language.filenames.iter().any(|file| *file == stem) && !stem.starts_with('.')
-        })
+        && let Some(language) = LANGUAGES
+            .iter()
+            .find(|language| language.filenames.contains(&stem) && !stem.starts_with('.'))
         && matches!(language.id, "dockerfile" | "makefile")
     {
         return Some(language.id);
