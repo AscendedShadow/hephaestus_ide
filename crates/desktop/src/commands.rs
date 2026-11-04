@@ -141,7 +141,12 @@ actions!(
         CloseEditorGroup,
         FocusNextGroup,
         FocusPreviousGroup,
-        MoveTabToNextGroup
+        MoveTabToNextGroup,
+        AddFolderToWorkspace,
+        RemoveFolderFromWorkspace,
+        SelectActiveRoot,
+        ToggleRootSearch,
+        SaveWorkspaceAs
     ]
 );
 
@@ -305,6 +310,11 @@ commands! {
     FocusNextGroup => FocusNextGroup,
     FocusPreviousGroup => FocusPreviousGroup,
     MoveTabToNextGroup => MoveTabToNextGroup,
+    AddFolderToWorkspace => AddFolderToWorkspace,
+    RemoveFolderFromWorkspace => RemoveFolderFromWorkspace,
+    SelectActiveRoot => SelectActiveRoot,
+    ToggleRootSearch => ToggleRootSearch,
+    SaveWorkspaceAs => SaveWorkspaceAs,
 }
 
 impl Command {

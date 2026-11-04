@@ -60,7 +60,7 @@ impl IdeShell {
     }
 
     pub(super) fn discover_tests(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.workspace.root().map(Path::to_path_buf) else {
+        let Some(root) = self.settings_root() else {
             self.testing.error = Some("Open a folder to discover tests".into());
             cx.notify();
             return;

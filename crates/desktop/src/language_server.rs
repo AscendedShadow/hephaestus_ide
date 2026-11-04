@@ -70,6 +70,8 @@ struct Document {
 #[derive(Default)]
 pub struct Servers {
     root: Option<PathBuf>,
+    /// All workspace folders (multi-root workspaces); the root is the first.
+    folders: Vec<PathBuf>,
     configs: Vec<LanguageServer>,
     servers: HashMap<String, Server>,
     documents: HashMap<PathBuf, Document>,
@@ -85,6 +87,39 @@ impl Servers {
         }
         self.root = root;
         self.stop(cx);
+    }
+
+    /// Update the workspace folders: servers that support folder change notifications
+    /// are told about the change; the others restart with the new folders.
+    pub fn set_folders(&mut self, folders: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.folders == folders {
+            return;
+        }
+        let added: Vec<PathBuf> = folders
+            .iter()
+            .filter(|folder| !self.folders.contains(folder))
+            .cloned()
+            .collect();
+        let removed: Vec<PathBuf> = self
+            .folders
+            .iter()
+            .filter(|folder| !folders.contains(folder))
+            .cloned()
+            .collect();
+        self.folders = folders;
+        let mut restart = Vec::new();
+        for (name, server) in &self.servers {
+            if server.state == State::Ready && server.client.supports_workspace_folder_changes() {
+                server.client.change_workspace_folders(&added, &removed);
+            } else {
+                restart.push(name.clone());
+            }
+        }
+        for name in restart {
+            self.servers.remove(&name);
+            self.documents.retain(|_, document| document.server != name);
+        }
+        cx.notify();
     }
 
     pub fn set_configs(&mut self, configs: Vec<LanguageServer>, cx: &mut Context<Self>) {
@@ -137,6 +172,7 @@ impl Servers {
             args: config.args.clone(),
             env: config.env.clone(),
             root,
+            folders: self.folders.clone(),
             initialization_options: config.initialization_options.clone(),
             settings: config.settings.clone(),
         };

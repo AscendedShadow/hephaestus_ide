@@ -24,6 +24,7 @@ pub(super) enum PickerAction {
     AttachProcess(u32),
     DebugProfile(String),
     Git(super::git_features::GitAction),
+    Root(super::roots::RootAction),
     Nothing,
 }
 
@@ -140,6 +141,7 @@ impl IdeShell {
             PickerAction::AttachProcess(pid) => self.attach_to(pid, window, cx),
             PickerAction::DebugProfile(name) => self.choose_debug_profile(name, cx),
             PickerAction::Git(action) => self.run_git_action(action, window, cx),
+            PickerAction::Root(action) => self.run_root_action(action, window, cx),
             PickerAction::Nothing => {}
         }
     }

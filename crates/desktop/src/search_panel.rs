@@ -53,6 +53,8 @@ pub struct SearchPanel {
     pub show_filters: bool,
     pub scope: Option<PathBuf>,
     pub root: Option<PathBuf>,
+    /// Workspace roots with their labels; with several, paths show the root's label.
+    pub roots: Vec<(PathBuf, String)>,
     pub limit: usize,
     results: Results,
     error: Option<String>,
@@ -119,6 +121,7 @@ impl SearchPanel {
             show_filters: false,
             scope: None,
             root: None,
+            roots: Vec::new(),
             limit: project_search::DEFAULT_MATCH_LIMIT,
             results: Results::default(),
             error: None,
@@ -391,11 +394,9 @@ impl SearchPanel {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let folder = self
-                    .root
-                    .as_deref()
-                    .and_then(|root| path.parent()?.strip_prefix(root).ok())
-                    .map(|folder| folder.display().to_string())
+                let folder = path
+                    .parent()
+                    .map(|folder| self.relative_label(folder))
                     .unwrap_or_default();
                 let all_selected = self
                     .results
@@ -542,10 +543,7 @@ impl Render for SearchPanel {
             .map(|(_, hits)| hits.len())
             .sum();
         let scope_label = self.scope.as_ref().map(|scope| {
-            self.root
-                .as_deref()
-                .and_then(|root| scope.strip_prefix(root).ok())
-                .map(|relative| relative.display().to_string())
+            Some(self.relative_label(scope))
                 .filter(|relative| !relative.is_empty())
                 .unwrap_or_else(|| scope.display().to_string())
         });
@@ -725,5 +723,39 @@ impl Render for SearchPanel {
                     .track_scroll(self.scroll.clone()),
                 ),
             )
+    }
+}
+
+impl SearchPanel {
+    /// `path` relative to its workspace root, prefixed with the root's label when the
+    /// workspace has several roots.
+    fn relative_label(&self, path: &Path) -> String {
+        let root = self
+            .roots
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count());
+        match root {
+            Some((root, label)) => {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                if self.roots.len() < 2 {
+                    relative
+                } else if relative.is_empty() {
+                    label.clone()
+                } else {
+                    format!("{label}/{relative}")
+                }
+            }
+            None => self
+                .root
+                .as_deref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .map(|relative| relative.display().to_string())
+                .unwrap_or_default(),
+        }
     }
 }

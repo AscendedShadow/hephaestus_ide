@@ -17,7 +17,7 @@ impl IdeShell {
     /// The folder new items go into: the selected folder, the selected file's folder, or
     /// the workspace root.
     pub(super) fn target_directory(&self) -> Option<PathBuf> {
-        let root = self.workspace.root()?.to_path_buf();
+        let root = self.active_root()?.to_path_buf();
         Some(match &self.tree_selection {
             Some(path) if path.is_dir() => path.clone(),
             Some(path) => path.parent().map(Path::to_path_buf).unwrap_or(root),
@@ -158,14 +158,12 @@ impl IdeShell {
         );
     }
 
+    /// `path` relative to its root (qualified with the root's label in a multi-root
+    /// workspace); a root itself shows its label.
     fn relative_name(&self, path: &Path) -> String {
-        match self.workspace.root() {
-            Some(root) if path == root => self.workspace.display_name().to_string(),
-            Some(root) => path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .display()
-                .to_string(),
+        match self.workspace.root_of(path) {
+            Some(root) if path == root => self.workspace.label(root),
+            Some(_) => self.workspace.qualified(path),
             None => path.display().to_string(),
         }
     }
@@ -229,13 +227,9 @@ impl IdeShell {
     ) {
         let parent = path
             .parent()
-            .map(|parent| {
-                let relative = self.relative_name(parent);
-                if Some(parent) == self.workspace.root() {
-                    String::new()
-                } else {
-                    relative
-                }
+            .and_then(|parent| {
+                let root = self.workspace.root_of(parent)?;
+                Some(parent.strip_prefix(root).ok()?.display().to_string())
             })
             .unwrap_or_default();
         let name = path
@@ -244,12 +238,12 @@ impl IdeShell {
             .to_string_lossy()
             .into_owned();
         self.prompt_name(
-            format!("Move {name} to folder (relative to the workspace root)"),
+            format!("Move {name} to folder (relative to its root folder)"),
             path,
             parent,
             "Move",
             |shell, path, folder, _, cx| {
-                let Some(root) = shell.workspace.root().map(Path::to_path_buf) else {
+                let Some(root) = shell.workspace.root_of(&path).map(Path::to_path_buf) else {
                     return Err("No workspace is open".into());
                 };
                 let folder = folder.trim().trim_matches(['/', '\\']);

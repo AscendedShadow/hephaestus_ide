@@ -64,8 +64,18 @@ impl IdeShell {
                 .filter(|text| !text.is_empty() && !text.contains('\n'))
                 .map(str::to_string)
         };
+        let roots: Vec<(PathBuf, String)> = self
+            .workspace
+            .root_paths()
+            .into_iter()
+            .map(|root| {
+                let label = self.workspace.label(&root);
+                (root, label)
+            })
+            .collect();
         self.search_panel.update(cx, |panel, cx| {
             panel.root = root;
+            panel.roots = roots;
             if let Some(selection) = selection {
                 panel
                     .query
@@ -114,19 +124,27 @@ impl IdeShell {
                 return;
             }
         };
-        let root = self.workspace.root().map(Path::to_path_buf);
+        // Every root included in search (IDE-017).
+        let roots: Vec<PathBuf> = self
+            .workspace
+            .roots()
+            .iter()
+            .filter(|root| root.search && root.error.is_none())
+            .map(|root| root.path.clone())
+            .collect();
+        let no_workspace = self.workspace.root().is_none();
         let open: Vec<(PathBuf, String)> = self
             .buffers
             .iter()
             .filter_map(|buffer| {
                 let path = buffer.document.path()?;
-                let inside = root.as_deref().is_none_or(|root| path.starts_with(root));
+                let inside = no_workspace || roots.iter().any(|root| path.starts_with(root));
                 inside.then(|| (path.to_path_buf(), buffer.document.text().to_string()))
             })
             .collect();
         let cache_key = format!(
             "{:?}|{:?}|{}|{}|{}",
-            root, options.scope, options.include, options.exclude, options.use_ignore_files
+            roots, options.scope, options.include, options.exclude, options.use_ignore_files
         );
         let cached = self
             .search_state
@@ -148,26 +166,37 @@ impl IdeShell {
                 .spawn({
                     let cancel = cancel.clone();
                     async move {
-                        let files = match (cached, &root) {
-                            (Some(files), _) => files,
-                            (None, Some(root)) => Arc::new(
-                                project::list_files(
-                                    root,
-                                    &filter,
-                                    scope.as_deref(),
-                                    project::DEFAULT_FILE_LIMIT,
-                                    &cancel,
-                                )
-                                .map_err(|error| error.to_string())?,
-                            ),
-                            (None, None) => Arc::new(FileList::default()),
+                        let files = match cached {
+                            Some(files) => files,
+                            None => {
+                                let mut all = FileList::default();
+                                for root in &roots {
+                                    // A folder scope limits the search to its root.
+                                    let here =
+                                        scope.as_deref().filter(|scope| scope.starts_with(root));
+                                    if scope.is_some() && here.is_none() {
+                                        continue;
+                                    }
+                                    let listed = project::list_files(
+                                        root,
+                                        &filter,
+                                        here,
+                                        project::DEFAULT_FILE_LIMIT,
+                                        &cancel,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                    all.paths.extend(listed.paths);
+                                    all.truncated |= listed.truncated;
+                                }
+                                Arc::new(all)
+                            }
                         };
                         let results = project::search(
                             &matcher,
                             &files,
                             &open,
                             &filter,
-                            root.as_deref(),
+                            &roots,
                             scope.as_deref(),
                             limit,
                             &cancel,

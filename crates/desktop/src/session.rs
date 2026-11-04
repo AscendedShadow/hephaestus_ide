@@ -17,6 +17,14 @@ pub struct Session {
     pub groups: Vec<SessionGroup>,
     /// Index into `groups` of the focused group.
     pub focused_group: usize,
+    /// Saved workspace definition the session had open (multi-root workspaces).
+    pub workspace_file: Option<PathBuf>,
+    /// All root folders when there are several and no definition file.
+    pub roots: Vec<PathBuf>,
+    /// Roots excluded from search.
+    pub excluded_roots: Vec<PathBuf>,
+    /// The explicitly selected active root.
+    pub active_root: Option<PathBuf>,
 }
 
 /// One editor group: indices into `Session::files` with a cursor for each.
@@ -69,8 +77,7 @@ mod tests {
                 active: 0,
                 cursors: vec![(3, 2)],
                 recent: Vec::new(),
-                groups: Vec::new(),
-                focused_group: 0,
+                ..Default::default()
             },
         )
         .unwrap();

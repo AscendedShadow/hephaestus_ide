@@ -28,14 +28,17 @@ impl IdeShell {
         self.fs_sync.task = None;
         self.fs_sync.pending = None;
         self.fs_sync.error = None;
-        let Some(root) = self.workspace.root().map(Path::to_path_buf) else {
+        let roots = self.workspace.root_paths();
+        if roots.is_empty() {
             return;
-        };
+        }
         let generation = self.fs_sync.generation;
         let executor = cx.background_executor().clone();
         // Setting up a recursive watch can take a while on large trees.
         self.fs_sync.task = Some(cx.spawn(async move |this, cx| {
-            let watcher = executor.spawn(async move { watcher::watch(&root) }).await;
+            let watcher = executor
+                .spawn(async move { watcher::watch_all(&roots) })
+                .await;
             let batches = match this.update(cx, |this, cx| {
                 if this.fs_sync.generation != generation {
                     return None;

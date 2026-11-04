@@ -697,3 +697,52 @@ fn signature_help_follows_triggers_overloads_and_dismissal(cx: &mut TestAppConte
         cx.read(|cx| shell.read(cx).signature.help.is_none())
     });
 }
+
+#[gpui::test]
+fn added_roots_become_workspace_folders(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().canonicalize().unwrap();
+    let (a, b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("main.rs"), "fn main() {}\n").unwrap();
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&a).unwrap(), cx)
+    });
+    open_file(&shell, &a.join("main.rs"), cx);
+    let capabilities = json!({
+        "workspace": {"workspaceFolders": {"supported": true, "changeNotifications": true}}
+    });
+    let server = mock_lsp::install(
+        &shell,
+        "rust",
+        &a,
+        capabilities,
+        Box::new(|_, _| Value::Null),
+        cx,
+    );
+    shell.update(cx, |shell, cx| shell.add_workspace_root(&b, cx).unwrap());
+    wait_until(cx, |_| {
+        !server
+            .notifications("workspace/didChangeWorkspaceFolders")
+            .is_empty()
+    });
+    let change = &server.notifications("workspace/didChangeWorkspaceFolders")[0];
+    let added = change["event"]["added"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(added.ends_with("/b"), "{added}");
+    assert!(change["event"]["removed"].as_array().unwrap().is_empty());
+    cx.read(|cx| {
+        assert!(
+            shell
+                .read(cx)
+                .servers
+                .read(cx)
+                .server_capabilities("rust")
+                .is_some()
+        );
+    });
+}

@@ -73,6 +73,7 @@ mod picker;
 mod problems;
 mod project_search;
 mod recovery;
+mod roots;
 mod settings_commands;
 mod signature_help;
 mod tasks;
@@ -255,6 +256,9 @@ fn tab_close_button(id: impl Into<ElementId>, hidden: bool) -> Stateful<Div> {
 
 type BufferId = u64;
 
+/// Marks a picked file that is a workspace definition (handled after the picker).
+const OPEN_WORKSPACE_MARKER: &str = "\u{0}open-workspace:";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingAction {
     CloseBuffer(BufferId),
@@ -372,6 +376,7 @@ pub struct IdeShell {
     testing: testing::TestingState,
     cursors: cursors::CursorState,
     groups: groups::Groups,
+    roots: roots::RootsState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -453,6 +458,7 @@ impl IdeShell {
             testing: Default::default(),
             cursors: Default::default(),
             groups: Default::default(),
+            roots: Default::default(),
             _subscriptions: Vec::new(),
         };
         let shell_cursors_live = shell.cursors_live();
@@ -595,11 +601,7 @@ impl IdeShell {
             return;
         };
         let snapshot = session::load(&path);
-        if let Some(folder) = snapshot.folder
-            && let Ok(workspace) = Workspace::open(&folder)
-        {
-            self.set_workspace(workspace, cx);
-        }
+        self.restore_roots(&snapshot, cx);
         for (ix, file) in snapshot.files.iter().enumerate() {
             if let Ok(document) = Document::open(file) {
                 self.open_document(document, window, cx);
@@ -658,6 +660,7 @@ impl IdeShell {
             recent: self.recent_paths.clone(),
             groups: self.session_groups(cx),
             focused_group: self.groups.focused,
+            ..self.session_roots()
         };
         let _ = session::save(&path, &snapshot);
     }
@@ -772,12 +775,20 @@ impl IdeShell {
         cx.notify();
     }
 
+    /// Language servers start in the primary root and get every root as a workspace
+    /// folder.
     fn sync_servers(&mut self, cx: &mut Context<Self>) {
-        let root = self.project_directory().map(Path::to_path_buf);
+        let root = self
+            .workspace
+            .root()
+            .or_else(|| self.document().path().and_then(Path::parent))
+            .map(Path::to_path_buf);
+        let folders = self.workspace.root_paths();
         let configs = settings::language_servers(cx);
         self.servers.update(cx, |servers, cx| {
             servers.set_configs(configs, cx);
             servers.set_root(root, cx);
+            servers.set_folders(folders, cx);
         });
     }
 
@@ -946,9 +957,9 @@ impl IdeShell {
         cx.notify();
     }
 
+    /// The folder for root-scoped features (Git, run/debug, tasks): the active root.
     fn project_directory(&self) -> Option<&Path> {
-        self.workspace
-            .root()
+        self.active_root()
             .or_else(|| self.document().path().and_then(Path::parent))
     }
 
@@ -1007,7 +1018,7 @@ impl IdeShell {
     /// Re-read the settings layers (so edits made outside the IDE apply) and return the
     /// effective settings. Invalid layers are reported; their last valid contents apply.
     fn load_settings(&mut self, cx: &mut Context<Self>) -> Option<Settings> {
-        let root = self.workspace.root().map(Path::to_path_buf);
+        let root = self.settings_root();
         let problems = settings::reload(root.as_deref(), None, cx);
         if let Some(summary) = settings::summary(&problems) {
             self.status = summary;
@@ -1397,6 +1408,16 @@ impl IdeShell {
     }
 
     fn open(&mut self, path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = path
+            .as_deref()
+            .filter(|path| Self::is_workspace_definition(path))
+        {
+            if let Err(error) = self.open_workspace_definition(path, cx) {
+                self.status = format!("Could not open the workspace: {error}");
+            }
+            cx.notify();
+            return;
+        }
         if let Some(ix) = path.as_deref().and_then(|path| self.buffer_for_path(path)) {
             self.activate(ix, window, cx);
             return;
@@ -1430,6 +1451,9 @@ impl IdeShell {
                 let Some(path) = path else {
                     return Ok(None);
                 };
+                if Self::is_workspace_definition(&path) {
+                    return Err(format!("{OPEN_WORKSPACE_MARKER}{}", path.display()));
+                }
                 executor
                     .spawn(async move {
                         Document::open(&path)
@@ -1456,6 +1480,12 @@ impl IdeShell {
                         }
                     }
                     Ok(None) => this.status = "Open cancelled".into(),
+                    Err(error) if error.starts_with(OPEN_WORKSPACE_MARKER) => {
+                        let path = PathBuf::from(&error[OPEN_WORKSPACE_MARKER.len()..]);
+                        if let Err(error) = this.open_workspace_definition(&path, cx) {
+                            this.status = format!("Could not open the workspace: {error}");
+                        }
+                    }
                     Err(error) => {
                         this.status = format!("Open failed: {error}");
                         if error.contains("Reopen with Encoding")
@@ -1938,14 +1968,15 @@ impl IdeShell {
     }
 
     fn set_workspace(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
-        if self.workspace.root() != workspace.root() {
+        if self.workspace.root_paths() != workspace.root_paths() {
             self.task_terminal
                 .update(cx, |terminal, cx| terminal.terminate(cx));
             self.debugger.update(cx, |debugger, cx| debugger.stop(cx));
         }
         self.status = format!("Opened folder {}", workspace.display_name());
         self.workspace = workspace;
-        let root = self.workspace.root().map(Path::to_path_buf);
+        self.roots = Default::default();
+        let root = self.settings_root();
         if let Some(problem) = settings::summary(&settings::reload(root.as_deref(), None, cx)) {
             self.status = problem;
         }
@@ -1969,19 +2000,33 @@ impl IdeShell {
     fn index_workspace(&mut self, cx: &mut Context<Self>) {
         self.search_paths.clear();
         self.invalidate_search_files();
-        let Some(root) = self.workspace.root().map(Path::to_path_buf) else {
+        let roots: Vec<PathBuf> = self
+            .workspace
+            .roots()
+            .iter()
+            .filter(|root| root.search && root.error.is_none())
+            .map(|root| root.path.clone())
+            .collect();
+        if roots.is_empty() {
             return;
-        };
+        }
+        let all = self.workspace.root_paths();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let paths = executor
                 .spawn({
-                    let root = root.clone();
-                    async move { search::files(&root) }
+                    let roots = roots.clone();
+                    async move {
+                        let mut paths = Vec::new();
+                        for root in &roots {
+                            paths.extend(search::files(root)?);
+                        }
+                        Ok::<_, std::io::Error>(paths)
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.workspace.root() == Some(root.as_path()) {
+                if this.workspace.root_paths() == all {
                     match paths {
                         Ok(paths) => this.search_paths = paths,
                         Err(error) => this.status = format!("Could not index files: {error}"),
@@ -2164,17 +2209,11 @@ impl IdeShell {
     }
 
     fn ranked_paths(&self, query: &str) -> Vec<PathBuf> {
-        let root = self.workspace.root();
         let mut files: Vec<_> = self
             .search_paths
             .iter()
             .filter_map(|path| {
-                search::rank(
-                    path.strip_prefix(root.unwrap_or(Path::new("")))
-                        .unwrap_or(path),
-                    query,
-                )
-                .map(|score| {
+                search::rank(Path::new(&self.workspace.qualified(path)), query).map(|score| {
                     (
                         score,
                         self.recent_paths
@@ -2316,12 +2355,7 @@ impl IdeShell {
             SearchMode::Files => self
                 .ranked_paths(query)
                 .iter()
-                .map(|path| {
-                    path.strip_prefix(self.workspace.root().unwrap_or(Path::new("")))
-                        .unwrap_or(path)
-                        .display()
-                        .to_string()
-                })
+                .map(|path| self.workspace.qualified(path))
                 .collect(),
             SearchMode::Commands => self
                 .ranked_commands(query)
@@ -3049,7 +3083,7 @@ impl IdeShell {
     }
 
     fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
-        let root = self.workspace.root().map(Path::to_path_buf);
+        let root = self.settings_root();
         let problems = settings::reload(root.as_deref(), Some(window), cx);
         self.show_sidebar = settings::current(cx).show_sidebar;
         self.sync_servers(cx);
@@ -4288,6 +4322,21 @@ impl IdeShell {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(SidebarPanel::Git, cx))),
             )
+            .when_some(
+                self.active_root()
+                    .filter(|_| self.workspace.roots().len() > 1)
+                    .map(|root| self.workspace.label(root)),
+                |bar, label| {
+                    bar.child(
+                        status_item("active-root", false)
+                            .child(Icon::new(AppIcon::Files).size(px(13.)))
+                            .child(format!("Root: {label}"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.select_active_root(&SelectActiveRoot, window, cx)
+                            })),
+                    )
+                },
+            )
             .child(
                 status_item(
                     "quick-search",
@@ -4546,6 +4595,11 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::focus_next_group))
             .on_action(cx.listener(Self::focus_previous_group))
             .on_action(cx.listener(Self::move_tab_to_next_group))
+            .on_action(cx.listener(Self::add_folder_to_workspace))
+            .on_action(cx.listener(Self::remove_folder_from_workspace))
+            .on_action(cx.listener(Self::select_active_root))
+            .on_action(cx.listener(Self::toggle_root_search))
+            .on_action(cx.listener(Self::save_workspace_as))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

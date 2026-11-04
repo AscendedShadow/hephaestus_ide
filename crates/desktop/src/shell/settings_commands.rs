@@ -13,7 +13,7 @@ impl IdeShell {
         if self.blocked() {
             return;
         }
-        let Some(root) = self.workspace.root().map(Path::to_path_buf) else {
+        let Some(root) = self.settings_root() else {
             self.status = "Open a folder to create workspace settings".into();
             cx.notify();
             return;

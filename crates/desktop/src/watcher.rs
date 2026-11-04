@@ -60,7 +60,14 @@ fn classify(root: &Path, path: &Path) -> Option<bool> {
 }
 
 /// Watch `root` recursively. Returns an error if the watcher cannot be created.
+#[cfg(test)]
 pub fn watch(root: &Path) -> Result<Watcher, String> {
+    watch_all(&[root.to_path_buf()])
+}
+
+/// Watch several workspace roots with one coalescing stream; roots that are not
+/// folders (e.g. unavailable ones) are skipped.
+pub fn watch_all(roots: &[PathBuf]) -> Result<Watcher, String> {
     let (raw_sender, raw_receiver) = mpsc::channel::<Raw>();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         let message = match result {
@@ -72,19 +79,21 @@ pub fn watch(root: &Path) -> Result<Watcher, String> {
         let _ = raw_sender.send(message);
     })
     .map_err(|error| format!("Cannot watch the workspace: {error}"))?;
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .map_err(|error| format!("Cannot watch {}: {error}", root.display()))?;
+    let roots: Vec<PathBuf> = roots.iter().filter(|root| root.is_dir()).cloned().collect();
+    for root in &roots {
+        watcher
+            .watch(root, RecursiveMode::Recursive)
+            .map_err(|error| format!("Cannot watch {}: {error}", root.display()))?;
+    }
     let (sender, batches) = async_channel::unbounded();
-    let root = root.to_path_buf();
-    thread::spawn(move || coalesce(root, raw_receiver, sender));
+    thread::spawn(move || coalesce(roots, raw_receiver, sender));
     Ok(Watcher {
         _watcher: watcher,
         batches,
     })
 }
 
-fn coalesce(root: PathBuf, raw: mpsc::Receiver<Raw>, sender: Sender<Batch>) {
+fn coalesce(roots: Vec<PathBuf>, raw: mpsc::Receiver<Raw>, sender: Sender<Batch>) {
     while let Ok(first) = raw.recv() {
         let mut batch = Batch::default();
         let started = Instant::now();
@@ -94,7 +103,14 @@ fn coalesce(root: PathBuf, raw: mpsc::Receiver<Raw>, sender: Sender<Batch>) {
                 Raw::Rescan => batch.rescan = true,
                 Raw::Paths(paths) => {
                     for path in paths {
-                        match classify(&root, &path) {
+                        let Some(root) = roots
+                            .iter()
+                            .filter(|root| path.starts_with(root))
+                            .max_by_key(|root| root.components().count())
+                        else {
+                            continue;
+                        };
+                        match classify(root, &path) {
                             Some(true) => batch.git = true,
                             Some(false) => {
                                 batch.paths.insert(path);

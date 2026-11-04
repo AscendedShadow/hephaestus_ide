@@ -140,7 +140,7 @@ impl IdeShell {
                             .update(cx, |servers, _| servers.saved(&path, &saved_text));
                         this.refresh_git(cx);
                         if settings::is_settings_file(&path, cx) {
-                            let root = this.workspace.root().map(Path::to_path_buf);
+                            let root = this.settings_root();
                             settings::reload(root.as_deref(), None, cx);
                         }
                     }

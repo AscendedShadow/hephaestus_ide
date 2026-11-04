@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::{self, BufReader, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -37,6 +37,8 @@ pub struct Options {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub root: PathBuf,
+    /// Further workspace folders (multi-root workspaces), sent with `root`.
+    pub folders: Vec<PathBuf>,
     pub initialization_options: Option<Value>,
     pub settings: Option<Value>,
 }
@@ -71,6 +73,17 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A workspace folder for `path`.
+pub fn workspace_folder(path: &Path) -> Option<lsp_types::WorkspaceFolder> {
+    Some(lsp_types::WorkspaceFolder {
+        uri: uri::path_to_uri(path)?,
+        name: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    })
+}
 
 impl Error {
     fn new(message: impl Into<String>) -> Self {
@@ -177,6 +190,34 @@ impl Client {
         !self.inner.stopped.load(Ordering::Relaxed)
     }
 
+    /// Whether the server accepts `workspace/didChangeWorkspaceFolders`.
+    pub fn supports_workspace_folder_changes(&self) -> bool {
+        self.capabilities()
+            .and_then(|capabilities| capabilities.workspace)
+            .and_then(|workspace| workspace.workspace_folders)
+            .is_some_and(|folders| {
+                folders.supported == Some(true) && folders.change_notifications.is_some()
+            })
+    }
+
+    /// Tell the server about added and removed workspace folders.
+    pub fn change_workspace_folders(&self, added: &[PathBuf], removed: &[PathBuf]) {
+        let convert = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .filter_map(|path| workspace_folder(path))
+                .collect()
+        };
+        self.notify::<lsp_types::notification::DidChangeWorkspaceFolders>(
+            lsp_types::DidChangeWorkspaceFoldersParams {
+                event: lsp_types::WorkspaceFoldersChangeEvent {
+                    added: convert(added),
+                    removed: convert(removed),
+                },
+            },
+        );
+    }
+
     pub fn capabilities(&self) -> Option<ServerCapabilities> {
         self.inner.capabilities.lock().ok()?.clone()
     }
@@ -247,21 +288,23 @@ impl Client {
         &self,
         options: &Options,
     ) -> impl Future<Output = Result<ServerCapabilities, Error>> + use<> {
-        let root = uri::path_to_uri(&options.root);
+        let mut folders = vec![options.root.clone()];
+        folders.extend(
+            options
+                .folders
+                .iter()
+                .filter(|folder| **folder != options.root)
+                .cloned(),
+        );
+        let folders: Vec<_> = folders
+            .iter()
+            .filter_map(|path| workspace_folder(path))
+            .collect();
         let params = InitializeParams {
             process_id: Some(std::process::id()),
             initialization_options: options.initialization_options.clone(),
             capabilities: capabilities(),
-            workspace_folders: root.map(|uri| {
-                vec![lsp_types::WorkspaceFolder {
-                    name: options
-                        .root
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    uri,
-                }]
-            }),
+            workspace_folders: (!folders.is_empty()).then_some(folders),
             ..Default::default()
         };
         let request = self.request::<lsp_types::request::Initialize>(params);

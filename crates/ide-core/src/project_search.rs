@@ -338,7 +338,7 @@ pub fn search(
     files: &FileList,
     open: &[(PathBuf, String)],
     filter: &Filter,
-    root: Option<&Path>,
+    roots: &[PathBuf],
     scope: Option<&Path>,
     limit: usize,
     cancelled: &AtomicBool,
@@ -348,8 +348,10 @@ pub fn search(
         ..Default::default()
     };
     let in_scope = |path: &Path| {
-        let relative = root
-            .and_then(|root| path.strip_prefix(root).ok())
+        let relative = roots
+            .iter()
+            .filter_map(|root| path.strip_prefix(root).ok())
+            .min_by_key(|relative| relative.components().count())
             .unwrap_or(path);
         scope.is_none_or(|scope| path.starts_with(scope)) && filter.accepts(relative)
     };
@@ -580,7 +582,7 @@ mod tests {
                 &files,
                 &[],
                 &filter,
-                Some(&root),
+                std::slice::from_ref(&root),
                 None,
                 limit,
                 &never,
@@ -620,7 +622,7 @@ mod tests {
             truncated: false,
         };
         let matcher = Matcher::new(&options("needle")).unwrap();
-        assert!(search(&matcher, &files, &[], &filter, None, None, 10, &cancelled).cancelled);
+        assert!(search(&matcher, &files, &[], &filter, &[], None, 10, &cancelled).cancelled);
     }
 
     #[test]
@@ -640,7 +642,7 @@ mod tests {
             &files,
             &open,
             &Filter::default(),
-            None,
+            &[],
             None,
             10,
             &never,

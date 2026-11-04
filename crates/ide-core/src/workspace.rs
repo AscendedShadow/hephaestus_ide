@@ -19,10 +19,28 @@ pub struct TreeRow {
     pub expanded: bool,
 }
 
+/// File extension of saved multi-root workspace definitions.
+pub const DEFINITION_EXTENSION: &str = "hephaestus-workspace";
+
+/// One workspace folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Root {
+    pub path: PathBuf,
+    /// Included in project search and Quick Open.
+    pub search: bool,
+    /// Why the folder could not be read (it stays in the workspace so it can be
+    /// retried or removed).
+    pub error: Option<String>,
+}
+
+/// A workspace: one or more root folders (IDE-017), optionally saved to a definition
+/// file. The first root is the primary one.
 #[derive(Debug, Default)]
 pub struct Workspace {
-    root: Option<PathBuf>,
+    roots: Vec<Root>,
     listings: HashMap<PathBuf, Vec<DirEntry>>,
+    name: Option<String>,
+    file: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -34,27 +52,173 @@ impl Workspace {
         let listing = read_dir(&root)?;
         Ok(Self {
             listings: HashMap::from([(root.clone(), listing)]),
-            root: Some(root),
+            roots: vec![Root {
+                path: root,
+                search: true,
+                error: None,
+            }],
+            name: None,
+            file: None,
         })
     }
 
+    /// The primary root folder.
     pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+        self.roots.first().map(|root| root.path.as_path())
     }
 
-    pub fn display_name(&self) -> &str {
-        self.root()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .unwrap_or("No project open")
+    pub fn roots(&self) -> &[Root] {
+        &self.roots
+    }
+
+    pub fn root_paths(&self) -> Vec<PathBuf> {
+        self.roots.iter().map(|root| root.path.clone()).collect()
+    }
+
+    pub fn is_multi_root(&self) -> bool {
+        self.roots.len() > 1 || self.file.is_some()
+    }
+
+    /// The saved definition file, when the workspace was opened from or saved to one.
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    /// The root folder containing `path` (the innermost one when roots are nested).
+    pub fn root_of(&self, path: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .map(|root| root.path.as_path())
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+    }
+
+    /// Add a root folder; returns `false` when it is already part of the workspace.
+    pub fn add_root(&mut self, path: &Path) -> io::Result<bool> {
+        let root = path.canonicalize()?;
+        if !fs::metadata(&root)?.is_dir() {
+            return Err(io::Error::other("Choose a folder"));
+        }
+        if self.roots.iter().any(|existing| existing.path == root) {
+            return Ok(false);
+        }
+        let listing = read_dir(&root)?;
+        self.listings.insert(root.clone(), listing);
+        self.roots.push(Root {
+            path: root,
+            search: true,
+            error: None,
+        });
+        Ok(true)
+    }
+
+    /// Keep a folder that cannot be read right now (e.g. restored from a session), so it
+    /// can be retried or removed.
+    pub fn add_unavailable_root(&mut self, path: PathBuf, error: String) {
+        if self.roots.iter().all(|root| root.path != path) {
+            self.roots.push(Root {
+                path,
+                search: true,
+                error: Some(error),
+            });
+        }
+    }
+
+    /// Remove a root folder (and its expanded listings). The last root cannot be removed.
+    pub fn remove_root(&mut self, path: &Path) -> bool {
+        if self.roots.len() < 2 {
+            return false;
+        }
+        let Some(ix) = self.roots.iter().position(|root| root.path == path) else {
+            return false;
+        };
+        self.roots.remove(ix);
+        let remaining: Vec<PathBuf> = self.root_paths();
+        self.listings.retain(|listed, _| {
+            !listed.starts_with(path) || remaining.iter().any(|root| listed.starts_with(root))
+        });
+        true
+    }
+
+    /// Include or exclude a root from project search and Quick Open.
+    pub fn set_search(&mut self, path: &Path, search: bool) {
+        if let Some(root) = self.roots.iter_mut().find(|root| root.path == path) {
+            root.search = search;
+        }
+    }
+
+    /// Try to read a root that could not be read before.
+    pub fn retry(&mut self, path: &Path) -> io::Result<()> {
+        let listing = read_dir(path)?;
+        self.listings.insert(path.to_path_buf(), listing);
+        if let Some(root) = self.roots.iter_mut().find(|root| root.path == path) {
+            root.error = None;
+        }
+        Ok(())
+    }
+
+    /// A short, unambiguous label for a root: its folder name, qualified by the parent
+    /// folder's name when two roots share a name.
+    pub fn label(&self, root: &Path) -> String {
+        let name = |path: &Path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string())
+        };
+        let own = name(root);
+        let clash = self
+            .roots
+            .iter()
+            .any(|other| other.path != root && name(&other.path) == own);
+        match root.parent().filter(|_| clash) {
+            Some(parent) => format!("{} ({})", own, name(parent)),
+            None => own,
+        }
+    }
+
+    /// `path` for display: relative to its root, prefixed with the root's label when the
+    /// workspace has several roots.
+    pub fn qualified(&self, path: &Path) -> String {
+        let Some(root) = self.root_of(path) else {
+            return path.display().to_string();
+        };
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        if self.roots.len() > 1 {
+            if relative.is_empty() {
+                self.label(root)
+            } else {
+                format!("{}/{}", self.label(root), relative)
+            }
+        } else {
+            relative
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+        match self.roots.as_slice() {
+            [] => "No project open".into(),
+            [root] => self.label(&root.path),
+            [first, rest @ ..] => format!("{} (+{})", self.label(&first.path), rest.len()),
+        }
     }
 
     pub fn is_expanded(&self, directory: &Path) -> bool {
         self.listings.contains_key(directory)
     }
 
+    fn is_root(&self, directory: &Path) -> bool {
+        self.roots.iter().any(|root| root.path == directory)
+    }
+
     pub fn expand(&mut self, directory: PathBuf, listing: Vec<DirEntry>) -> bool {
-        let reachable = self.root() == Some(directory.as_path())
+        let reachable = self.is_root(&directory)
             || directory
                 .parent()
                 .and_then(|parent| self.listings.get(parent))
@@ -69,17 +233,37 @@ impl Workspace {
         reachable
     }
 
+    /// Collapse a folder. With several roots, a root folder collapses too.
     pub fn collapse(&mut self, directory: &Path) {
-        if self.root() == Some(directory) {
+        if self.is_root(directory) && self.roots.len() < 2 {
             return;
         }
         self.listings.retain(|path, _| !path.starts_with(directory));
     }
 
+    /// Explorer rows. With several roots each root is a top-level row.
     pub fn rows(&self) -> Vec<TreeRow> {
         let mut rows = Vec::new();
-        if let Some(root) = self.root() {
-            self.push_rows(root, 0, &mut rows);
+        match self.roots.as_slice() {
+            [] => {}
+            [root] if self.file.is_none() => self.push_rows(&root.path, 0, &mut rows),
+            roots => {
+                for root in roots {
+                    let expanded = self.is_expanded(&root.path);
+                    rows.push(TreeRow {
+                        entry: DirEntry {
+                            path: root.path.clone(),
+                            name: self.label(&root.path),
+                            is_dir: true,
+                        },
+                        depth: 0,
+                        expanded,
+                    });
+                    if expanded {
+                        self.push_rows(&root.path, 1, &mut rows);
+                    }
+                }
+            }
         }
         rows
     }
@@ -100,6 +284,103 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// Open a saved workspace definition (`{"name": …, "folders": [{"path": …,
+    /// "search": false}]}`; relative paths resolve against the file's folder). Folders
+    /// that cannot be read are kept with an error so they can be retried or removed.
+    pub fn open_definition(file: &Path) -> io::Result<Self> {
+        let text = fs::read_to_string(file)?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| io::Error::other(format!("{}: {error}", file.display())))?;
+        let base = file
+            .canonicalize()?
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let folders = value
+            .get("folders")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| io::Error::other(format!("{}: missing \"folders\"", file.display())))?;
+        let mut workspace = Self {
+            name: value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            file: Some(base.join(file.file_name().unwrap_or_default())),
+            ..Self::default()
+        };
+        for folder in folders {
+            let Some(path) = folder
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| folder.as_str())
+            else {
+                continue;
+            };
+            let search = folder
+                .get("search")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let joined = base.join(path);
+            let resolved = joined.canonicalize().unwrap_or_else(|_| normalize(&joined));
+            if workspace.roots.iter().any(|root| root.path == resolved) {
+                continue;
+            }
+            let error = match read_dir(&resolved) {
+                Ok(listing) => {
+                    workspace.listings.insert(resolved.clone(), listing);
+                    None
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            workspace.roots.push(Root {
+                path: resolved,
+                search,
+                error,
+            });
+        }
+        if workspace.roots.is_empty() {
+            return Err(io::Error::other(format!(
+                "{}: the workspace has no folders",
+                file.display()
+            )));
+        }
+        Ok(workspace)
+    }
+
+    /// Save the workspace definition with folder paths relative to the file, so the
+    /// workspace keeps working when its folder tree is moved together.
+    pub fn save_definition(&mut self, file: &Path) -> io::Result<()> {
+        let parent = file
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(parent)?;
+        let base = parent.canonicalize()?;
+        let folders: Vec<serde_json::Value> = self
+            .roots
+            .iter()
+            .map(|root| {
+                let path = relative_to(&base, &root.path)
+                    .unwrap_or_else(|| root.path.clone())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let mut folder = serde_json::json!({ "path": path });
+                if !root.search {
+                    folder["search"] = serde_json::Value::Bool(false);
+                }
+                folder
+            })
+            .collect();
+        let mut value = serde_json::json!({ "folders": folders });
+        if let Some(name) = &self.name {
+            value["name"] = serde_json::Value::String(name.clone());
+        }
+        let text = serde_json::to_string_pretty(&value).map_err(io::Error::other)?;
+        fs::write(file, text + "\n")?;
+        self.file = Some(base.join(file.file_name().unwrap_or_default()));
+        Ok(())
+    }
+
     /// Follow a rename/move of `from` to `to`: expanded folders below it stay expanded.
     pub fn remap(&mut self, from: &Path, to: &Path) {
         let moved: Vec<PathBuf> = self
@@ -117,7 +398,7 @@ impl Workspace {
         }
     }
 
-    /// Directories currently expanded (including the root).
+    /// Directories currently expanded (including roots).
     pub fn expanded(&self) -> Vec<PathBuf> {
         let mut expanded: Vec<PathBuf> = self.listings.keys().cloned().collect();
         expanded.sort();
@@ -126,10 +407,47 @@ impl Workspace {
 
     /// Forget listings of folders that no longer exist.
     pub fn prune(&mut self) {
-        let root = self.root.clone();
+        let roots = self.root_paths();
         self.listings
-            .retain(|path, _| Some(path) == root.as_ref() || path.is_dir());
+            .retain(|path, _| roots.contains(path) || path.is_dir());
     }
+}
+
+/// `target` relative to the directory `base` (both absolute), using `..` as needed.
+/// `None` when they share no common prefix (e.g. different drives).
+pub fn relative_to(base: &Path, target: &Path) -> Option<PathBuf> {
+    let base: Vec<_> = base.components().collect();
+    let target: Vec<_> = target.components().collect();
+    let common = base.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..base.len() {
+        relative.push("..");
+    }
+    for component in &target[common..] {
+        relative.push(component.as_os_str());
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Some(relative)
+}
+
+/// Resolve `.` and `..` lexically (for folders that do not exist).
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn join(base: &Path, suffix: &Path) -> PathBuf {
@@ -372,5 +690,76 @@ mod tests {
         fs::write(&path, "").unwrap();
         assert!(Workspace::open(&path).is_err());
         assert!(Workspace::open(&directory.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn multi_root_rows_labels_and_definitions() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        for repository in ["one/app", "two/app", "lib"] {
+            fs::create_dir_all(base.join(repository).join("src")).unwrap();
+            fs::write(base.join(repository).join("src/main.rs"), "").unwrap();
+        }
+        let mut workspace = Workspace::open(&base.join("one/app")).unwrap();
+        assert_eq!(names(&workspace.rows()), ["src"]);
+        assert!(workspace.add_root(&base.join("two/app")).unwrap());
+        assert!(!workspace.add_root(&base.join("two/app")).unwrap());
+        workspace.add_root(&base.join("lib")).unwrap();
+        // Duplicate folder names are qualified by their parent.
+        assert_eq!(
+            names(&workspace.rows()),
+            ["app (one)", "  src", "app (two)", "  src", "lib", "  src"]
+        );
+        let main = base.join("two/app/src/main.rs");
+        assert_eq!(
+            workspace.root_of(&main),
+            Some(base.join("two/app").as_path())
+        );
+        assert_eq!(workspace.qualified(&main), "app (two)/src/main.rs");
+        assert_eq!(workspace.display_name(), "app (one) (+2)");
+        workspace.collapse(&base.join("lib"));
+        assert_eq!(names(&workspace.rows()).len(), 5);
+
+        // Saved definitions use relative paths and survive moving the whole tree.
+        workspace.set_search(&base.join("lib"), false);
+        let file = base.join("one/team.hephaestus-workspace");
+        workspace.save_definition(&file).unwrap();
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("\"path\": \"app\""), "{saved}");
+        assert!(saved.contains("\"../two/app\""), "{saved}");
+        assert!(saved.contains("\"search\": false"), "{saved}");
+        let moved = directory.path().join("moved");
+        fs::create_dir_all(&moved).unwrap();
+        for entry in ["one", "two", "lib"] {
+            fs::rename(base.join(entry), moved.join(entry)).unwrap();
+        }
+        let moved = moved.canonicalize().unwrap();
+        let reopened =
+            Workspace::open_definition(&moved.join("one/team.hephaestus-workspace")).unwrap();
+        assert_eq!(
+            reopened.root_paths(),
+            [
+                moved.join("one/app"),
+                moved.join("two/app"),
+                moved.join("lib")
+            ]
+        );
+        assert!(!reopened.roots()[2].search);
+
+        // Removing roots keeps at least one; missing folders stay with an error.
+        let mut reopened = reopened;
+        assert!(reopened.remove_root(&moved.join("lib")));
+        fs::rename(moved.join("two"), moved.join("gone")).unwrap();
+        reopened
+            .save_definition(&moved.join("one/team.hephaestus-workspace"))
+            .unwrap();
+        let broken =
+            Workspace::open_definition(&moved.join("one/team.hephaestus-workspace")).unwrap();
+        assert!(broken.roots()[1].error.is_some());
+        assert_eq!(names(&broken.rows()), ["app (one)", "  src", "app (two)"]);
+        assert_eq!(
+            relative_to(Path::new("/a/b"), Path::new("/a/c/d")),
+            Some(PathBuf::from("../c/d"))
+        );
     }
 }
