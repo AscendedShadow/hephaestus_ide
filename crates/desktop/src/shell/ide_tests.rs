@@ -711,3 +711,63 @@ fn external_changes_update_explorer_index_and_buffers(cx: &mut TestAppContext) {
         assert!(!shell.buffer().external_change);
     });
 }
+
+#[gpui::test]
+fn encodings_and_line_endings_convert_explicitly(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    std::fs::write(root.join("latin.txt"), b"caf\xe9\nna\xefve\n").unwrap();
+    open_file(&shell, &root.join("latin.txt"), cx);
+    cx.read(|cx| assert_eq!(shell.read(cx).search_mode, Some(SearchMode::Items)));
+    cx.simulate_input("1252");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(text(&shell, cx), "café\nnaïve\n");
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(shell.document().encoding().label(), "windows-1252");
+        assert!(!shell.buffer().dirty);
+    });
+
+    // A line-ending conversion is a pending change even though the text is unchanged.
+    shell.update(cx, |shell, cx| {
+        shell.set_line_ending(ide_core::document::LineEnding::CrLf, cx)
+    });
+    cx.read(|cx| assert!(shell.read(cx).buffer().dirty));
+    shell.update_in(cx, |shell, window, cx| {
+        shell.apply_save_encoding(ide_core::document::Encoding::Utf16Be, window, cx)
+    });
+    cx.run_until_parked();
+    let bytes = std::fs::read(root.join("latin.txt")).unwrap();
+    let expected: Vec<u8> = [0xfe, 0xff]
+        .into_iter()
+        .chain(
+            "café\r\nnaïve\r\n"
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes),
+        )
+        .collect();
+    assert_eq!(bytes, expected);
+    cx.read(|cx| assert!(!shell.read(cx).buffer().dirty));
+
+    // Unrepresentable text is refused without touching buffer or disk.
+    cx.simulate_input("😀");
+    shell.update_in(cx, |shell, window, cx| {
+        shell.apply_save_encoding(
+            ide_core::document::Encoding::Legacy("windows-1252"),
+            window,
+            cx,
+        )
+    });
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(
+            shell.status.starts_with("Not converted"),
+            "{}",
+            shell.status
+        );
+        assert_eq!(shell.document().encoding().label(), "UTF-16 BE");
+    });
+    assert_eq!(std::fs::read(root.join("latin.txt")).unwrap(), expected);
+}

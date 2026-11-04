@@ -16,6 +16,10 @@ pub(super) enum PickerAction {
     CodeAction(usize),
     WorkspaceSymbol(usize),
     TerminalProfile(Option<String>),
+    ReopenWithEncoding(ide_core::document::Encoding),
+    SaveWithEncoding(ide_core::document::Encoding),
+    SetLineEnding(ide_core::document::LineEnding),
+    OpenWithEncoding(PathBuf, ide_core::document::Encoding),
     Nothing,
 }
 
@@ -118,6 +122,16 @@ impl IdeShell {
             PickerAction::CodeAction(index) => self.run_code_action(index, window, cx),
             PickerAction::WorkspaceSymbol(index) => self.open_workspace_symbol(index, window, cx),
             PickerAction::TerminalProfile(name) => self.start_profile(name, window, cx),
+            PickerAction::ReopenWithEncoding(encoding) => {
+                self.apply_reopen_encoding(encoding, window, cx)
+            }
+            PickerAction::SaveWithEncoding(encoding) => {
+                self.apply_save_encoding(encoding, window, cx)
+            }
+            PickerAction::SetLineEnding(ending) => self.set_line_ending(ending, cx),
+            PickerAction::OpenWithEncoding(path, encoding) => {
+                self.open_with_encoding(path, encoding, window, cx)
+            }
             PickerAction::Nothing => {}
         }
     }

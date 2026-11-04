@@ -58,6 +58,7 @@ mod autosave;
 mod completion;
 mod editor_preferences;
 mod edits;
+mod encoding;
 mod explorer;
 mod fs_sync;
 mod language_mode;
@@ -1423,7 +1424,16 @@ impl IdeShell {
                         }
                     }
                     Ok(None) => this.status = "Open cancelled".into(),
-                    Err(error) => this.status = format!("Open failed: {error}"),
+                    Err(error) => {
+                        this.status = format!("Open failed: {error}");
+                        if error.contains("Reopen with Encoding")
+                            && let Some(path) = error.split(": ").next().map(PathBuf::from)
+                        {
+                            this.offer_encodings_for(path, window, cx);
+                            cx.notify();
+                            return;
+                        }
+                    }
                 }
                 this.focus_editor(window, cx);
                 cx.notify();
@@ -4259,12 +4269,23 @@ impl IdeShell {
                             .px_1p5()
                             .child(self.indentation_label()),
                     )
-                    .child(div().flex_shrink_0().px_1p5().child("UTF-8"))
                     .child(
-                        div()
-                            .flex_shrink_0()
-                            .px_1p5()
-                            .child(self.document().line_ending().label()),
+                        status_item("quick-encoding", false)
+                            .child(self.document().encoding().label())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.document().path().is_some() {
+                                    this.reopen_with_encoding(&ReopenWithEncoding, window, cx)
+                                } else {
+                                    this.save_with_encoding(&SaveWithEncoding, window, cx)
+                                }
+                            })),
+                    )
+                    .child(
+                        status_item("quick-line-ending", false)
+                            .child(self.document().line_ending().label())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.change_line_ending(&ChangeLineEnding, window, cx)
+                            })),
                     )
                     .child(
                         div()
@@ -4382,6 +4403,9 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::rename_terminal))
             .on_action(cx.listener(Self::select_terminal_profile))
             .on_action(cx.listener(Self::refresh_explorer))
+            .on_action(cx.listener(Self::reopen_with_encoding))
+            .on_action(cx.listener(Self::save_with_encoding))
+            .on_action(cx.listener(Self::change_line_ending))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

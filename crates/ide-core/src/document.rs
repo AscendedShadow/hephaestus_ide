@@ -26,18 +26,159 @@ impl LineEnding {
     }
 }
 
+/// A text encoding the editor can read and write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Encoding {
+    #[default]
+    Utf8,
+    Utf8Bom,
+    Utf16Le,
+    Utf16Be,
+    /// A single- or multi-byte legacy encoding, by its WHATWG name.
+    Legacy(&'static str),
+}
+
+/// Legacy encodings offered when automatic (UTF-8/UTF-16) decoding does not apply.
+pub const LEGACY_ENCODINGS: &[&str] = &[
+    "windows-1252",
+    "ISO-8859-2",
+    "ISO-8859-15",
+    "windows-1250",
+    "windows-1251",
+    "KOI8-R",
+    "Shift_JIS",
+    "EUC-JP",
+    "GBK",
+    "Big5",
+    "EUC-KR",
+];
+
+impl Encoding {
+    pub fn all() -> Vec<Encoding> {
+        let mut all = vec![Self::Utf8, Self::Utf8Bom, Self::Utf16Le, Self::Utf16Be];
+        all.extend(LEGACY_ENCODINGS.iter().map(|name| Self::Legacy(name)));
+        all
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf8Bom => "UTF-8 with BOM",
+            Self::Utf16Le => "UTF-16 LE",
+            Self::Utf16Be => "UTF-16 BE",
+            Self::Legacy(name) => name,
+        }
+    }
+
+    fn legacy(name: &str) -> io::Result<&'static encoding_rs::Encoding> {
+        encoding_rs::Encoding::for_label(name.as_bytes())
+            .ok_or_else(|| io::Error::other(format!("Unknown encoding {name}")))
+    }
+
+    /// Decode bytes with this encoding (a matching BOM is skipped).
+    pub fn decode(self, bytes: &[u8]) -> io::Result<String> {
+        let invalid = || io::Error::other(format!("The file is not valid {}", self.label()));
+        match self {
+            Self::Utf8 | Self::Utf8Bom => {
+                let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+                std::str::from_utf8(bytes)
+                    .map(str::to_string)
+                    .map_err(|_| invalid())
+            }
+            Self::Utf16Le | Self::Utf16Be => {
+                let (bom, swap): (&[u8], bool) = match self {
+                    Self::Utf16Le => (b"\xff\xfe", false),
+                    _ => (b"\xfe\xff", true),
+                };
+                let bytes = bytes.strip_prefix(bom).unwrap_or(bytes);
+                if bytes.len() % 2 != 0 {
+                    return Err(invalid());
+                }
+                let units = bytes.chunks_exact(2).map(|pair| {
+                    if swap {
+                        u16::from_be_bytes([pair[0], pair[1]])
+                    } else {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    }
+                });
+                char::decode_utf16(units)
+                    .collect::<Result<String, _>>()
+                    .map_err(|_| invalid())
+            }
+            Self::Legacy(name) => Self::legacy(name)?
+                .decode_without_bom_handling_and_without_replacement(bytes)
+                .map(|text| text.into_owned())
+                .ok_or_else(invalid),
+        }
+    }
+
+    /// Encode text, failing if a character cannot be represented.
+    pub fn encode(self, text: &str) -> io::Result<Vec<u8>> {
+        Ok(match self {
+            Self::Utf8 => text.as_bytes().to_vec(),
+            Self::Utf8Bom => [b"\xef\xbb\xbf".as_slice(), text.as_bytes()].concat(),
+            Self::Utf16Le => [0xff, 0xfe]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+                .collect(),
+            Self::Utf16Be => [0xfe, 0xff]
+                .into_iter()
+                .chain(text.encode_utf16().flat_map(u16::to_be_bytes))
+                .collect(),
+            Self::Legacy(name) => {
+                let encoding = Self::legacy(name)?;
+                let (bytes, _, unmappable) = encoding.encode(text);
+                if unmappable {
+                    let character = text
+                        .chars()
+                        .find(|character| encoding.encode(&character.to_string()).2)
+                        .unwrap_or('?');
+                    return Err(io::Error::other(format!(
+                        "{character:?} cannot be saved as {name}; choose another encoding"
+                    )));
+                }
+                bytes.into_owned()
+            }
+        })
+    }
+
+    /// Detect the encoding of file bytes: a BOM, or UTF-8.
+    pub fn detect(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.starts_with(b"\xef\xbb\xbf") {
+            Ok(Self::Utf8Bom)
+        } else if bytes.starts_with(b"\xff\xfe") {
+            Ok(Self::Utf16Le)
+        } else if bytes.starts_with(b"\xfe\xff") {
+            Ok(Self::Utf16Be)
+        } else if std::str::from_utf8(bytes).is_ok() {
+            Ok(Self::Utf8)
+        } else {
+            Err(io::Error::other(
+                "Not valid UTF-8 — use Reopen with Encoding to choose the file's encoding",
+            ))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Document {
     path: Option<PathBuf>,
     text: Rope,
     saved_text: Rope,
     line_ending: LineEnding,
-    utf8_bom: bool,
+    saved_line_ending: LineEnding,
+    encoding: Encoding,
+    saved_encoding: Encoding,
     disk_hash: Option<u64>,
 }
 
 impl Document {
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with(path, None)
+    }
+
+    /// Open with an explicit encoding (`None` detects a BOM or UTF-8).
+    pub fn open_with(path: &Path, encoding: Option<Encoding>) -> io::Result<Self> {
         let path = path.canonicalize()?;
         let file = File::open(&path)?;
         if !file.metadata()?.is_file() {
@@ -48,7 +189,7 @@ impl Document {
         if bytes.len() as u64 > MAX_OPEN_BYTES {
             return Err(io::Error::other("Basic editor supports files up to 8 MiB"));
         }
-        let mut document = Self::decode(&bytes)?;
+        let mut document = Self::decode_with(&bytes, encoding)?;
         document.path = Some(path);
         document.disk_hash = Some(hash_bytes(&bytes));
         Ok(document)
@@ -64,11 +205,17 @@ impl Document {
         }
     }
 
+    #[cfg(test)]
     fn decode(bytes: &[u8]) -> io::Result<Self> {
-        let utf8_bom = bytes.starts_with(b"\xef\xbb\xbf");
-        let bytes = if utf8_bom { &bytes[3..] } else { bytes };
-        let text = std::str::from_utf8(bytes)
-            .map_err(|_| io::Error::other("Only UTF-8 text files are supported"))?;
+        Self::decode_with(bytes, None)
+    }
+
+    fn decode_with(bytes: &[u8], encoding: Option<Encoding>) -> io::Result<Self> {
+        let encoding = match encoding {
+            Some(encoding) => encoding,
+            None => Encoding::detect(bytes)?,
+        };
+        let text = encoding.decode(bytes)?;
         if text.contains('\0') {
             return Err(io::Error::other("Binary files cannot be edited"));
         }
@@ -83,7 +230,9 @@ impl Document {
             saved_text: text.clone(),
             text,
             line_ending,
-            utf8_bom,
+            saved_line_ending: line_ending,
+            encoding,
+            saved_encoding: encoding,
             path: None,
             disk_hash: None,
         })
@@ -108,8 +257,20 @@ impl Document {
         self.text = text;
     }
 
+    /// Modified text, or a pending encoding/line-ending conversion.
     pub fn is_dirty(&self) -> bool {
         self.text != self.saved_text
+            || self.encoding != self.saved_encoding
+            || self.line_ending != self.saved_line_ending
+    }
+
+    pub fn encoding(&self) -> Encoding {
+        self.encoding
+    }
+
+    /// Convert the encoding used when saving (a pending change until saved).
+    pub fn set_encoding(&mut self, encoding: Encoding) {
+        self.encoding = encoding;
     }
 
     pub fn line_ending(&self) -> LineEnding {
@@ -155,28 +316,25 @@ impl Document {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let mut file = NamedTempFile::new_in(parent)?;
-        if let Some(permissions) = permissions {
-            file.as_file().set_permissions(permissions)?;
-        }
-        if self.utf8_bom {
-            file.write_all(b"\xef\xbb\xbf")?;
-        }
         let text = self.text.to_string().replace("\r\n", "\n");
         let text = match self.line_ending {
             LineEnding::Lf => text,
             LineEnding::CrLf => text.replace('\n', "\r\n"),
         };
-        file.write_all(text.as_bytes())?;
-        let mut written = Vec::with_capacity(text.len() + 3);
-        if self.utf8_bom {
-            written.extend_from_slice(b"\xef\xbb\xbf");
+        // Encode before touching the file so an unrepresentable character leaves the
+        // disk file untouched.
+        let written = self.encoding.encode(&text)?;
+        let mut file = NamedTempFile::new_in(parent)?;
+        if let Some(permissions) = permissions {
+            file.as_file().set_permissions(permissions)?;
         }
-        written.extend_from_slice(text.as_bytes());
+        file.write_all(&written)?;
         file.as_file().sync_all()?;
         file.persist(&path).map_err(|error| error.error)?;
         self.path = Some(path.canonicalize().unwrap_or(path));
         self.saved_text = self.text.clone();
+        self.saved_encoding = self.encoding;
+        self.saved_line_ending = self.line_ending;
         self.disk_hash = Some(hash_bytes(&written));
         Ok(self)
     }
@@ -195,6 +353,8 @@ impl Document {
     pub fn accept_saved(&mut self, saved: Self) {
         self.path = saved.path;
         self.saved_text = saved.saved_text;
+        self.saved_encoding = saved.saved_encoding;
+        self.saved_line_ending = saved.saved_line_ending;
         self.disk_hash = saved.disk_hash;
     }
 }
@@ -265,7 +425,11 @@ mod tests {
     #[test]
     fn rejects_binary_invalid_utf8_and_oversized_files() {
         assert!(Document::decode(b"binary\0text").is_err());
-        assert!(Document::decode(&[0xff, 0xfe]).is_err());
+        assert!(Document::decode(&[0xc3, 0x28]).is_err());
+        assert!(
+            Document::decode(&[0xff, 0xfe]).is_ok(),
+            "a UTF-16 BOM alone is an empty file"
+        );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("large.txt");
         File::create(&path)
@@ -287,6 +451,59 @@ mod tests {
                 text.replace("\r\n", "\n")
             );
         }
+    }
+
+    #[test]
+    fn utf16_and_legacy_encodings_round_trip_and_conversions_are_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("utf16.txt");
+        let utf16: Vec<u8> = [0xff, 0xfe]
+            .into_iter()
+            .chain("héllo 😀\r\nline".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        fs::write(&path, &utf16).unwrap();
+        let mut document = Document::open(&path).unwrap();
+        assert_eq!(document.encoding(), Encoding::Utf16Le);
+        assert_eq!(document.line_ending(), LineEnding::CrLf);
+        assert_eq!(document.text().to_string(), "héllo 😀\nline");
+        let saved = document.clone().save_to(&path).unwrap();
+        document.accept_saved(saved);
+        assert_eq!(fs::read(&path).unwrap(), utf16, "preserved by default");
+
+        // A conversion with unchanged text is a pending change until saved.
+        document.set_encoding(Encoding::Utf8);
+        document.set_line_ending(LineEnding::Lf);
+        assert!(document.is_dirty());
+        let saved = document.clone().save_to(&path).unwrap();
+        document.accept_saved(saved);
+        assert!(!document.is_dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "héllo 😀\nline");
+
+        // Unrepresentable characters fail without touching the file.
+        document.set_encoding(Encoding::Legacy("windows-1252"));
+        let error = document.clone().save_to(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be saved as windows-1252"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "héllo 😀\nline");
+
+        let latin = directory.path().join("latin.txt");
+        fs::write(&latin, b"caf\xe9\n").unwrap();
+        assert!(
+            Document::open(&latin)
+                .unwrap_err()
+                .to_string()
+                .contains("Reopen with Encoding")
+        );
+        let legacy = Document::open_with(&latin, Some(Encoding::Legacy("windows-1252"))).unwrap();
+        assert_eq!(legacy.text().to_string(), "café\n");
+        let saved = legacy.save_to(&latin).unwrap();
+        assert!(!saved.has_external_changes().unwrap());
+        assert_eq!(fs::read(&latin).unwrap(), b"caf\xe9\n");
+        assert!(Encoding::Utf16Be.decode(&[0xfe, 0xff, 0xd8]).is_err());
     }
 
     #[test]

@@ -104,7 +104,10 @@ actions!(
         CloseTerminal,
         RenameTerminal,
         SelectTerminalProfile,
-        RefreshExplorer
+        RefreshExplorer,
+        ReopenWithEncoding,
+        SaveWithEncoding,
+        ChangeLineEnding
     ]
 );
 
@@ -230,6 +233,9 @@ commands! {
     RenameTerminal => RenameTerminal,
     SelectTerminalProfile => SelectTerminalProfile,
     RefreshExplorer => RefreshExplorer,
+    ReopenWithEncoding => ReopenWithEncoding,
+    SaveWithEncoding => SaveWithEncoding,
+    ChangeLineEnding => ChangeLineEnding,
 }
 
 impl Command {
