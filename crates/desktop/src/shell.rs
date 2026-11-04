@@ -54,6 +54,7 @@ use crate::{
     vim::VimInput,
 };
 
+mod autosave;
 mod editor_preferences;
 mod edits;
 mod language_mode;
@@ -300,6 +301,9 @@ pub struct IdeShell {
     lsp_task: Task<()>,
     completions: Vec<(String, String)>,
     pending_hit: Option<SearchMatch>,
+    auto_save: autosave::AutoSaveState,
+    /// Appended to the status when the running Save All finishes.
+    save_all_note: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -353,6 +357,8 @@ impl IdeShell {
             lsp_task: Task::ready(()),
             completions: Vec::new(),
             pending_hit: None,
+            auto_save: Default::default(),
+            save_all_note: None,
             _subscriptions: Vec::new(),
         };
         shell._subscriptions = vec![
@@ -420,6 +426,8 @@ impl IdeShell {
                 if window.is_window_active() {
                     this.refresh_git(cx);
                     this.check_disk_changes(window, cx);
+                } else {
+                    this.auto_save_on_focus_change(None, cx);
                 }
             }),
             cx.subscribe_in(
@@ -587,6 +595,9 @@ impl IdeShell {
                 }
                 buffer.dirty = buffer.document.is_dirty();
                 this.sync_lsp_buffer(ix, cx);
+                if this.buffers[ix].dirty {
+                    this.schedule_auto_save(id, cx);
+                }
                 cx.notify();
             }
         });
@@ -605,6 +616,14 @@ impl IdeShell {
     }
 
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.buffers.get(self.active).map(|buffer| buffer.id)
+            && self
+                .buffers
+                .get(ix)
+                .is_some_and(|buffer| buffer.id != previous)
+        {
+            self.auto_save_on_focus_change(Some(previous), cx);
+        }
         self.active = ix;
         if let Some(path) = self.document().path().map(Path::to_path_buf) {
             self.recent_paths.retain(|recent| recent != &path);
@@ -1555,6 +1574,9 @@ impl IdeShell {
                         let plural = if saved == 1 { "" } else { "s" };
                         this.status = settings_status
                             .unwrap_or_else(|| format!("Saved {saved} file{plural}"));
+                        if let Some(note) = this.save_all_note.take() {
+                            this.status = format!("{} · {note}", this.status);
+                        }
                         if let Some(action) = then {
                             this.perform(action, window, cx);
                         }
@@ -4071,6 +4093,9 @@ impl IdeShell {
             )
             .child(divider())
             .child(div().flex_1().min_w_0().px_1p5().truncate().child(status))
+            .when_some(Self::auto_save_settings(cx).label(), |bar, label| {
+                bar.child(div().flex_shrink_0().px_1p5().child(label))
+            })
             .when_some(vim_mode, |bar, mode| {
                 bar.child(
                     div()
@@ -4227,6 +4252,7 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::open_workspace_settings))
             .on_action(cx.listener(Self::open_user_settings))
             .on_action(cx.listener(Self::show_effective_settings))
+            .on_action(cx.listener(Self::save_all_action))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

@@ -71,7 +71,8 @@ actions!(
         InsertLineBelow,
         OpenWorkspaceSettings,
         OpenUserSettings,
-        ShowEffectiveSettings
+        ShowEffectiveSettings,
+        SaveAll
     ]
 );
 
@@ -163,6 +164,7 @@ commands! {
     OpenWorkspaceSettings => OpenWorkspaceSettings,
     OpenUserSettings => OpenUserSettings,
     ShowEffectiveSettings => ShowEffectiveSettings,
+    SaveAll => SaveAll,
 }
 
 impl Command {
@@ -253,6 +255,7 @@ impl Command {
             Self::DeleteLines => &["secondary-shift-backspace"],
             Self::InsertLineAbove => &["secondary-shift-enter"],
             Self::InsertLineBelow => &["secondary-enter"],
+            Self::SaveAll => &["secondary-alt-s"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };
@@ -406,6 +409,7 @@ fn menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Save", SaveFile),
             MenuItem::action("Save As…", SaveFileAs),
+            MenuItem::action("Save All", SaveAll),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
         ],

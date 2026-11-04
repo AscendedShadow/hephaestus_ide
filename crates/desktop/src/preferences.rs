@@ -29,6 +29,50 @@ pub enum LineEndingSetting {
     Crlf,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSaveMode {
+    #[default]
+    Off,
+    /// Save a modified file after `delay_ms` without further edits.
+    AfterDelay,
+    /// Save modified files when the window loses focus or the active tab changes.
+    OnFocusChange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoSave {
+    pub mode: AutoSaveMode,
+    pub delay_ms: u64,
+}
+
+impl Default for AutoSave {
+    fn default() -> Self {
+        Self {
+            mode: AutoSaveMode::Off,
+            delay_ms: 1000,
+        }
+    }
+}
+
+impl AutoSave {
+    pub fn label(&self) -> Option<String> {
+        match self.mode {
+            AutoSaveMode::Off => None,
+            AutoSaveMode::AfterDelay => Some(format!(
+                "Auto Save: {}",
+                if self.delay_ms % 1000 == 0 {
+                    format!("{}s", self.delay_ms / 1000)
+                } else {
+                    format!("{}ms", self.delay_ms)
+                }
+            )),
+            AutoSaveMode::OnFocusChange => Some("Auto Save: on focus change".into()),
+        }
+    }
+}
+
 /// One layer of editor preferences; `None` inherits from the layer below.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]

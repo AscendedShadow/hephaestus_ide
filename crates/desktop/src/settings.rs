@@ -35,6 +35,8 @@ pub struct Settings {
     pub file_associations: BTreeMap<String, String>,
     /// Editor preferences (see `preferences`), with per-language overrides.
     pub editor: crate::preferences::EditorSettings,
+    /// Auto-save policy: `{"mode": "off" | "after_delay" | "on_focus_change", "delay_ms": 1000}`.
+    pub auto_save: crate::preferences::AutoSave,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -131,6 +133,7 @@ impl Settings {
             language_servers: default_language_servers(),
             file_associations: BTreeMap::new(),
             editor: Default::default(),
+            auto_save: Default::default(),
         }
     }
 

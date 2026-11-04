@@ -110,3 +110,22 @@ indentation; trailing-whitespace and final-newline policies run when a file is s
 (as an undoable edit), and a line ending applies to new files. The status bar shows the
 effective indentation. Whitespace markers are drawn for the first visual row of each
 line when word wrap is on.
+
+## Saving
+
+**Save All** (File menu, palette, `Ctrl/Cmd+Alt+S`) saves every modified file-backed
+buffer with the normal save path. Untitled buffers are never prompted for; the status bar
+reports how many remain unsaved.
+
+```json
+{ "auto_save": { "mode": "after_delay", "delay_ms": 1000 } }
+```
+
+`mode` is `off` (default), `after_delay` (save after `delay_ms` without edits) or
+`on_focus_change` (save when the window loses focus or another tab is activated). The
+status bar shows the active mode. Auto-save skips untitled buffers and buffers with a
+pending external change, never opens prompts or moves focus, serializes saves per file
+(edits made during a save stay modified and are saved next), keeps the external-change
+and read-only checks of a manual save, and reports a failure once without retrying until
+the buffer changes again. Save-time whitespace policies and format-on-save apply to
+manual saves only, so text never shifts under the cursor while typing.

@@ -259,3 +259,79 @@ fn editor_preferences_follow_settings_language_overrides_and_editorconfig(cx: &m
     assert_eq!(saved, "let a = 1;\nlet b = 2;!\n");
     cx.read(|cx| assert!(!shell.read(cx).buffer().dirty));
 }
+
+#[gpui::test]
+fn save_all_and_auto_save_after_delay(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write(&root.join("a.txt"), "a");
+    write(&root.join("b.txt"), "b");
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(root).unwrap(), cx)
+    });
+    open_file(&shell, &root.join("a.txt"), cx);
+    cx.simulate_input("1");
+    open_file(&shell, &root.join("b.txt"), cx);
+    cx.simulate_input("2");
+    cx.dispatch_action(NewFile);
+    cx.simulate_input("scratch");
+    cx.dispatch_action(SaveAll);
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "1a");
+    assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "2b");
+    cx.read(|cx| {
+        let status = &shell.read(cx).status;
+        assert!(status.contains("1 untitled buffer not saved"), "{status}");
+    });
+
+    write(
+        &root.join(".hephaestus/settings.json"),
+        r#"{"auto_save": {"mode": "after_delay", "delay_ms": 200}}"#,
+    );
+    cx.dispatch_action(ReloadSettings);
+    cx.read(|cx| {
+        assert_eq!(
+            IdeShell::auto_save_settings(cx).label().as_deref(),
+            Some("Auto Save: 200ms")
+        )
+    });
+    open_file(&shell, &root.join("a.txt"), cx);
+    cx.simulate_input("x");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(100));
+    cx.simulate_input("y");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(150));
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "1a",
+        "debounced"
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(100));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "1xya");
+    cx.read(|cx| assert!(!shell.read(cx).buffer().dirty));
+
+    // A conflicting external change is not overwritten, and the failure is not retried.
+    write(&root.join("a.txt"), "theirs");
+    cx.simulate_input("z");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(300));
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "theirs"
+    );
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(
+            shell.status.starts_with("Auto-save failed"),
+            "{}",
+            shell.status
+        );
+        assert!(shell.buffer().external_change && shell.buffer().dirty);
+    });
+}
