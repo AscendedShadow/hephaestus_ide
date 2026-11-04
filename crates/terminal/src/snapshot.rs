@@ -100,6 +100,8 @@ pub struct Cell {
     pub strikethrough: bool,
     pub width: u8,
     pub selected: bool,
+    /// Part of a search match (all visible matches are marked).
+    pub matched: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +127,14 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub(crate) fn new<T: EventListener>(term: &Term<T>, palette: &Palette) -> Self {
+        Self::with_matches(term, palette, &[])
+    }
+
+    pub(crate) fn with_matches<T: EventListener>(
+        term: &Term<T>,
+        palette: &Palette,
+        matches: &[crate::SearchMatch],
+    ) -> Self {
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
         let mut rows: Vec<Vec<Cell>> = (0..term.screen_lines())
@@ -165,6 +175,10 @@ impl Snapshot {
                 selected: content
                     .selection
                     .is_some_and(|selection| selection.contains(indexed.point)),
+                matched: matches.iter().any(|found| {
+                    let point = (indexed.point.line.0, indexed.point.column.0);
+                    found.start <= point && point <= found.end
+                }),
             });
         }
 

@@ -90,6 +90,14 @@ pub enum Event {
     Output(Vec<u8>),
 }
 
+/// A match in the terminal grid: inclusive `(line, column)` cell positions. Lines are
+/// relative to the live screen (negative lines are scrollback history).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub start: (i32, usize),
+    pub end: (i32, usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionKind {
     Cells,
@@ -509,6 +517,103 @@ impl Terminal {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot::new(&self.term.lock(), &self.palette)
     }
+
+    /// A snapshot with search matches highlighted.
+    pub fn snapshot_with(&self, matches: &[SearchMatch]) -> Snapshot {
+        Snapshot::with_matches(&self.term.lock(), &self.palette, matches)
+    }
+
+    /// Search the retained scrollback and the screen (top to bottom). Soft-wrapped rows
+    /// are searched as one line; wide characters and combining marks map to their cells.
+    /// In the alternate screen (full-screen programs) only the visible screen is searched,
+    /// because it has no scrollback.
+    pub fn search(&self, query: &str, case_sensitive: bool) -> Vec<SearchMatch> {
+        let normalize = |character: char| {
+            if case_sensitive {
+                character
+            } else {
+                character.to_lowercase().next().unwrap_or(character)
+            }
+        };
+        let needle: Vec<char> = query.chars().map(normalize).collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let term = self.term.lock();
+        let grid = term.grid();
+        let top = -(grid.history_size() as i32);
+        let bottom = term.screen_lines() as i32;
+        let columns = term.columns();
+        let mut matches = Vec::new();
+        let mut text: Vec<char> = Vec::new();
+        let mut cells: Vec<(i32, usize)> = Vec::new();
+        let mut flush = |text: &mut Vec<char>, cells: &mut Vec<(i32, usize)>| {
+            if text.len() >= needle.len() {
+                for start in 0..=text.len() - needle.len() {
+                    if text[start..start + needle.len()] == needle[..] {
+                        matches.push(SearchMatch {
+                            start: cells[start],
+                            end: cells[start + needle.len() - 1],
+                        });
+                    }
+                }
+            }
+            text.clear();
+            cells.clear();
+        };
+        for line in top..bottom {
+            let row = &grid[Line(line)];
+            let mut wrapped = false;
+            for column in 0..columns {
+                let cell = &row[Column(column)];
+                if cell.flags.contains(term::cell::Flags::WIDE_CHAR_SPACER)
+                    || cell
+                        .flags
+                        .contains(term::cell::Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(normalize(cell.c));
+                cells.push((line, column));
+                for combining in cell.zerowidth().unwrap_or_default() {
+                    text.push(normalize(*combining));
+                    cells.push((line, column));
+                }
+                if column == columns - 1 && cell.flags.contains(term::cell::Flags::WRAPLINE) {
+                    wrapped = true;
+                }
+            }
+            if !wrapped {
+                // Trailing blanks of a line never match across lines.
+                while text.last() == Some(&' ') {
+                    text.pop();
+                    cells.pop();
+                }
+                flush(&mut text, &mut cells);
+            }
+        }
+        flush(&mut text, &mut cells);
+        matches
+    }
+
+    /// Scroll so `found` is visible and select it (the current match).
+    pub fn reveal(&self, found: &SearchMatch) {
+        let mut term = self.term.lock();
+        let screen = term.screen_lines() as i32;
+        term.scroll_display(Scroll::Bottom);
+        if found.start.0 < 0 {
+            term.scroll_display(Scroll::Delta(-found.start.0 + screen / 2));
+        }
+        let start = Point::new(Line(found.start.0), Column(found.start.1));
+        let end = Point::new(Line(found.end.0), Column(found.end.1));
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        term.selection = Some(selection);
+    }
+
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+    }
 }
 
 impl Drop for Terminal {
@@ -564,6 +669,62 @@ mod tests {
             "{:#?}",
             snapshot.lines()
         );
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn finds_matches_in_scrollback_wrapped_lines_and_wide_characters() {
+        let mut output = Vec::new();
+        for ix in 0..60 {
+            output.extend(format!("row {ix} Needle\r\n").into_bytes());
+        }
+        // A line longer than the 20-column grid wraps; the match spans the wrap.
+        output.extend("0123456789012345needle-wrapped\r\n".as_bytes());
+        output.extend("漢字 needle 😀 e\u{301}x\r\n".as_bytes());
+        let size = GridSize {
+            columns: 20,
+            rows: 6,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let terminal = Terminal::from_test_output(&output, size, false);
+        let insensitive = terminal.search("needle", false);
+        let sensitive = terminal.search("Needle", true);
+        assert!(insensitive.len() > sensitive.len());
+        assert!(
+            insensitive[0].start.0 < 0,
+            "scrollback is searched: {:?}",
+            insensitive[0]
+        );
+        let wrapped = insensitive
+            .iter()
+            .find(|found| found.start.0 != found.end.0)
+            .expect("a match across the soft wrap");
+        assert_eq!(wrapped.start.1, 16);
+        assert_eq!(wrapped.end, (wrapped.start.0 + 1, 1));
+        let wide = insensitive.last().unwrap();
+        assert_eq!(
+            wide.start.1, 5,
+            "two wide characters take four cells plus a space"
+        );
+        assert_eq!(
+            terminal.search("e\u{301}x", true).len(),
+            1,
+            "combining marks stay with their cell"
+        );
+        terminal.reveal(&insensitive[0]);
+        assert!(
+            terminal
+                .selected_text()
+                .unwrap()
+                .eq_ignore_ascii_case("needle")
+        );
+        let snapshot = terminal.snapshot_with(&insensitive);
+        assert!(snapshot.rows.iter().flatten().any(|cell| cell.matched));
     }
 }
 

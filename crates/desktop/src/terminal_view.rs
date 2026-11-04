@@ -19,7 +19,7 @@ use crate::theme;
 #[path = "terminal_view_tests.rs"]
 mod tests;
 
-actions!(terminal, [Copy, Paste]);
+actions!(terminal, [Copy, Paste, Find]);
 
 pub const KEY_CONTEXT: &str = "Terminal";
 
@@ -34,7 +34,17 @@ pub enum TerminalEvent {
 const FONT_SIZE: f32 = 13.;
 const LINE_HEIGHT: f32 = 1.3;
 
+/// The terminal Find bar (IDE-025).
+pub struct FindState {
+    pub input: gpui::Entity<gpui_component::input::InputState>,
+    pub case_sensitive: bool,
+    pub matches: Vec<terminal::SearchMatch>,
+    pub current: Option<usize>,
+    _subscription: gpui::Subscription,
+}
+
 pub struct TerminalView {
+    find: Option<FindState>,
     focus_handle: FocusHandle,
     session: Option<Session>,
     error: Option<String>,
@@ -86,6 +96,7 @@ impl Layout {
 impl TerminalView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            find: None,
             focus_handle: cx.focus_handle(),
             session: None,
             error: None,
@@ -252,7 +263,11 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed into the Find bar never reach the shell.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let keystroke = &event.keystroke;
         let Some(session) = &self.session else {
             return;
@@ -329,6 +344,170 @@ impl TerminalView {
         }
     }
 
+    // ----- find (IDE-025) -----
+
+    pub fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(find) = &self.find {
+            let input = find.input.clone();
+            input.update(cx, |input, cx| input.focus(window, cx));
+            return;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder("Find in terminal")
+                .validate(|text, _| !text.contains('\n'))
+        });
+        let subscription = cx.subscribe_in(&input, window, |this, _, event, _, cx| match event {
+            gpui_component::input::InputEvent::Change => this.update_find(true, cx),
+            gpui_component::input::InputEvent::PressEnter { secondary } => {
+                this.step_find(if *secondary { -1 } else { 1 }, cx)
+            }
+            _ => {}
+        });
+        input.update(cx, |input, cx| input.focus(window, cx));
+        self.find = Some(FindState {
+            input,
+            case_sensitive: false,
+            matches: Vec::new(),
+            current: None,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Recompute matches (output may have arrived); with `reset`, jump to the match
+    /// nearest the bottom (the most recent output).
+    pub fn update_find(&mut self, reset: bool, cx: &mut Context<Self>) {
+        let (Some(find), Some(session)) = (&mut self.find, &self.session) else {
+            return;
+        };
+        let query = find.input.read(cx).value().to_string();
+        let previous = find.current.and_then(|ix| find.matches.get(ix).copied());
+        find.matches = session.terminal.search(&query, find.case_sensitive);
+        find.current = if find.matches.is_empty() {
+            None
+        } else if reset {
+            Some(find.matches.len() - 1)
+        } else {
+            previous
+                .and_then(|previous| find.matches.iter().position(|found| *found == previous))
+                .or(Some(find.matches.len() - 1))
+        };
+        match find.current.and_then(|ix| find.matches.get(ix)) {
+            Some(found) => session.terminal.reveal(found),
+            None => session.terminal.clear_selection(),
+        }
+        cx.notify();
+    }
+
+    /// Move to the next (`1`) or previous (`-1`) match, wrapping around.
+    pub fn step_find(&mut self, step: isize, cx: &mut Context<Self>) {
+        self.update_find(false, cx);
+        let (Some(find), Some(session)) = (&mut self.find, &self.session) else {
+            return;
+        };
+        if find.matches.is_empty() {
+            return;
+        }
+        let len = find.matches.len() as isize;
+        let current = find.current.map_or(0, |ix| ix as isize);
+        let next = (current + step).rem_euclid(len) as usize;
+        find.current = Some(next);
+        session.terminal.reveal(&find.matches[next]);
+        cx.notify();
+    }
+
+    pub fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.take().is_some()
+            && let Some(session) = &self.session
+        {
+            session.terminal.clear_selection();
+        }
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn find_state(&self) -> Option<&FindState> {
+        self.find.as_ref()
+    }
+
+    fn render_find(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        use gpui_component::{
+            Selectable as _, Sizable as _,
+            button::{Button, ButtonVariants as _},
+        };
+        let find = self.find.as_ref()?;
+        let count = match find.current {
+            Some(ix) => format!("{}/{}", ix + 1, find.matches.len()),
+            None if find.input.read(cx).value().is_empty() => String::new(),
+            None => "No results".into(),
+        };
+        Some(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .bg(theme::panel())
+                .border_b_1()
+                .border_color(theme::border())
+                .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.close_find(window, cx);
+                    }
+                }))
+                .child(
+                    div()
+                        .w(px(240.))
+                        .child(gpui_component::input::Input::new(&find.input).small()),
+                )
+                .child(
+                    Button::new("terminal-find-case")
+                        .ghost()
+                        .xsmall()
+                        .label("Aa")
+                        .tooltip("Match Case")
+                        .selected(find.case_sensitive)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(find) = &mut this.find {
+                                find.case_sensitive = !find.case_sensitive;
+                            }
+                            this.update_find(true, cx);
+                        })),
+                )
+                .child(
+                    Button::new("terminal-find-previous")
+                        .ghost()
+                        .xsmall()
+                        .label("↑")
+                        .tooltip("Previous match")
+                        .on_click(cx.listener(|this, _, _, cx| this.step_find(-1, cx))),
+                )
+                .child(
+                    Button::new("terminal-find-next")
+                        .ghost()
+                        .xsmall()
+                        .label("↓")
+                        .tooltip("Next match (Enter)")
+                        .on_click(cx.listener(|this, _, _, cx| this.step_find(1, cx))),
+                )
+                .child(div().text_xs().text_color(theme::muted()).child(count))
+                .child(div().flex_1())
+                .child(
+                    Button::new("terminal-find-close")
+                        .ghost()
+                        .xsmall()
+                        .label("×")
+                        .tooltip("Close (Escape)")
+                        .on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx))),
+                ),
+        )
+    }
+
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self
             .session
@@ -375,7 +554,10 @@ impl TerminalView {
             let palette = theme::terminal_palette();
             session.terminal.set_palette(palette);
             session.terminal.resize(grid);
-            let snapshot = session.terminal.snapshot();
+            let snapshot = match &self.find {
+                Some(find) => session.terminal.snapshot_with(&find.matches),
+                None => session.terminal.snapshot(),
+            };
             layout.cursor = snapshot.cursor.map(|cursor| (cursor.row, cursor.column));
             let marked_text = self.marked_text.as_deref();
             Frame::new(
@@ -436,6 +618,8 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::find))
+            .children(self.render_find(cx))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -614,6 +798,7 @@ impl Frame {
                     strikethrough: false,
                     width: 1,
                     selected: false,
+                    matched: false,
                 };
                 let line = shape(marked_text, &style, font, window);
                 overlays.push(fill(
@@ -625,9 +810,12 @@ impl Frame {
         }
 
         let selection = Hsla::from(theme::selection());
+        let matched = Hsla::from(theme::accent()).opacity(0.3);
         let background = |cell: &Cell| {
             if cell.selected {
                 Some(selection)
+            } else if cell.matched {
+                Some(matched)
             } else {
                 (cell.background != palette.background).then(|| hsla(cell.background))
             }
