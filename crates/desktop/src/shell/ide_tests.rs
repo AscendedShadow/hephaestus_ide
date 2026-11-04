@@ -494,3 +494,133 @@ fn workspace_replace_handles_dirty_closed_stale_and_read_only_files(cx: &mut Tes
         "fn x() {\r\n    old_name(2); // ünï\r\n}\r\n"
     );
 }
+
+#[gpui::test]
+fn explorer_creates_renames_moves_and_deletes_with_open_buffers(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    write(&root.join("src/lib.rs"), "fn lib() {}\n");
+    write(&root.join("src/nested/deep.rs"), "deep\n");
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    open_file(&shell, &root.join("src/nested/deep.rs"), cx);
+    cx.simulate_input("unsaved ");
+    cx.run_until_parked();
+
+    // Create inside the selected folder, including Unicode names and a collision.
+    shell.update_in(cx, |shell, window, cx| {
+        shell.tree_selection = Some(root.join("src"));
+        let directory = shell.target_directory().unwrap();
+        assert_eq!(directory, root.join("src"));
+        ide_core::workspace::create(&directory, "名前.rs", false).unwrap();
+        shell.after_tree_change(Some(&directory.join("名前.rs")), cx);
+        let _ = window;
+    });
+    assert!(root.join("src/名前.rs").is_file());
+    let collision = ide_core::workspace::create(&root.join("src"), "lib.rs", false).unwrap_err();
+    assert_eq!(collision, "lib.rs already exists");
+
+    // Move a folder holding a dirty open file: the buffer follows with its edits.
+    let result = shell.update(cx, |shell, cx| {
+        shell.move_item_to(&root.join("src/nested"), &root.join("moved"), cx)
+    });
+    assert!(result.is_ok(), "{result:?}");
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(
+            shell.document().path(),
+            Some(root.join("moved/deep.rs").as_path())
+        );
+        assert!(shell.buffer().dirty);
+        assert!(
+            shell
+                .search_paths
+                .iter()
+                .any(|path| path.ends_with("moved/deep.rs"))
+        );
+    });
+    assert_eq!(text(&shell, cx), "unsaved deep\n");
+    let into_itself = shell.update(cx, |shell, cx| {
+        shell.move_item_to(&root.join("moved"), &root.join("moved/inside"), cx)
+    });
+    assert!(into_itself.unwrap_err().contains("into itself"));
+
+    // Saving after the move writes to the new location only.
+    cx.simulate_keystrokes(&primary("s"));
+    cx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(root.join("moved/deep.rs")).unwrap(),
+        "unsaved deep\n"
+    );
+    assert!(!root.join("src/nested").exists());
+
+    // Deleting a folder closes its open files.
+    shell.update_in(cx, |shell, window, cx| {
+        shell.delete_folder(root.join("moved"), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!root.join("moved").exists());
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(shell.buffer_for_path(&root.join("moved/deep.rs")).is_none());
+        assert!(
+            shell
+                .tree_rows
+                .iter()
+                .all(|row| !row.entry.path.starts_with(root.join("moved")))
+        );
+    });
+}
+
+#[gpui::test]
+fn terminal_sessions_are_independent(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    write(
+        &root.join(".hephaestus/settings.json"),
+        r#"{"terminal_profiles": [{"name": "Broken", "program": "/no/such/shell-binary"}]}"#,
+    );
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    cx.dispatch_action(NewTerminal);
+    cx.dispatch_action(NewTerminal);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(shell.terminal_sessions.len(), 3);
+        assert_eq!(shell.active_terminal, 2);
+        assert_eq!(shell.terminal_sessions[2].name, "Terminal 3");
+    });
+    shell.update_in(cx, |shell, window, cx| {
+        shell.start_profile(Some("Broken".into()), window, cx)
+    });
+    cx.read(|cx| {
+        let status = &shell.read(cx).status;
+        assert!(
+            status.contains("Broken") && status.contains("/no/such/shell-binary"),
+            "{status}"
+        );
+    });
+    let others: Vec<_> = cx.read(|cx| {
+        shell
+            .read(cx)
+            .terminal_sessions
+            .iter()
+            .map(|session| session.view.clone())
+            .collect()
+    });
+    cx.dispatch_action(CloseTerminal);
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(shell.terminal_sessions.len(), 3);
+        assert_eq!(
+            others[1].read(cx).process_state(),
+            Some(true),
+            "other terminals keep running"
+        );
+    });
+}

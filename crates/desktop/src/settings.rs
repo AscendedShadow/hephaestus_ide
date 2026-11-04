@@ -35,6 +35,10 @@ pub struct Settings {
     pub file_associations: BTreeMap<String, String>,
     /// Editor preferences (see `preferences`), with per-language overrides.
     pub editor: crate::preferences::EditorSettings,
+    /// Named shell profiles for the integrated terminal.
+    pub terminal_profiles: Vec<TerminalProfile>,
+    /// Profile used by New Terminal (defaults to the system shell).
+    pub default_terminal_profile: Option<String>,
     /// Auto-save policy: `{"mode": "off" | "after_delay" | "on_focus_change", "delay_ms": 1000}`.
     pub auto_save: crate::preferences::AutoSave,
 }
@@ -47,6 +51,30 @@ pub struct RunConfig {
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
     pub env: HashMap<String, String>,
+}
+
+/// Where a terminal profile starts.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCwd {
+    /// The workspace folder (or the active file's folder).
+    #[default]
+    Workspace,
+    Home,
+    /// A path (relative paths resolve against the workspace folder).
+    #[serde(untagged)]
+    Path(PathBuf),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalProfile {
+    pub name: String,
+    /// Shell program; empty uses the system default shell.
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: TerminalCwd,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -134,6 +162,8 @@ impl Settings {
             file_associations: BTreeMap::new(),
             editor: Default::default(),
             auto_save: Default::default(),
+            terminal_profiles: Vec::new(),
+            default_terminal_profile: None,
         }
     }
 

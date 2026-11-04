@@ -93,7 +93,17 @@ actions!(
         NextSignature,
         PreviousSignature,
         NextTabStop,
-        PreviousTabStop
+        PreviousTabStop,
+        ExplorerNewFile,
+        ExplorerNewFolder,
+        RenameItem,
+        MoveItem,
+        DeleteItem,
+        NewTerminal,
+        NextTerminal,
+        CloseTerminal,
+        RenameTerminal,
+        SelectTerminalProfile
     ]
 );
 
@@ -208,6 +218,16 @@ commands! {
     PreviousSignature => PreviousSignature,
     NextTabStop => NextTabStop,
     PreviousTabStop => PreviousTabStop,
+    ExplorerNewFile => ExplorerNewFile,
+    ExplorerNewFolder => ExplorerNewFolder,
+    RenameItem => RenameItem,
+    MoveItem => MoveItem,
+    DeleteItem => DeleteItem,
+    NewTerminal => NewTerminal,
+    NextTerminal => NextTerminal,
+    CloseTerminal => CloseTerminal,
+    RenameTerminal => RenameTerminal,
+    SelectTerminalProfile => SelectTerminalProfile,
 }
 
 impl Command {
@@ -326,6 +346,7 @@ impl Command {
             Self::PreviousSignature => &["alt-["],
             Self::NextTabStop => &["tab"],
             Self::PreviousTabStop => &["shift-tab"],
+            Self::NewTerminal => &["ctrl-shift-`"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };

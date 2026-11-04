@@ -91,12 +91,32 @@ impl TerminalView {
         }
     }
 
+    /// `None` before start, `Some(true)` while the process runs, `Some(false)` after exit.
+    pub fn process_state(&self) -> Option<bool> {
+        self.session
+            .as_ref()
+            .map(|session| !session.terminal.exited())
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Start a shell with explicit options (terminal profiles) unless one already runs.
+    pub fn start_with(&mut self, options: Options, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        self.spawn(options, cx)
+    }
+
     fn is_running(&self) -> bool {
         self.session
             .as_ref()
             .is_some_and(|session| !session.terminal.exited())
     }
 
+    #[allow(dead_code)]
     pub fn start(&mut self, working_directory: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.session.is_none() {
             let _ = self.spawn(
@@ -152,7 +172,10 @@ impl TerminalView {
                 Ok(())
             }
             Err(error) => {
-                let message = format!("Could not start a shell: {error}");
+                let message = match &options.shell {
+                    Some((program, _)) => format!("Could not start {program}: {error}"),
+                    None => format!("Could not start a shell: {error}"),
+                };
                 self.error = Some(message.clone());
                 Err(message)
             }

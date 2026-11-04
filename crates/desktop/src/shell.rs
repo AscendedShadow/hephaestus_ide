@@ -58,6 +58,7 @@ mod autosave;
 mod completion;
 mod editor_preferences;
 mod edits;
+mod explorer;
 mod language_mode;
 mod line_commands;
 mod lsp_features;
@@ -66,6 +67,7 @@ mod picker;
 mod project_search;
 mod settings_commands;
 mod signature_help;
+mod terminals;
 mod workspace_edits;
 
 #[cfg(test)]
@@ -279,13 +281,19 @@ pub struct IdeShell {
     next_buffer_id: BufferId,
     workspace: Workspace,
     tree_rows: Vec<TreeRow>,
+    /// The explorer item last clicked (target of explorer commands).
+    tree_selection: Option<PathBuf>,
     tree_scroll: UniformListScrollHandle,
     sidebar_split: Entity<ResizableState>,
     tool_panel_split: Entity<ResizableState>,
     active_sidebar: SidebarPanel,
     show_sidebar: bool,
     active_panel: ToolPanel,
+    /// The active interactive terminal (one of `terminal_sessions`).
     terminal: Entity<TerminalView>,
+    terminal_sessions: Vec<terminals::TerminalSession>,
+    active_terminal: usize,
+    next_terminal_id: u64,
     task_terminal: Entity<TerminalView>,
     debugger: Entity<Debugger>,
     breakpoint_hover: Option<usize>,
@@ -345,6 +353,7 @@ impl IdeShell {
             next_buffer_id: 0,
             workspace: Workspace::default(),
             tree_rows: Vec::new(),
+            tree_selection: None,
             tree_scroll: UniformListScrollHandle::new(),
             sidebar_split: cx.new(|_| ResizableState::default()),
             tool_panel_split: cx.new(|_| ResizableState::default()),
@@ -352,6 +361,9 @@ impl IdeShell {
             show_sidebar: settings::current(cx).show_sidebar,
             active_panel: ToolPanel::default(),
             terminal: cx.new(TerminalView::new),
+            terminal_sessions: Vec::new(),
+            active_terminal: 0,
+            next_terminal_id: 1,
             task_terminal: cx.new(TerminalView::new),
             debugger: cx.new(|cx| Debugger::new(window, cx)),
             breakpoint_hover: None,
@@ -503,6 +515,11 @@ impl IdeShell {
                 cx.notify();
             }),
         ];
+        shell.terminal_sessions.push(terminals::TerminalSession {
+            id: 1,
+            name: "Terminal".into(),
+            view: shell.terminal.clone(),
+        });
         let buffer = shell.new_buffer(Document::default(), window, cx);
         shell.buffers.push(buffer);
         shell.activate(0, window, cx);
@@ -2362,6 +2379,7 @@ impl IdeShell {
             return;
         };
         let path = row.entry.path.clone();
+        self.tree_selection = Some(path.clone());
         if !row.entry.is_dir {
             if !self.blocked() {
                 self.open(Some(path), window, cx);
@@ -3155,6 +3173,28 @@ impl IdeShell {
                             })),
                     )
                     .child(
+                        Button::new("sidebar-new-named-file")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::File)
+                            .tooltip("New File in Folder…")
+                            .disabled(self.blocked() || !has_root)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.explorer_new_file(&ExplorerNewFile, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("sidebar-new-folder")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Folder)
+                            .tooltip("New Folder…")
+                            .disabled(self.blocked() || !has_root)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.explorer_new_folder(&ExplorerNewFolder, window, cx)
+                            })),
+                    )
+                    .child(
                         Button::new("sidebar-open-folder")
                             .ghost()
                             .xsmall()
@@ -3238,6 +3278,7 @@ impl IdeShell {
         let is_file = !row.entry.is_dir;
         let shell = cx.entity().downgrade();
         let is_open = !row.entry.is_dir && self.document().path() == Some(row.entry.path.as_path());
+        let selected = self.tree_selection.as_deref() == Some(row.entry.path.as_path());
         let git = self.git.read(cx);
         let change = git.tree_change(&row.entry.path);
         let ignored = git.tree_ignored(&row.entry.path);
@@ -3260,7 +3301,7 @@ impl IdeShell {
             .rounded_md()
             .cursor_pointer()
             .hover(|style| style.bg(theme::hover()))
-            .when(is_open, |row| row.bg(theme::active_row()))
+            .when(is_open || selected, |row| row.bg(theme::active_row()))
             .when(ignored, |row| row.text_color(theme::subtle()))
             .when_some(change.filter(|_| !ignored), |row, change| {
                 row.text_color(theme::git_change(change))
@@ -3300,46 +3341,77 @@ impl IdeShell {
                 cx.listener(move |this, _, window, cx| this.activate_tree_row(ix, window, cx)),
             )
             .context_menu(move |menu, _, _| {
-                if !is_file {
-                    let search_shell = shell.clone();
-                    let search_path = path.clone();
-                    return menu.item(PopupMenuItem::new("Find in Folder…").on_click(
-                        move |_, window, cx| {
-                            let _ = search_shell.update(cx, |shell, cx| {
-                                shell.search_in_folder(search_path.clone(), window, cx)
-                            });
-                        },
-                    ));
-                }
-                let open_shell = shell.clone();
-                let open_path = path.clone();
-                let reveal_shell = shell.clone();
-                let reveal_path = path.clone();
-                let delete_shell = shell.clone();
-                let delete_path = path.clone();
-                menu.item(
-                    PopupMenuItem::new("View File").on_click(move |_, window, cx| {
-                        let _ = open_shell.update(cx, |shell, cx| {
+                let item = |label: &'static str,
+                            path: &PathBuf,
+                            run: fn(
+                    &mut IdeShell,
+                    PathBuf,
+                    &mut Window,
+                    &mut Context<IdeShell>,
+                )| {
+                    let (shell, path) = (shell.clone(), path.clone());
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let _ = shell.update(cx, |shell, cx| {
                             if !shell.blocked() {
-                                shell.open(Some(open_path.clone()), window, cx);
+                                run(shell, path.clone(), window, cx)
                             }
                         });
-                    }),
-                )
-                .item(
-                    PopupMenuItem::new("Reveal in File Explorer").on_click(move |_, _, cx| {
-                        let _ = reveal_shell
-                            .update(cx, |shell, cx| shell.reveal_tree_file(&reveal_path, cx));
-                    }),
-                )
+                    })
+                };
+                if !is_file {
+                    return menu
+                        .item(item("New File…", &path, |shell, path, window, cx| {
+                            shell.new_item_in(path, false, window, cx)
+                        }))
+                        .item(item("New Folder…", &path, |shell, path, window, cx| {
+                            shell.new_item_in(path, true, window, cx)
+                        }))
+                        .separator()
+                        .item(item(
+                            "Find in Folder…",
+                            &path,
+                            |shell, path, window, cx| shell.search_in_folder(path, window, cx),
+                        ))
+                        .item(item(
+                            "New Terminal Here",
+                            &path,
+                            |shell, path, window, cx| shell.new_terminal_in(Some(path), window, cx),
+                        ))
+                        .separator()
+                        .item(item("Rename…", &path, |shell, path, window, cx| {
+                            shell.prompt_rename_item(path, window, cx)
+                        }))
+                        .item(item("Move…", &path, |shell, path, window, cx| {
+                            shell.prompt_move_item(path, window, cx)
+                        }))
+                        .separator()
+                        .item(item(
+                            "Delete Folder…",
+                            &path,
+                            |shell, path, window, cx| shell.confirm_delete_folder(path, window, cx),
+                        ));
+                }
+                menu.item(item("View File", &path, |shell, path, window, cx| {
+                    shell.open(Some(path), window, cx)
+                }))
+                .item(item(
+                    "Reveal in File Explorer",
+                    &path,
+                    |shell, path, _, cx| shell.reveal_tree_file(&path, cx),
+                ))
                 .separator()
-                .item(
-                    PopupMenuItem::new("Delete File…").on_click(move |_, window, cx| {
-                        let _ = delete_shell.update(cx, |shell, cx| {
-                            shell.confirm_delete_tree_file(delete_path.clone(), window, cx);
-                        });
-                    }),
-                )
+                .item(item("Rename…", &path, |shell, path, window, cx| {
+                    shell.prompt_rename_item(path, window, cx)
+                }))
+                .item(item("Move…", &path, |shell, path, window, cx| {
+                    shell.prompt_move_item(path, window, cx)
+                }))
+                .separator()
+                .item(item(
+                    "Delete File…",
+                    &path,
+                    |shell, path, window, cx| shell.confirm_delete_tree_file(path, window, cx),
+                ))
             })
             .into_any_element()
     }
@@ -3811,9 +3883,20 @@ impl IdeShell {
 
     fn focus_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_panel = ToolPanel::Terminal;
-        let directory = self.project_directory().map(Path::to_path_buf);
-        self.terminal
-            .update(cx, |terminal, cx| terminal.start(directory, cx));
+        let profile = settings::current(cx)
+            .default_terminal_profile
+            .and_then(|name| {
+                Self::terminal_profiles(cx)
+                    .into_iter()
+                    .find(|profile| profile.name == name)
+            });
+        let options = self.profile_options(profile.as_ref(), None);
+        let result = self
+            .terminal
+            .update(cx, |terminal, cx| terminal.start_with(options, cx));
+        if let Err(error) = result {
+            self.status = error;
+        }
         window.focus(&self.terminal.focus_handle(cx));
         cx.notify();
     }
@@ -3875,12 +3958,20 @@ impl IdeShell {
                 ToolPanel::Terminal => div()
                     .flex_1()
                     .min_h_0()
-                    .bg(theme::background())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.focus_terminal(window, cx)),
+                    .flex()
+                    .flex_col()
+                    .child(self.render_terminal_tabs(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .bg(theme::background())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| this.focus_terminal(window, cx)),
+                            )
+                            .child(self.terminal.clone()),
                     )
-                    .child(self.terminal.clone())
                     .into_any_element(),
                 ToolPanel::Run => div()
                     .flex_1()
@@ -4279,6 +4370,16 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::previous_signature))
             .on_action(cx.listener(Self::next_tab_stop))
             .on_action(cx.listener(Self::previous_tab_stop))
+            .on_action(cx.listener(Self::explorer_new_file))
+            .on_action(cx.listener(Self::explorer_new_folder))
+            .on_action(cx.listener(Self::rename_item))
+            .on_action(cx.listener(Self::move_item))
+            .on_action(cx.listener(Self::delete_item))
+            .on_action(cx.listener(Self::new_terminal))
+            .on_action(cx.listener(Self::next_terminal))
+            .on_action(cx.listener(Self::close_terminal))
+            .on_action(cx.listener(Self::rename_terminal))
+            .on_action(cx.listener(Self::select_terminal_profile))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

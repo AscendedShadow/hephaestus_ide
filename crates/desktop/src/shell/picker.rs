@@ -15,6 +15,7 @@ pub(super) enum PickerAction {
     Open(SearchMatch),
     CodeAction(usize),
     WorkspaceSymbol(usize),
+    TerminalProfile(Option<String>),
     Nothing,
 }
 
@@ -116,6 +117,7 @@ impl IdeShell {
             }
             PickerAction::CodeAction(index) => self.run_code_action(index, window, cx),
             PickerAction::WorkspaceSymbol(index) => self.open_workspace_symbol(index, window, cx),
+            PickerAction::TerminalProfile(name) => self.start_profile(name, window, cx),
             PickerAction::Nothing => {}
         }
     }

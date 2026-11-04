@@ -129,3 +129,24 @@ pending external change, never opens prompts or moves focus, serializes saves pe
 and read-only checks of a manual save, and reports a failure once without retrying until
 the buffer changes again. Save-time whitespace policies and format-on-save apply to
 manual saves only, so text never shifts under the cursor while typing.
+
+## Terminal profiles
+
+```json
+{
+  "terminal_profiles": [
+    { "name": "zsh", "program": "/bin/zsh", "args": ["-l"], "env": { "TERM_THEME": "dark" }, "cwd": "workspace" },
+    { "name": "Home bash", "program": "bash", "cwd": "home" },
+    { "name": "Logs", "cwd": "var/log" }
+  ],
+  "default_terminal_profile": "zsh"
+}
+```
+
+`cwd` is `workspace` (default), `home`, or a path (relative to the workspace folder).
+An empty `program` uses the system shell. **New Terminal** (`Ctrl+Shift+``) starts the
+default profile; **New Terminal with Profile…** chooses one; **New Terminal Here** in a
+folder's context menu starts in that folder. Sessions can be renamed, switched (**Next
+Terminal**) and closed; closing a session ends only its process. Switching workspaces
+leaves interactive terminals running in their folders. A profile that fails to start names
+the profile and the executable.
