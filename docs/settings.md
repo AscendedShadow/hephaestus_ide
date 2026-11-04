@@ -63,3 +63,50 @@ win over built-in recognition (exact file names, then extensions, then `#!` sheb
 | Recognized (comments, language server routing) | Dockerfile, ignore files, INI/EditorConfig, plain text |
 
 Any configured `language_servers` entry works for a registered language id.
+
+## Editor preferences
+
+```json
+{
+  "editor": {
+    "font_family": "JetBrains Mono",
+    "font_size": 14,
+    "tab_width": 2,
+    "insert_spaces": true,
+    "word_wrap": false,
+    "line_numbers": true,
+    "show_whitespace": false,
+    "trim_trailing_whitespace": false,
+    "insert_final_newline": false,
+    "line_ending": "lf",
+    "format_on_save": false,
+    "use_editorconfig": true,
+    "languages": {
+      "go": { "insert_spaces": false, "tab_width": 8 },
+      "python": { "tab_width": 4, "format_on_save": true }
+    }
+  }
+}
+```
+
+`font_size` must be 6–72 and `tab_width` 1–16; invalid values are reported and ignored.
+`line_ending` applies to files saved for the first time.
+
+Effective editor preferences resolve in this order, later winning:
+
+1. built-in defaults,
+2. user `editor`,
+3. workspace `editor` (merged with the user layer as described above),
+4. `editor.languages.<language id>`,
+5. `.editorconfig` (unless `"use_editorconfig": false`).
+
+EditorConfig files are read from the file's folder upwards until one declares
+`root = true`; nearer files and later sections win, and `unset` clears an inherited value.
+Supported properties: `indent_style`, `indent_size` (including `tab`), `tab_width`,
+`end_of_line` (`lf`/`crlf`), `insert_final_newline` and `trim_trailing_whitespace`.
+
+Changing preferences never rewrites existing text. Indentation settings apply to new
+indentation; trailing-whitespace and final-newline policies run when a file is saved
+(as an undoable edit), and a line ending applies to new files. The status bar shows the
+effective indentation. Whitespace markers are drawn for the first visual row of each
+line when word wrap is on.

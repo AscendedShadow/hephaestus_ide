@@ -489,6 +489,11 @@ impl InputState {
 
     /// Set line number, only for [`InputMode::CodeEditor`] mode.
     pub fn set_line_number(&mut self, line_number: bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_line_number_mode(line_number, cx);
+    }
+
+    /// Set line number visibility without a window (only for code editors).
+    pub fn set_line_number_mode(&mut self, line_number: bool, cx: &mut Context<Self>) {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
             *l = line_number;
@@ -719,7 +724,20 @@ impl InputState {
 
     /// Update the soft wrap mode for multi-line input, default is true.
     pub fn set_soft_wrap(&mut self, wrap: bool, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_soft_wrap_mode(wrap, cx);
+    }
+
+    /// Whether soft wrapping is enabled.
+    pub fn soft_wrap_enabled(&self) -> bool {
+        self.soft_wrap
+    }
+
+    /// Update soft wrapping without a window.
+    pub fn set_soft_wrap_mode(&mut self, wrap: bool, cx: &mut Context<Self>) {
         debug_assert!(self.mode.is_multi_line());
+        if self.soft_wrap == wrap {
+            return;
+        }
         self.soft_wrap = wrap;
         if wrap {
             let wrap_width = self

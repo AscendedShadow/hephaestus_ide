@@ -216,6 +216,24 @@ impl InputState {
         self
     }
 
+    /// Change the tab size of an existing editor.
+    pub fn set_tab_size(&mut self, tab: TabSize, cx: &mut Context<Self>) {
+        match &mut self.mode {
+            InputMode::PlainText { tab: t, .. } => *t = tab,
+            InputMode::CodeEditor { tab: t, .. } => *t = tab,
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The current tab size settings.
+    pub fn tab_size_setting(&self) -> TabSize {
+        match &self.mode {
+            InputMode::PlainText { tab, .. } | InputMode::CodeEditor { tab, .. } => *tab,
+            _ => TabSize::default(),
+        }
+    }
+
     pub(super) fn indent_inline(
         &mut self,
         _: &IndentInline,

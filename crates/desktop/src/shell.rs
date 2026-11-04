@@ -54,6 +54,7 @@ use crate::{
     vim::VimInput,
 };
 
+mod editor_preferences;
 mod edits;
 mod language_mode;
 mod line_commands;
@@ -71,8 +72,6 @@ mod tests;
 mod feature_tests;
 
 pub const EDITOR_CONTEXT: &str = "Editor";
-const INDENT_WIDTH: usize = 2;
-const EDITOR_TEXT_SIZE: Pixels = px(14.);
 const EDITOR_PADDING_LEFT: Pixels = px(20.);
 const BREAKPOINT_RADIUS: f32 = 4.5;
 const LINE_NUMBER_PADDING: Pixels = px(6.);
@@ -239,6 +238,7 @@ struct Buffer {
     language: &'static str,
     /// The user picked the language mode explicitly; keep it across saves.
     language_overridden: bool,
+    preferences: crate::preferences::EditorPreferences,
     editor: Entity<InputState>,
     dirty: bool,
     folds: Vec<Fold>,
@@ -556,14 +556,15 @@ impl IdeShell {
         let id = self.next_buffer_id;
         self.next_buffer_id += 1;
         let language = syntax::detect(document.path(), Some(&first_line(&document)));
+        let preferences = Self::resolve_preferences(&document, language, cx);
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(language)
-                .line_number(true)
-                .soft_wrap(false)
+                .line_number(preferences.line_numbers)
+                .soft_wrap(preferences.word_wrap)
                 .tab_size(TabSize {
-                    tab_size: INDENT_WIDTH,
-                    hard_tabs: false,
+                    tab_size: preferences.tab_width,
+                    hard_tabs: !preferences.insert_spaces,
                 })
                 .default_value(document.text().to_string())
         });
@@ -594,6 +595,7 @@ impl IdeShell {
             document,
             language,
             language_overridden: false,
+            preferences,
             editor,
             dirty: false,
             folds: Vec::new(),
@@ -612,7 +614,9 @@ impl IdeShell {
         self.show_diff = false;
         let editor = self.editor().clone();
         editor.update(cx, |editor, cx| editor.focus(window, cx));
+        let indent = self.buffer().preferences.tab_width;
         if let Some(vim) = &mut self.vim {
+            vim.set_indent_width(indent);
             vim.reset(&editor, cx);
         }
         self.sync_git(cx);
@@ -1342,6 +1346,8 @@ impl IdeShell {
         if self.busy {
             return;
         }
+        let new_file = self.document().path().is_none() || !matches!(target, SaveTarget::Current);
+        self.apply_save_policies(self.active, new_file, window, cx);
         let buffer = self.buffer();
         let id = buffer.id;
         let existing_path = match target {
@@ -1415,6 +1421,10 @@ impl IdeShell {
                                 )
                             };
                             buffer.language = saved_language;
+                            let preferences =
+                                Self::resolve_preferences(&buffer.document, saved_language, cx);
+                            Self::apply_preferences(&buffer.editor, &preferences, cx);
+                            buffer.preferences = preferences;
                             if saved_language != language {
                                 buffer.editor.update(cx, |editor, cx| {
                                     editor.set_highlighter(saved_language, cx)
@@ -1475,6 +1485,11 @@ impl IdeShell {
     ) {
         if self.busy {
             return;
+        }
+        for ix in 0..self.buffers.len() {
+            if self.buffers[ix].dirty && self.buffers[ix].document.path().is_some() {
+                self.apply_save_policies(ix, false, window, cx);
+            }
         }
         let snapshots: Vec<_> = self
             .buffers
@@ -1729,6 +1744,7 @@ impl IdeShell {
         if let Some(problem) = settings::summary(&settings::reload(root.as_deref(), None, cx)) {
             self.status = problem;
         }
+        self.refresh_preferences(None, cx);
         self.diagnostics.clear();
         self.sync_servers(cx);
         self.index_workspace(cx);
@@ -2858,7 +2874,7 @@ impl IdeShell {
             return;
         }
         self.vim = enabled.then(|| {
-            let mut vim = VimInput::new(INDENT_WIDTH);
+            let mut vim = VimInput::new(self.buffer().preferences.tab_width);
             vim.reset(self.editor(), cx);
             vim
         });
@@ -2945,6 +2961,7 @@ impl IdeShell {
         let problems = settings::reload(root.as_deref(), Some(window), cx);
         self.show_sidebar = settings::current(cx).show_sidebar;
         self.sync_servers(cx);
+        self.refresh_preferences(None, cx);
         cx.notify();
         settings::summary(&problems).unwrap_or_else(|| "Settings applied".into())
     }
@@ -3496,9 +3513,10 @@ impl IdeShell {
             underline: None,
             strikethrough: None,
         };
-        let line = window
-            .text_system()
-            .shape_line(sample.into(), EDITOR_TEXT_SIZE, &[run], None);
+        let line =
+            window
+                .text_system()
+                .shape_line(sample.into(), self.editor_text_size(), &[run], None);
         line.width + LINE_NUMBER_PADDING
     }
 
@@ -3506,13 +3524,44 @@ impl IdeShell {
         let editor = self.editor().clone();
         let state = editor.read(cx);
         let guide = BraceGuide::find(&state.text().to_string(), state.cursor());
+        let text_size = self.editor_text_size();
         canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
                 if let Some(guide) = guide
                     && let Some(geometry) = editor.read(cx).text_geometry()
                 {
-                    guide.paint(geometry, bounds, EDITOR_TEXT_SIZE, window);
+                    guide.paint(geometry, bounds, text_size, window);
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    fn render_whitespace(&self, cx: &App) -> impl IntoElement {
+        let editor = self.editor().clone();
+        let text = editor.read(cx).text().to_string();
+        let font = gpui::Font {
+            fallbacks: theme::monospace_font().fallbacks,
+            ..gpui::font(self.editor_font_family())
+        };
+        let size = self.editor_text_size();
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, cx| {
+                if let Some(geometry) = editor.read(cx).text_geometry() {
+                    crate::whitespace::paint(
+                        &text,
+                        geometry,
+                        bounds,
+                        font.clone(),
+                        size,
+                        window,
+                        cx,
+                    );
                 }
             },
         )
@@ -3676,12 +3725,15 @@ impl IdeShell {
                         .focus_bordered(false)
                         .appearance(false)
                         .disabled(self.blocked())
-                        .font_family(theme::mono_family())
-                        .text_size(EDITOR_TEXT_SIZE)
+                        .font_family(self.editor_font_family())
+                        .text_size(self.editor_text_size())
                         .bg(theme::background())
                         .text_color(theme::text()),
                 )
                 .child(self.render_brace_guide(cx))
+                .when(self.buffer().preferences.show_whitespace, |editor| {
+                    editor.child(self.render_whitespace(cx))
+                })
                 .child(self.render_debug_markers(cx))
                 .child(
                     div()
@@ -4079,6 +4131,12 @@ impl IdeShell {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.change_language_mode(&ChangeLanguageMode, window, cx)
                             })),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_1p5()
+                            .child(self.indentation_label()),
                     )
                     .child(div().flex_shrink_0().px_1p5().child("UTF-8"))
                     .child(

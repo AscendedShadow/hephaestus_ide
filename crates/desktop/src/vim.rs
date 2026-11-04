@@ -30,6 +30,10 @@ impl VimInput {
         }
     }
 
+    pub fn set_indent_width(&mut self, width: usize) {
+        self.vim.set_shift_width(width);
+    }
+
     pub fn mode(&self) -> Mode {
         self.vim.mode()
     }

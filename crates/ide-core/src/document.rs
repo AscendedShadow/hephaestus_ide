@@ -116,6 +116,11 @@ impl Document {
         self.line_ending
     }
 
+    /// Change the line ending used when saving.
+    pub fn set_line_ending(&mut self, line_ending: LineEnding) {
+        self.line_ending = line_ending;
+    }
+
     pub fn save_to(mut self, path: &Path) -> io::Result<Self> {
         let path = if path.exists() {
             path.canonicalize()?

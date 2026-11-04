@@ -33,6 +33,8 @@ pub struct Settings {
     /// File associations: glob pattern (matched against the file name, or the
     /// workspace-relative path when it contains `/`) to language mode id or name.
     pub file_associations: BTreeMap<String, String>,
+    /// Editor preferences (see `preferences`), with per-language overrides.
+    pub editor: crate::preferences::EditorSettings,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -128,6 +130,7 @@ impl Settings {
             debugger: None,
             language_servers: default_language_servers(),
             file_associations: BTreeMap::new(),
+            editor: Default::default(),
         }
     }
 
@@ -179,6 +182,7 @@ impl Settings {
                 .iter()
                 .map(|(pattern, language)| (pattern.as_str(), language.as_str())),
         );
+        problems.extend(self.editor.problems());
         theme::set_themes(self.theme.clone());
         theme::set_mode(theme::mode(), window, cx);
         problems.extend(commands::rebind(cx, &self.keybindings));

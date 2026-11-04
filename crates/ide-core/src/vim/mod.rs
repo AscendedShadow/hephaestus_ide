@@ -145,6 +145,10 @@ pub struct Vim {
 }
 
 impl Vim {
+    pub fn set_shift_width(&mut self, shift_width: usize) {
+        self.shift_width = shift_width.max(1);
+    }
+
     pub fn new(shift_width: usize) -> Self {
         Self {
             mode: Mode::Normal,

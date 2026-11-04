@@ -74,6 +74,7 @@ impl IdeShell {
             }
         });
         language_server::attach(&editor, &self.servers, path, language, cx);
+        self.refresh_preferences(Some(ix), cx);
         self.sync_servers(cx);
         self.sync_lsp_buffer(ix, cx);
         self.status = format!("Language mode: {}", language::get(language).name);

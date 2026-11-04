@@ -95,6 +95,15 @@ impl IdeShell {
             editor.update(cx, |editor, cx| {
                 editor.apply_edits(&display_edits, display_selection, window, cx)
             });
+            // Update the document and folds now (the editor's change notification arrives
+            // later and then finds them already in sync), so callers such as save see the
+            // edited text immediately.
+            if let Ok(updated) = ide_core::text_edit::apply(&source, edits) {
+                buffer.document.set_text(updated.as_str().into());
+                buffer.folds = shifted;
+                buffer.dirty = buffer.document.is_dirty();
+                self.sync_lsp_buffer(ix, cx);
+            }
         } else if let Some((range, reversed)) = selection {
             let folds = buffer.folds.clone();
             editor.update(cx, |editor, cx| {

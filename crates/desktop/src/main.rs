@@ -11,6 +11,7 @@ mod git_panel;
 mod language_server;
 mod merge_view;
 mod navigation;
+mod preferences;
 mod session;
 mod settings;
 mod shell;
@@ -19,6 +20,7 @@ mod terminal_view;
 mod theme;
 mod ui;
 mod vim;
+mod whitespace;
 
 use assets::Assets;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};

@@ -209,3 +209,53 @@ fn workspace_settings_layer_over_user_settings(cx: &mut TestAppContext) {
     assert!(view.starts_with("// Effective settings"), "{view}");
     cx.read(|cx| assert_eq!(shell.read(cx).buffer().language, "jsonc"));
 }
+
+#[gpui::test]
+fn editor_preferences_follow_settings_language_overrides_and_editorconfig(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    write(
+        &root.join(".hephaestus/settings.json"),
+        r#"{"editor": {"tab_width": 3, "font_size": 16, "languages": {"go": {"insert_spaces": false, "tab_width": 8}}}}"#,
+    );
+    write(
+        &root.join("web/.editorconfig"),
+        "root = true\n[*.js]\nindent_size = 4\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n",
+    );
+    write(&root.join("main.go"), "package main\n");
+    write(&root.join("lib.rs"), "fn main() {}\n");
+    write(&root.join("web/app.js"), "let a = 1;   \nlet b = 2;");
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(root).unwrap(), cx)
+    });
+
+    let tab = |shell: &Entity<IdeShell>, cx: &mut VisualTestContext| {
+        cx.read(|cx| {
+            let shell = shell.read(cx);
+            let setting = shell.editor().read(cx).tab_size_setting();
+            (
+                setting.tab_size,
+                setting.hard_tabs,
+                shell.buffer().preferences.font_size,
+            )
+        })
+    };
+    open_file(&shell, &root.join("lib.rs"), cx);
+    assert_eq!(tab(&shell, cx), (3, false, 16.));
+    open_file(&shell, &root.join("main.go"), cx);
+    assert_eq!(tab(&shell, cx), (8, true, 16.));
+    open_file(&shell, &root.join("web/app.js"), cx);
+    assert_eq!(tab(&shell, cx), (4, false, 16.));
+    cx.read(|cx| assert_eq!(shell.read(cx).indentation_label(), "Spaces: 4"));
+
+    // Opening does not reformat; saving applies the EditorConfig policies.
+    assert_eq!(text(&shell, cx), "let a = 1;   \nlet b = 2;");
+    set_cursor(&shell, 1, 10, cx);
+    cx.simulate_input("!");
+    cx.simulate_keystrokes(&primary("s"));
+    cx.run_until_parked();
+    let saved = std::fs::read_to_string(root.join("web/app.js")).unwrap();
+    assert_eq!(saved, "let a = 1;\nlet b = 2;!\n");
+    cx.read(|cx| assert!(!shell.read(cx).buffer().dirty));
+}

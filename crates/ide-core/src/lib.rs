@@ -1,5 +1,6 @@
 pub mod document;
 pub mod editing;
+pub mod editorconfig;
 pub mod git;
 pub mod glob;
 pub mod language;
