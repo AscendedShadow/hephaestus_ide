@@ -54,6 +54,16 @@ impl Document {
         Ok(document)
     }
 
+    /// An unsaved, clean document holding `text` (for generated read-only views).
+    pub fn from_text(text: &str) -> Self {
+        let text = Rope::from(text);
+        Self {
+            saved_text: text.clone(),
+            text,
+            ..Self::default()
+        }
+    }
+
     fn decode(bytes: &[u8]) -> io::Result<Self> {
         let utf8_bom = bytes.starts_with(b"\xef\xbb\xbf");
         let bytes = if utf8_bom { &bytes[3..] } else { bytes };

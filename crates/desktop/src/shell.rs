@@ -57,6 +57,7 @@ use crate::{
 mod edits;
 mod language_mode;
 mod line_commands;
+mod settings_commands;
 
 #[cfg(test)]
 mod ide_tests;
@@ -316,9 +317,7 @@ impl IdeShell {
             sidebar_split: cx.new(|_| ResizableState::default()),
             tool_panel_split: cx.new(|_| ResizableState::default()),
             active_sidebar: SidebarPanel::default(),
-            show_sidebar: settings::path(cx)
-                .and_then(|path| Settings::load(&path).ok())
-                .is_some_and(|settings| settings.show_sidebar),
+            show_sidebar: settings::current(cx).show_sidebar,
             active_panel: ToolPanel::default(),
             terminal: cx.new(TerminalView::new),
             task_terminal: cx.new(TerminalView::new),
@@ -867,20 +866,16 @@ impl IdeShell {
         cx.notify();
     }
 
+    /// Re-read the settings layers (so edits made outside the IDE apply) and return the
+    /// effective settings. Invalid layers are reported; their last valid contents apply.
     fn load_settings(&mut self, cx: &mut Context<Self>) -> Option<Settings> {
-        let Some(settings_path) = settings::path(cx) else {
-            self.status = "No settings directory is available".into();
+        let root = self.workspace.root().map(Path::to_path_buf);
+        let problems = settings::reload(root.as_deref(), None, cx);
+        if let Some(summary) = settings::summary(&problems) {
+            self.status = summary;
             cx.notify();
-            return None;
-        };
-        match Settings::load(&settings_path) {
-            Ok(settings) => Some(settings),
-            Err(error) => {
-                self.status = error;
-                cx.notify();
-                None
-            }
         }
+        Some(settings::current(cx))
     }
 
     fn config_directory(
@@ -954,8 +949,8 @@ impl IdeShell {
     }
 
     fn run_command(&mut self, _: &RunCommand, window: &mut Window, cx: &mut Context<Self>) {
-        self.task_commands = settings::path(cx)
-            .and_then(|path| Settings::load(&path).ok())
+        self.task_commands = self
+            .load_settings(cx)
             .map(|settings| settings.commands)
             .unwrap_or_default();
         if self.task_commands.len() > 1 {
@@ -1730,6 +1725,10 @@ impl IdeShell {
         }
         self.status = format!("Opened folder {}", workspace.display_name());
         self.workspace = workspace;
+        let root = self.workspace.root().map(Path::to_path_buf);
+        if let Some(problem) = settings::summary(&settings::reload(root.as_deref(), None, cx)) {
+            self.status = problem;
+        }
         self.diagnostics.clear();
         self.sync_servers(cx);
         self.index_workspace(cx);
@@ -2942,16 +2941,10 @@ impl IdeShell {
     }
 
     fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
-        let Some(path) = settings::path(cx) else {
-            return "No settings file is available".into();
-        };
-        let problems = match Settings::load(&path) {
-            Ok(settings) => {
-                self.show_sidebar = settings.show_sidebar;
-                settings.apply(Some(window), cx)
-            }
-            Err(error) => vec![error],
-        };
+        let root = self.workspace.root().map(Path::to_path_buf);
+        let problems = settings::reload(root.as_deref(), Some(window), cx);
+        self.show_sidebar = settings::current(cx).show_sidebar;
+        self.sync_servers(cx);
         cx.notify();
         settings::summary(&problems).unwrap_or_else(|| "Settings applied".into())
     }
@@ -4173,6 +4166,9 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::delete_lines))
             .on_action(cx.listener(Self::insert_line_above))
             .on_action(cx.listener(Self::insert_line_below))
+            .on_action(cx.listener(Self::open_workspace_settings))
+            .on_action(cx.listener(Self::open_user_settings))
+            .on_action(cx.listener(Self::show_effective_settings))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

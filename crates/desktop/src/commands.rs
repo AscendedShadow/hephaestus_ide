@@ -68,7 +68,10 @@ actions!(
         DuplicateLinesDown,
         DeleteLines,
         InsertLineAbove,
-        InsertLineBelow
+        InsertLineBelow,
+        OpenWorkspaceSettings,
+        OpenUserSettings,
+        ShowEffectiveSettings
     ]
 );
 
@@ -157,6 +160,9 @@ commands! {
     DeleteLines => DeleteLines,
     InsertLineAbove => InsertLineAbove,
     InsertLineBelow => InsertLineBelow,
+    OpenWorkspaceSettings => OpenWorkspaceSettings,
+    OpenUserSettings => OpenUserSettings,
+    ShowEffectiveSettings => ShowEffectiveSettings,
 }
 
 impl Command {
@@ -429,6 +435,8 @@ fn menus() -> Vec<Menu> {
         vec![
             MenuItem::action(open, OpenSettings),
             MenuItem::action("Edit settings.json", EditSettings),
+            MenuItem::action("Open Workspace Settings", OpenWorkspaceSettings),
+            MenuItem::action("Show Effective Settings", ShowEffectiveSettings),
             MenuItem::action("Reload Settings", ReloadSettings),
             MenuItem::separator(),
             MenuItem::action("Toggle Vim Keys", ToggleVimMode),

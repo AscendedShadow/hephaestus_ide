@@ -156,3 +156,56 @@ fn line_commands_never_write_fold_placeholders_into_the_source(cx: &mut TestAppC
     assert!(!text(&shell, cx).contains("..."));
     cx.read(|cx| assert!(shell.read(cx).buffer().folds.is_empty()));
 }
+
+fn write(path: &Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+#[gpui::test]
+fn workspace_settings_layer_over_user_settings(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let settings_file = first.path().join(".hephaestus/settings.json");
+    write(
+        &settings_file,
+        r#"{"commands": [{"name": "build", "program": "./build.sh", "working_directory": "out"}]}"#,
+    );
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(first.path()).unwrap(), cx)
+    });
+    let root = first.path().canonicalize().unwrap();
+    cx.read(|cx| {
+        let commands = settings::current(cx).commands;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(Path::new(&commands[0].program), root.join("./build.sh"));
+        assert_eq!(
+            commands[0].working_directory.as_deref(),
+            Some(root.join("out").as_path())
+        );
+        assert_eq!(
+            settings::state(cx).unwrap().resolved.sources["commands"],
+            settings::layers::Source::Workspace
+        );
+    });
+
+    // A malformed edit is reported with its location and the last valid layer stays.
+    write(&settings_file, "{\n  \"commands\": [\n");
+    let status = shell.update_in(cx, |shell, window, cx| shell.apply_settings(window, cx));
+    assert!(status.contains("settings.json:3:"), "{status}");
+    cx.read(|cx| assert_eq!(settings::current(cx).commands.len(), 1));
+
+    // Switching workspaces drops the old overrides.
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(second.path()).unwrap(), cx)
+    });
+    cx.read(|cx| assert!(settings::current(cx).commands.is_empty()));
+
+    cx.dispatch_action(ShowEffectiveSettings);
+    let view = text(&shell, cx);
+    assert!(view.starts_with("// Effective settings"), "{view}");
+    cx.read(|cx| assert_eq!(shell.read(cx).buffer().language, "jsonc"));
+}

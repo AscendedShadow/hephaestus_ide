@@ -1,0 +1,65 @@
+# Settings
+
+Hephaestus reads JSON settings from two files and merges them over built-in defaults.
+
+| Layer | Location | Opened with |
+| --- | --- | --- |
+| Defaults | built in | **Show Effective Settings** shows the merged result |
+| User | `$XDG_CONFIG_HOME/hephaestus/settings.json` (Linux), `~/Library/Application Support/Hephaestus/settings.json` (macOS), `%APPDATA%\Hephaestus\settings.json` (Windows) | **Edit settings.json** / **Open User Settings** |
+| Workspace | `<workspace root>/.hephaestus/settings.json` | **Open Workspace Settings** (creates the file) |
+
+Saving either file, **Reload Settings**, and switching workspaces re-apply the settings.
+Run, task and debug launches re-read both files first, so edits made outside the IDE take
+effect.
+
+## Precedence and merging
+
+Later layers win: **defaults < user < workspace < language overrides < EditorConfig**
+(the last two only apply to editor preferences, see below).
+
+- **Objects** merge key by key, recursively. A workspace can change one keybinding or
+  one theme color without repeating the rest.
+- **`null` resets** a key to its built-in default, which is different from omitting the
+  key (omitted keys inherit from the lower layer). For example `"debugger": null` in a
+  workspace disables a debugger configured in user settings.
+- **Named arrays merge by name**: `commands`, `debug_profiles` and `terminal_profiles` by
+  `name`, `tasks` by `id`, and `language_servers` by `program`. A workspace entry
+  replaces the user entry with the same name; other entries are appended.
+- **Other arrays replace** the lower layer's array.
+
+## Relative paths
+
+- In **workspace** settings, `working_directory`/`cwd` values and `program` values that
+  start with `./` or `../` are resolved against the workspace root when the file is read.
+- In **user** settings, a relative `working_directory` resolves against the active
+  project directory (the open folder, or the active file's folder) at launch time.
+
+## Errors
+
+A malformed layer is reported in the status bar with its file, line and column. The last
+valid contents of that layer stay in effect until the file is fixed, so a typo never
+silently resets your configuration.
+
+## File associations
+
+`file_associations` maps glob patterns to language modes (by id such as `cpp`, or by
+name such as `C++`):
+
+```json
+{ "file_associations": { "*.h": "cpp", "Jenkinsfile": "java", "config/*.conf": "yaml" } }
+```
+
+Patterns without `/` match the file name; patterns with `/` match the
+workspace-relative path. `*`, `**`, `?`, `[a-z]` and `{a,b}` are supported. Associations
+win over built-in recognition (exact file names, then extensions, then `#!` shebangs).
+**Change Language Mode** picks a mode for one buffer, including untitled buffers.
+
+### Language support levels
+
+| Level | Languages |
+| --- | --- |
+| Highlighting, navigation, default language server | Rust, C, C#, Go, Java, JavaScript/JSX, TypeScript/TSX, Zig |
+| Syntax highlighting | C++ (clangd by default), Python, Shell, JSON/JSONC, TOML, YAML, Markdown, HTML, CSS, Makefile |
+| Recognized (comments, language server routing) | Dockerfile, ignore files, INI/EditorConfig, plain text |
+
+Any configured `language_servers` entry works for a registered language id.

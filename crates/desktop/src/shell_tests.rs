@@ -241,7 +241,8 @@ fn settings_file_rebinds_hotkeys_and_recolors_panels(cx: &mut TestAppContext) {
     .unwrap();
     cx.dispatch_action(ReloadSettings);
     assert!(
-        status(cx).starts_with("Settings error — settings.json:"),
+        status(cx).starts_with("Settings error — ")
+            && status(cx).contains("settings.json: invalid RGBA"),
         "{}",
         status(cx)
     );

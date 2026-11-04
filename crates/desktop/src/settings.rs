@@ -13,6 +13,8 @@ use crate::{
     theme::{self, Themes},
 };
 
+pub mod layers;
+
 #[cfg(test)]
 #[path = "settings_tests.rs"]
 mod tests;
@@ -150,10 +152,12 @@ impl Settings {
         servers
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(source: &str) -> Result<Self, String> {
         serde_json::from_str(source).map_err(|error| format!("{FILE_NAME}: {error}"))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn load(path: &Path) -> Result<Self, String> {
         match fs::read_to_string(path) {
             Ok(source) => Self::parse(&source),
@@ -217,28 +221,105 @@ pub fn path(cx: &App) -> Option<PathBuf> {
 }
 
 pub fn is_settings_file(file: &Path, cx: &App) -> bool {
-    path(cx).is_some_and(|settings| {
-        settings == file
-            || settings
-                .canonicalize()
-                .is_ok_and(|settings| settings == file)
-    })
+    path(cx)
+        .into_iter()
+        .chain(workspace_path(cx))
+        .any(|settings| {
+            settings == file
+                || settings
+                    .canonicalize()
+                    .is_ok_and(|settings| settings == file)
+        })
+}
+
+/// The layered settings currently in effect (see [`layers`]).
+#[derive(Default)]
+pub struct SettingsState {
+    pub workspace_root: Option<PathBuf>,
+    user_good: serde_json::Value,
+    workspace_good: Option<(PathBuf, serde_json::Value)>,
+    pub resolved: layers::Resolved,
+}
+
+impl Global for SettingsState {}
+
+/// The effective settings (defaults, user and workspace layers merged).
+pub fn current(cx: &App) -> Settings {
+    cx.try_global::<SettingsState>()
+        .map(|state| state.resolved.settings.clone())
+        .unwrap_or_default()
+}
+
+pub fn state(cx: &App) -> Option<&SettingsState> {
+    cx.try_global::<SettingsState>()
+}
+
+/// The workspace settings file of the current workspace, if a folder is open.
+pub fn workspace_path(cx: &App) -> Option<PathBuf> {
+    state(cx)?
+        .workspace_root
+        .as_deref()
+        .map(layers::workspace_path)
+}
+
+/// Re-read the user and workspace layers, then apply the effective settings. Invalid
+/// layers are reported and their last-known-good contents stay in effect.
+pub fn reload(
+    workspace_root: Option<&Path>,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) -> Vec<String> {
+    let mut state = cx
+        .try_global::<SettingsState>()
+        .map_or_else(SettingsState::default, |state| SettingsState {
+            workspace_root: state.workspace_root.clone(),
+            user_good: state.user_good.clone(),
+            workspace_good: state.workspace_good.clone(),
+            resolved: state.resolved.clone(),
+        });
+    let mut problems = Vec::new();
+    if state.user_good.is_null() {
+        state.user_good = serde_json::json!({});
+    }
+    if let Some(path) = path(cx) {
+        match layers::read_layer(&path) {
+            Ok(layer) => state.user_good = layer,
+            Err(error) => problems.push(error),
+        }
+    }
+    let root = workspace_root.map(Path::to_path_buf);
+    if state.workspace_root != root {
+        state.workspace_good = None;
+    }
+    state.workspace_root = root.clone();
+    if let Some(root) = &root {
+        let file = layers::workspace_path(root);
+        match layers::read_layer(&file) {
+            Ok(mut layer) => {
+                layers::resolve_paths(&mut layer, root);
+                state.workspace_good = Some((root.clone(), layer));
+            }
+            Err(error) => {
+                problems.push(format!("{error} (using the last valid workspace settings)"))
+            }
+        }
+    }
+    let workspace = state.workspace_good.as_ref().map(|(_, layer)| layer);
+    match layers::resolve(&state.user_good, workspace) {
+        Ok(resolved) => state.resolved = resolved,
+        Err(error) => problems.push(error),
+    }
+    let settings = state.resolved.settings.clone();
+    cx.set_global(state);
+    problems.extend(settings.apply(window, cx));
+    problems
 }
 
 pub fn init(cx: &mut App) -> Vec<String> {
-    let Some(path) = default_path() else {
-        return Settings::default().apply(None, cx);
-    };
-    let loaded = Settings::load(&path);
-    cx.set_global(SettingsPath(path));
-    match loaded {
-        Ok(settings) => settings.apply(None, cx),
-        Err(error) => {
-            let mut problems = vec![error];
-            problems.extend(Settings::default().apply(None, cx));
-            problems
-        }
+    if let Some(path) = default_path() {
+        cx.set_global(SettingsPath(path));
     }
+    reload(None, None, cx)
 }
 
 pub fn create_if_missing(path: &Path) -> io::Result<()> {
