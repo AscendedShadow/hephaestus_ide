@@ -59,11 +59,19 @@ mod editor_preferences;
 mod edits;
 mod language_mode;
 mod line_commands;
+mod lsp_features;
+mod outline;
+mod picker;
 mod project_search;
 mod settings_commands;
+mod workspace_edits;
 
 #[cfg(test)]
 mod ide_tests;
+#[cfg(test)]
+mod lsp_tests;
+#[cfg(test)]
+mod mock_lsp;
 
 #[cfg(test)]
 #[path = "shell_tests.rs"]
@@ -103,6 +111,7 @@ enum SidebarPanel {
     Folder,
     Git,
     Search,
+    Outline,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -123,6 +132,7 @@ enum SearchMode {
     Completion,
     Line,
     Languages,
+    Items,
 }
 
 impl ToolPanel {
@@ -307,6 +317,17 @@ pub struct IdeShell {
     save_all_note: Option<String>,
     search_panel: Entity<crate::search_panel::SearchPanel>,
     search_state: project_search::SearchState,
+    edit_history: workspace_edits::EditHistory,
+    picker: Option<picker::Picker>,
+    symbol_task: Task<()>,
+    outline_timer: Task<()>,
+    /// Latest document symbols: buffer, document version, symbols.
+    outline: Option<(BufferId, Option<i32>, Vec<lsp_features::Symbol>)>,
+    workspace_symbols: Vec<lsp_types::WorkspaceSymbol>,
+    workspace_symbol_language: Option<&'static str>,
+    code_actions: Option<(lsp_features::Target, Vec<lsp_types::CodeActionOrCommand>)>,
+    /// Full diagnostics as published by language servers, per file.
+    lsp_diagnostics: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -364,14 +385,25 @@ impl IdeShell {
             save_all_note: None,
             search_panel: cx.new(|cx| crate::search_panel::SearchPanel::new(window, cx)),
             search_state: Default::default(),
+            edit_history: Default::default(),
+            picker: None,
+            symbol_task: Task::ready(()),
+            outline_timer: Task::ready(()),
+            outline: None,
+            workspace_symbols: Vec::new(),
+            workspace_symbol_language: None,
+            code_actions: None,
+            lsp_diagnostics: HashMap::new(),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
         shell._subscriptions = vec![
             search_subscription,
-            cx.subscribe_in(&shell.servers.clone(), window, |this, _, event, _, cx| {
-                this.handle_server_event(event, cx)
-            }),
+            cx.subscribe_in(
+                &shell.servers.clone(),
+                window,
+                |this, _, event, window, cx| this.handle_server_event(event, window, cx),
+            ),
             cx.subscribe_in(
                 &shell.git,
                 window,
@@ -590,24 +622,29 @@ impl IdeShell {
             language,
             cx,
         );
-        let subscription = cx.subscribe_in(&editor, window, move |this, editor, event, _, cx| {
-            if matches!(event, InputEvent::Change)
-                && let Some(ix) = this.buffer_index(id)
-            {
-                let buffer = &mut this.buffers[ix];
-                let displayed = editor.read(cx).text().to_string();
-                let source = buffer.document.text().to_string();
-                if let Some(text) = folding::apply_edit(&source, &mut buffer.folds, &displayed) {
-                    buffer.document.set_text(text.into());
+        let subscription =
+            cx.subscribe_in(&editor, window, move |this, editor, event, window, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(ix) = this.buffer_index(id)
+                {
+                    let buffer = &mut this.buffers[ix];
+                    let displayed = editor.read(cx).text().to_string();
+                    let source = buffer.document.text().to_string();
+                    if let Some(text) = folding::apply_edit(&source, &mut buffer.folds, &displayed)
+                    {
+                        buffer.document.set_text(text.into());
+                    }
+                    buffer.dirty = buffer.document.is_dirty();
+                    this.sync_lsp_buffer(ix, cx);
+                    if this.buffers[ix].dirty {
+                        this.schedule_auto_save(id, cx);
+                    }
+                    if ix == this.active {
+                        this.schedule_outline_refresh(window, cx);
+                    }
+                    cx.notify();
                 }
-                buffer.dirty = buffer.document.is_dirty();
-                this.sync_lsp_buffer(ix, cx);
-                if this.buffers[ix].dirty {
-                    this.schedule_auto_save(id, cx);
-                }
-                cx.notify();
-            }
-        });
+            });
         Buffer {
             id,
             document,
@@ -648,6 +685,9 @@ impl IdeShell {
         self.sync_git(cx);
         self.sync_servers(cx);
         self.sync_lsp_buffer(ix, cx);
+        if self.show_sidebar && self.active_sidebar == SidebarPanel::Outline {
+            self.refresh_outline(window, cx);
+        }
         cx.notify();
     }
 
@@ -687,6 +727,7 @@ impl IdeShell {
     fn handle_server_event(
         &mut self,
         event: &language_server::ServerEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -696,6 +737,9 @@ impl IdeShell {
                 }
             }
             language_server::ServerEvent::Status(status) => self.status = status.clone(),
+            language_server::ServerEvent::ApplyEdit { server, id, params } => {
+                self.server_apply_edit(server.clone(), id.clone(), params.clone(), window, cx)
+            }
             language_server::ServerEvent::Diagnostics { path, diagnostics } => {
                 self.apply_diagnostics(path, diagnostics, cx)
             }
@@ -726,6 +770,8 @@ impl IdeShell {
             })
             .collect();
         self.diagnostics.insert(path.to_path_buf(), hits);
+        self.lsp_diagnostics
+            .insert(path.to_path_buf(), diagnostics.to_vec());
         let Some(ix) = self.buffer_for_path(path) else {
             return;
         };
@@ -1362,7 +1408,57 @@ impl IdeShell {
         .detach();
     }
 
+    /// Save, running the language server's formatter first when format-on-save is on.
+    /// The save waits for the formatting result (up to a timeout); a failed, timed-out or
+    /// stale formatting result is skipped and the current text is saved.
     fn save(
+        &mut self,
+        target: SaveTarget,
+        then: Option<PendingAction>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        let wants_format = matches!(target, SaveTarget::Current)
+            && self.buffer().preferences.format_on_save
+            && self.document().path().is_some();
+        let request = if wants_format {
+            self.formatting_request(false, true, cx)
+        } else {
+            None
+        };
+        let Some((format_target, request)) = request else {
+            return self.save_now(target, then, window, cx);
+        };
+        self.busy = true;
+        self.status = "Formatting before save…".into();
+        cx.notify();
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(3));
+        cx.spawn_in(window, async move |this, cx| {
+            let response = futures_lite::future::or(async { Some(request.await) }, async {
+                timer.await;
+                None
+            })
+            .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match response {
+                    Some(response) => {
+                        this.apply_formatting(&format_target, response, window, cx);
+                    }
+                    None => this.status = "Formatting timed out; saving without it".into(),
+                }
+                this.save_now(target, then, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn save_now(
         &mut self,
         target: SaveTarget,
         then: Option<PendingAction>,
@@ -1850,6 +1946,14 @@ impl IdeShell {
         self.search_task = Task::ready(());
         self.search_hits.clear();
         self.search_selected = 0;
+        if self.search_mode == Some(SearchMode::Items)
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == picker::PickerKind::WorkspaceSymbols)
+        {
+            self.update_workspace_symbols(query.clone(), cx);
+        }
         match self.search_mode {
             Some(SearchMode::File) if !query.is_empty() => {
                 let text = self.document().text().to_string();
@@ -1882,7 +1986,8 @@ impl IdeShell {
     fn choose_search_result(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mode) = self.search_mode else { return };
         let query = self.search_input.read(cx).text().to_string();
-        let query = query.trim_end_matches(['\r', '\n']);
+        let query = query.trim_end_matches(['\r', '\n']).to_string();
+        let query = query.as_str();
         let file = (mode == SearchMode::Files)
             .then(|| self.ranked_paths(query).get(ix).cloned())
             .flatten();
@@ -1925,6 +2030,7 @@ impl IdeShell {
                     self.insert_completion(index, window, cx);
                 }
             }
+            SearchMode::Items => self.choose_picker_item(ix, query, window, cx),
             SearchMode::Languages => {
                 if let Some(language) = language {
                     self.set_buffer_language(self.active, language, cx);
@@ -2143,6 +2249,21 @@ impl IdeShell {
         }
     }
 
+    fn search_item_count(&self, cx: &App) -> usize {
+        let query = self.search_input.read(cx).text().to_string();
+        let query = query.trim_end_matches(['\r', '\n']);
+        match self.search_mode {
+            Some(SearchMode::Files) => self.ranked_paths(query).len(),
+            Some(SearchMode::Commands) => self.ranked_commands(query).len(),
+            Some(SearchMode::Tasks) => self.ranked_tasks(query).len(),
+            Some(SearchMode::Completion) => self.ranked_completions(query).len(),
+            Some(SearchMode::Languages) => self.ranked_languages(query).len(),
+            Some(SearchMode::Items) => self.ranked_items(query).len(),
+            Some(SearchMode::File | SearchMode::Diagnostics) => self.search_hits.len().min(1000),
+            Some(SearchMode::Line) | None => 1,
+        }
+    }
+
     fn render_search(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.search_mode.unwrap();
         let query = self.search_input.read(cx).text().to_string();
@@ -2183,6 +2304,7 @@ impl IdeShell {
                 .map(|&ix| self.completions[ix].0.clone())
                 .collect(),
             SearchMode::Line => vec!["Enter line or line:column, then press Enter".into()],
+            SearchMode::Items => self.picker_labels(query),
             SearchMode::Languages => self
                 .ranked_languages(query)
                 .into_iter()
@@ -2191,7 +2313,7 @@ impl IdeShell {
             SearchMode::File | SearchMode::Diagnostics => self
                 .search_hits
                 .iter()
-                .take(30)
+                .take(1000)
                 .map(|hit| {
                     format!(
                         "{}:{}:{}  {}",
@@ -2222,7 +2344,8 @@ impl IdeShell {
                         cx.notify();
                     }
                     "down" => {
-                        this.search_selected = (this.search_selected + 1).min(29);
+                        this.search_selected = (this.search_selected + 1)
+                            .min(this.search_item_count(cx).saturating_sub(1));
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -2572,9 +2695,10 @@ impl IdeShell {
         cx.notify();
         self.lsp_task = cx.spawn_in(window, async move |this, cx| {
             let found = request.await;
-            let _ = this.update_in(cx, |this, window, cx| match found {
-                Some((path, position)) => this.open_declaration_at(path, position, window, cx),
-                None => {
+            let _ = this.update_in(cx, |this, window, cx| {
+                let shown = found
+                    .is_some_and(|response| this.show_definition_targets(response, window, cx));
+                if !shown {
                     this.go_to_declaration_fallback(display_offset, window, cx);
                 }
             });
@@ -2593,23 +2717,6 @@ impl IdeShell {
         }
         let offset = self.editor().read(cx).cursor();
         self.go_to_declaration(offset, window, cx);
-    }
-
-    fn open_declaration_at(
-        &mut self,
-        path: PathBuf,
-        position: Position,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let hit = SearchMatch {
-            path,
-            line: position.line as usize + 1,
-            column: position.character as usize + 1,
-            preview: String::new(),
-        };
-        self.record_location(&hit, cx);
-        self.open_at(hit, window, cx);
     }
 
     fn hover_info(&mut self, _: &HoverInfo, window: &mut Window, cx: &mut Context<Self>) {
@@ -3100,6 +3207,7 @@ impl IdeShell {
                 SidebarPanel::Folder => self.render_project_sidebar(cx).into_any_element(),
                 SidebarPanel::Git => self.git.clone().into_any_element(),
                 SidebarPanel::Search => self.search_panel.clone().into_any_element(),
+                SidebarPanel::Outline => self.render_outline(cx).into_any_element(),
             })
     }
 
@@ -4233,6 +4341,21 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::show_effective_settings))
             .on_action(cx.listener(Self::save_all_action))
             .on_action(cx.listener(Self::undo_workspace_replace))
+            .on_action(cx.listener(Self::undo_workspace_edit))
+            .on_action(cx.listener(Self::rename_symbol))
+            .on_action(cx.listener(Self::find_references))
+            .on_action(cx.listener(Self::find_references_without_declaration))
+            .on_action(cx.listener(Self::go_to_implementation))
+            .on_action(cx.listener(Self::go_to_type_definition))
+            .on_action(cx.listener(Self::go_to_symbol_in_file))
+            .on_action(cx.listener(Self::go_to_symbol_in_workspace))
+            .on_action(cx.listener(Self::format_document))
+            .on_action(cx.listener(Self::format_selection))
+            .on_action(cx.listener(Self::quick_fix))
+            .on_action(cx.listener(Self::refactor))
+            .on_action(cx.listener(Self::source_action))
+            .on_action(cx.listener(Self::organize_imports))
+            .on_action(cx.listener(Self::show_outline))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

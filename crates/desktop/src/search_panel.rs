@@ -150,10 +150,12 @@ impl SearchPanel {
         self.replace.read(cx).value().to_string()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn results(&self) -> &Results {
         &self.results
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -248,11 +250,13 @@ impl SearchPanel {
         rows
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn hit_count(&self) -> usize {
         self.results.hits.len()
     }
 
     /// Select the row of the `n`th hit (for keyboard tests and next/previous result).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn select_hit(&mut self, n: usize, cx: &mut Context<Self>) {
         if let Some(row) = self.rows().iter().position(|row| *row == Row::Hit(n)) {
             self.selected = row;

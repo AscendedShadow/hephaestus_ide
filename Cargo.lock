@@ -2632,6 +2632,7 @@ dependencies = [
  "async-channel 2.5.0",
  "dap",
  "embed-resource",
+ "futures-lite 2.6.1",
  "gpui",
  "gpui-component",
  "gpui-component-assets",

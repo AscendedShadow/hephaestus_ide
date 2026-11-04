@@ -89,6 +89,16 @@ fn serve(
                 });
                 transport::write_message(&mut output, &message.to_string()).unwrap();
             }
+            Some("workspace/executeCommand") => {
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": 700,
+                    "method": "workspace/applyEdit",
+                    "params": {"label": "fix", "edit": {"changes": {}}},
+                });
+                transport::write_message(&mut output, &request.to_string()).unwrap();
+                respond(&mut output, id, Value::Null);
+            }
             Some("exit") => break,
             Some(_) => {
                 if id.is_some() {
@@ -243,4 +253,44 @@ fn paths_round_trip_through_file_uris() {
     assert!(text.ends_with("/space%20dir/caf%C3%A9.rs"), "{text}");
     assert!(!text.contains('\\'), "{text}");
     assert_eq!(uri_to_path(&uri).unwrap(), path);
+}
+
+#[test]
+fn apply_edit_requests_are_forwarded_and_answered_by_the_application() {
+    let (client, options, replies, _directory) = connect();
+    block_on(client.initialize(&options)).unwrap();
+    let _ = replies.recv_timeout(TIMEOUT).unwrap();
+    let command =
+        client.request::<lsp_types::request::ExecuteCommand>(lsp_types::ExecuteCommandParams {
+            command: "fix".into(),
+            arguments: Vec::new(),
+            work_done_progress_params: Default::default(),
+        });
+    let request = block_on(async {
+        loop {
+            match client.events().recv().await {
+                Ok(Event::Request { id, method, params }) => return (id, method, params),
+                Ok(_) => continue,
+                Err(_) => panic!("events closed"),
+            }
+        }
+    });
+    assert_eq!(request.0, json!(700));
+    assert_eq!(request.1, "workspace/applyEdit");
+    assert_eq!(request.2["label"], json!("fix"));
+    client.respond(
+        request.0,
+        Ok(json!({"applied": false, "failureReason": "stale"})),
+    );
+    let answer = replies.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(answer["id"], json!(700));
+    assert_eq!(answer["result"]["failureReason"], json!("stale"));
+    assert_eq!(block_on(command).unwrap(), None);
+    let capabilities = super::capabilities();
+    let workspace = capabilities.workspace.unwrap();
+    assert_eq!(workspace.apply_edit, Some(true));
+    assert_eq!(
+        workspace.workspace_edit.unwrap().document_changes,
+        Some(true)
+    );
 }

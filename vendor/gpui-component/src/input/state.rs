@@ -1732,8 +1732,8 @@ impl InputState {
         self.selection_reversed
     }
 
-    /// Select a byte range (UTF-8 offsets). With `reversed`, the cursor is placed at the
-    /// start of the range.
+    /// Select a byte range (UTF-8 offsets) and scroll it into view, without moving focus.
+    /// With `reversed`, the cursor is placed at the start of the range.
     pub fn select_byte_range(
         &mut self,
         range: Range<usize>,
@@ -1752,7 +1752,7 @@ impl InputState {
         self.selected_word_range = None;
         self.update_preferred_column();
         let cursor = self.cursor();
-        self.focus(window, cx);
+        let _ = window;
         self.center_on(cursor, cx);
         cx.notify();
     }

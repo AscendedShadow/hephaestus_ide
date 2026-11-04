@@ -116,6 +116,12 @@ impl Document {
         self.line_ending
     }
 
+    /// Point the document at a new path after its file was moved or renamed on disk. The
+    /// recorded disk content is kept, so external-change detection keeps working.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+    }
+
     /// Change the line ending used when saving.
     pub fn set_line_ending(&mut self, line_ending: LineEnding) {
         self.line_ending = line_ending;

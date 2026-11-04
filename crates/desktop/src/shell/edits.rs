@@ -116,6 +116,9 @@ impl IdeShell {
                 )
             });
         }
+        if ix == self.active && !self.show_diff {
+            self.focus_editor(window, cx);
+        }
         cx.notify();
         true
     }

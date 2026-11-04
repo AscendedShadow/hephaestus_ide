@@ -15,6 +15,10 @@ use lsp_types::{
 
 use crate::{navigation, settings::LanguageServer, syntax};
 
+mod features;
+
+pub use features::{Features, RequestOrigin};
+
 #[cfg(test)]
 #[path = "language_server_tests.rs"]
 mod tests;
@@ -37,6 +41,13 @@ impl State {
 }
 
 pub enum ServerEvent {
+    /// The server asks the client to apply a workspace edit; answer with
+    /// [`Servers::respond`].
+    ApplyEdit {
+        server: String,
+        id: serde_json::Value,
+        params: serde_json::Value,
+    },
     Diagnostics {
         path: PathBuf,
         diagnostics: Vec<lsp_types::Diagnostic>,
@@ -138,6 +149,18 @@ impl Servers {
                 return None;
             }
         };
+        self.adopt(name.clone(), client, options, cx);
+        Some(name)
+    }
+
+    /// Run the event pump and initialization handshake for a connected client.
+    pub(crate) fn adopt(
+        &mut self,
+        name: String,
+        client: lsp::Client,
+        options: lsp::Options,
+        cx: &mut Context<Self>,
+    ) {
         let events = client.events();
         let owner = name.clone();
         let pump = cx.spawn(async move |this, cx| {
@@ -175,14 +198,20 @@ impl Servers {
         })
         .detach();
         self.servers.insert(
-            name.clone(),
+            name,
             Server {
                 client,
                 state: State::Starting,
                 _events: pump,
             },
         );
-        Some(name)
+    }
+
+    /// The configured servers and root (for tests that install an in-process server).
+    #[cfg(test)]
+    pub(crate) fn configure_for_test(&mut self, configs: Vec<LanguageServer>, root: PathBuf) {
+        self.configs = configs;
+        self.root = Some(root);
     }
 
     fn handle(&mut self, name: &str, event: lsp::Event, cx: &mut Context<Self>) {
@@ -190,6 +219,19 @@ impl Servers {
             lsp::Event::Diagnostics { path, diagnostics } => {
                 if self.documents.contains_key(&path) {
                     cx.emit(ServerEvent::Diagnostics { path, diagnostics });
+                }
+            }
+            lsp::Event::Request { id, method, params } => {
+                if method == "workspace/applyEdit" {
+                    cx.emit(ServerEvent::ApplyEdit {
+                        server: name.to_string(),
+                        id,
+                        params,
+                    });
+                } else if let Some(server) = self.servers.get(name) {
+                    server
+                        .client
+                        .respond(id, Err(format!("{method} is not supported")));
                 }
             }
             lsp::Event::Log(message) => {
@@ -321,7 +363,7 @@ impl Servers {
         path: &Path,
         language: &str,
         position: Position,
-    ) -> Option<impl Future<Output = Option<(PathBuf, Position)>> + use<>> {
+    ) -> Option<impl Future<Output = Option<GotoDefinitionResponse>> + use<>> {
         let request = self
             .client(language)?
             .request::<lsp_types::request::GotoDefinition>(GotoDefinitionParams {
@@ -329,7 +371,7 @@ impl Servers {
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             });
-        Some(async move { request.await.ok().flatten().and_then(first_location) })
+        Some(async move { request.await.ok().flatten() })
     }
 
     pub fn completions(
@@ -362,25 +404,6 @@ impl Servers {
             },
             position,
         })
-    }
-}
-
-fn first_location(response: GotoDefinitionResponse) -> Option<(PathBuf, Position)> {
-    match response {
-        GotoDefinitionResponse::Scalar(location) => {
-            Some((lsp::uri_to_path(&location.uri)?, location.range.start))
-        }
-        GotoDefinitionResponse::Array(locations) => {
-            let location = locations.into_iter().next()?;
-            Some((lsp::uri_to_path(&location.uri)?, location.range.start))
-        }
-        GotoDefinitionResponse::Link(links) => {
-            let link = links.into_iter().next()?;
-            Some((
-                lsp::uri_to_path(&link.target_uri)?,
-                link.target_selection_range.start,
-            ))
-        }
     }
 }
 

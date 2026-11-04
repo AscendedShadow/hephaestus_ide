@@ -73,7 +73,22 @@ actions!(
         OpenUserSettings,
         ShowEffectiveSettings,
         SaveAll,
-        UndoWorkspaceReplace
+        UndoWorkspaceReplace,
+        UndoWorkspaceEdit,
+        RenameSymbol,
+        FindReferences,
+        FindReferencesWithoutDeclaration,
+        GoToImplementation,
+        GoToTypeDefinition,
+        GoToSymbolInFile,
+        GoToSymbolInWorkspace,
+        FormatDocument,
+        FormatSelection,
+        QuickFix,
+        Refactor,
+        SourceAction,
+        OrganizeImports,
+        ShowOutline
     ]
 );
 
@@ -167,6 +182,21 @@ commands! {
     ShowEffectiveSettings => ShowEffectiveSettings,
     SaveAll => SaveAll,
     UndoWorkspaceReplace => UndoWorkspaceReplace,
+    UndoWorkspaceEdit => UndoWorkspaceEdit,
+    RenameSymbol => RenameSymbol,
+    FindReferences => FindReferences,
+    FindReferencesWithoutDeclaration => FindReferencesWithoutDeclaration,
+    GoToImplementation => GoToImplementation,
+    GoToTypeDefinition => GoToTypeDefinition,
+    GoToSymbolInFile => GoToSymbolInFile,
+    GoToSymbolInWorkspace => GoToSymbolInWorkspace,
+    FormatDocument => FormatDocument,
+    FormatSelection => FormatSelection,
+    QuickFix => QuickFix,
+    Refactor => Refactor,
+    SourceAction => SourceAction,
+    OrganizeImports => OrganizeImports,
+    ShowOutline => ShowOutline,
 }
 
 impl Command {
@@ -191,6 +221,12 @@ impl Command {
             Self::DeleteLines => Some(EDITOR_INPUT.into()),
             Self::InsertLineAbove => Some(EDITOR_INPUT.into()),
             Self::InsertLineBelow => Some(EDITOR_INPUT.into()),
+            Self::RenameSymbol => Some(EDITOR_INPUT.into()),
+            Self::FormatDocument => Some(EDITOR_INPUT.into()),
+            Self::FormatSelection => Some(EDITOR_INPUT.into()),
+            Self::QuickFix => Some(EDITOR_INPUT.into()),
+            Self::Refactor => Some(EDITOR_INPUT.into()),
+            Self::OrganizeImports => Some(EDITOR_INPUT.into()),
             _ => None,
         }
     }
@@ -258,6 +294,17 @@ impl Command {
             Self::InsertLineAbove => &["secondary-shift-enter"],
             Self::InsertLineBelow => &["secondary-enter"],
             Self::SaveAll => &["secondary-alt-s"],
+            Self::RenameSymbol => &["f2"],
+            Self::FindReferences => &["shift-f12"],
+            Self::GoToImplementation => &["secondary-f12"],
+            Self::GoToSymbolInFile => &["secondary-shift-o"],
+            Self::GoToSymbolInWorkspace => &["secondary-t"],
+            Self::FormatDocument => &["shift-alt-f"],
+            Self::FormatSelection => &["secondary-k secondary-f"],
+            Self::QuickFix => &["secondary-."],
+            Self::Refactor => &["ctrl-shift-r"],
+            Self::OrganizeImports => &["shift-alt-o"],
+            Self::ShowOutline => &["secondary-shift-u"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };
@@ -433,6 +480,28 @@ fn menus() -> Vec<Menu> {
             MenuItem::action("Change Language Mode…", ChangeLanguageMode),
         ],
     };
+    let code_menu = Menu {
+        name: "Code".into(),
+        items: vec![
+            MenuItem::action("Go to Definition", GoToDefinition),
+            MenuItem::action("Go to Type Definition", GoToTypeDefinition),
+            MenuItem::action("Go to Implementation", GoToImplementation),
+            MenuItem::action("Find References", FindReferences),
+            MenuItem::action("Go to Symbol in File…", GoToSymbolInFile),
+            MenuItem::action("Go to Symbol in Workspace…", GoToSymbolInWorkspace),
+            MenuItem::action("Show Outline", ShowOutline),
+            MenuItem::separator(),
+            MenuItem::action("Rename Symbol…", RenameSymbol),
+            MenuItem::action("Quick Fix…", QuickFix),
+            MenuItem::action("Refactor…", Refactor),
+            MenuItem::action("Source Action…", SourceAction),
+            MenuItem::action("Organize Imports", OrganizeImports),
+            MenuItem::action("Format Document", FormatDocument),
+            MenuItem::action("Format Selection", FormatSelection),
+            MenuItem::separator(),
+            MenuItem::action("Undo Workspace Edit", UndoWorkspaceEdit),
+        ],
+    };
     let view_menu = Menu {
         name: "View".into(),
         items: vec![MenuItem::action("Toggle Fold", ToggleFold)],
@@ -456,12 +525,14 @@ fn menus() -> Vec<Menu> {
             },
             file_menu,
             edit_menu,
+            code_menu,
             view_menu,
         ]
     } else {
         vec![
             file_menu,
             edit_menu,
+            code_menu,
             view_menu,
             Menu {
                 name: "Settings".into(),

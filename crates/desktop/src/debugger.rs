@@ -482,6 +482,33 @@ impl Debugger {
         enabled
     }
 
+    /// Follow a file or folder rename: breakpoints under `from` move to `to`.
+    pub fn move_breakpoints(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        let moved: Vec<PathBuf> = self
+            .breakpoints
+            .keys()
+            .filter(|path| path.starts_with(from))
+            .cloned()
+            .collect();
+        for old in moved {
+            let Ok(suffix) = old.strip_prefix(from) else {
+                continue;
+            };
+            let new = if suffix.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(suffix)
+            };
+            if let Some(lines) = self.breakpoints.remove(&old) {
+                self.breakpoints.insert(new.clone(), lines);
+            }
+            self.rejected.retain(|(path, _)| path != &old);
+            self.sync_breakpoints(&old, cx);
+            self.sync_breakpoints(&new, cx);
+        }
+        cx.notify();
+    }
+
     fn remove_breakpoints(&mut self, path: Option<&Path>, cx: &mut Context<Self>) {
         let paths: Vec<PathBuf> = match path {
             Some(path) => vec![path.to_path_buf()],

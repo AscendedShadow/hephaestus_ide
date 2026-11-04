@@ -48,8 +48,18 @@ pub enum Event {
         diagnostics: Vec<lsp_types::Diagnostic>,
     },
     Log(String),
+    /// A server-to-client request the application must answer with [`Client::respond`]
+    /// (currently `workspace/applyEdit`).
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     Stopped(String),
 }
+
+/// Server requests forwarded to the application instead of being answered here.
+pub const FORWARDED_REQUESTS: &[&str] = &["workspace/applyEdit"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(pub String);
@@ -115,6 +125,15 @@ impl Client {
         }
         drain_stderr(stderr, log);
         Ok(client)
+    }
+
+    /// Connect to a server over arbitrary streams (in-process servers and tests).
+    pub fn connect_streams(
+        stdout: impl io::BufRead + Send + 'static,
+        stdin: impl Write + Send + 'static,
+        options: &Options,
+    ) -> Self {
+        Self::connect(stdout, stdin, options, Arc::default())
     }
 
     fn connect(
@@ -198,6 +217,19 @@ impl Client {
                 .map_err(|_| Error::new("the language server stopped"))??;
             serde_json::from_value(value).map_err(|error| Error::new(error.to_string()))
         }
+    }
+
+    /// Answer a forwarded server request (see [`Event::Request`]).
+    pub fn respond(&self, id: Value, result: Result<Value, String>) {
+        let message = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(message) => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32603, "message": message},
+            }),
+        };
+        let _ = self.send(message);
     }
 
     pub fn notify<N: Notification>(&self, params: N::Params) {
@@ -355,6 +387,13 @@ fn handle(
     };
     let method = message.get("method").and_then(Value::as_str);
     match (message.get("id"), method) {
+        (Some(id), Some(method)) if FORWARDED_REQUESTS.contains(&method) => {
+            let _ = events.try_send(Event::Request {
+                id: id.clone(),
+                method: method.to_string(),
+                params: message.get("params").cloned().unwrap_or(Value::Null),
+            });
+        }
         (Some(id), Some(method)) => {
             let response = match reply(method, message.get("params"), options) {
                 Some(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -464,10 +503,43 @@ fn section_of(settings: &Value, section: &str) -> Option<Value> {
 
 fn capabilities() -> lsp_types::ClientCapabilities {
     use lsp_types::*;
+    let goto = || {
+        Some(GotoCapability {
+            link_support: Some(true),
+            ..Default::default()
+        })
+    };
+    let symbol_kinds = || SymbolKindCapability {
+        value_set: Some(
+            (1..=26)
+                .filter_map(|kind| serde_json::from_value(json!(kind)).ok())
+                .collect(),
+        ),
+    };
     ClientCapabilities {
         workspace: Some(WorkspaceClientCapabilities {
+            apply_edit: Some(true),
+            workspace_edit: Some(WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
+                resource_operations: Some(vec![
+                    ResourceOperationKind::Create,
+                    ResourceOperationKind::Rename,
+                    ResourceOperationKind::Delete,
+                ]),
+                failure_handling: Some(FailureHandlingKind::Abort),
+                normalizes_line_endings: Some(true),
+                change_annotation_support: None,
+            }),
             workspace_folders: Some(true),
             configuration: Some(true),
+            symbol: Some(WorkspaceSymbolClientCapabilities {
+                symbol_kind: Some(symbol_kinds()),
+                resolve_support: Some(WorkspaceSymbolResolveSupportCapability {
+                    properties: vec!["location.range".into()],
+                }),
+                ..Default::default()
+            }),
+            execute_command: Some(DynamicRegistrationClientCapabilities::default()),
             ..Default::default()
         }),
         text_document: Some(TextDocumentClientCapabilities {
@@ -479,22 +551,81 @@ fn capabilities() -> lsp_types::ClientCapabilities {
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 ..Default::default()
             }),
-            definition: Some(GotoCapability {
-                link_support: Some(true),
-                ..Default::default()
-            }),
+            definition: goto(),
+            type_definition: goto(),
+            implementation: goto(),
+            references: Some(DynamicRegistrationClientCapabilities::default()),
             completion: Some(CompletionClientCapabilities {
                 completion_item: Some(CompletionItemCapability {
-                    snippet_support: Some(false),
+                    snippet_support: Some(true),
+                    insert_replace_support: Some(true),
                     documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                     resolve_support: Some(CompletionItemCapabilityResolveSupport {
-                        properties: vec!["documentation".into(), "detail".into()],
+                        properties: vec![
+                            "documentation".into(),
+                            "detail".into(),
+                            "additionalTextEdits".into(),
+                        ],
                     }),
                     ..Default::default()
                 }),
+                context_support: Some(true),
                 ..Default::default()
             }),
-            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities::default()),
+            signature_help: Some(SignatureHelpClientCapabilities {
+                signature_information: Some(SignatureInformationSettings {
+                    documentation_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                    parameter_information: Some(ParameterInformationSettings {
+                        label_offset_support: Some(true),
+                    }),
+                    active_parameter_support: Some(true),
+                }),
+                context_support: Some(true),
+                ..Default::default()
+            }),
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(true),
+                symbol_kind: Some(symbol_kinds()),
+                ..Default::default()
+            }),
+            code_action: Some(CodeActionClientCapabilities {
+                code_action_literal_support: Some(CodeActionLiteralSupport {
+                    code_action_kind: CodeActionKindLiteralSupport {
+                        value_set: [
+                            "",
+                            "quickfix",
+                            "refactor",
+                            "refactor.extract",
+                            "refactor.inline",
+                            "refactor.rewrite",
+                            "source",
+                            "source.organizeImports",
+                            "source.fixAll",
+                        ]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                    },
+                }),
+                is_preferred_support: Some(true),
+                disabled_support: Some(true),
+                data_support: Some(true),
+                resolve_support: Some(CodeActionCapabilityResolveSupport {
+                    properties: vec!["edit".into(), "command".into()],
+                }),
+                ..Default::default()
+            }),
+            formatting: Some(DynamicRegistrationClientCapabilities::default()),
+            range_formatting: Some(DynamicRegistrationClientCapabilities::default()),
+            rename: Some(RenameClientCapabilities {
+                prepare_support: Some(true),
+                ..Default::default()
+            }),
+            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
+                related_information: Some(true),
+                code_description_support: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()

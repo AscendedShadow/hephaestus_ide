@@ -9,6 +9,7 @@ default-run = "hephaestus"
 anyhow.workspace = true
 async-channel.workspace = true
 dap.workspace = true
+futures-lite.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true

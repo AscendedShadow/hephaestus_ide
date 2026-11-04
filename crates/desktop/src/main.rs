@@ -22,6 +22,7 @@ mod theme;
 mod ui;
 mod vim;
 mod whitespace;
+mod workspace_edit;
 
 use assets::Assets;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
