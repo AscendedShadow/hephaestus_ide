@@ -56,6 +56,7 @@ use crate::{
 
 mod autosave;
 mod completion;
+mod debugging;
 mod editor_preferences;
 mod edits;
 mod encoding;
@@ -66,10 +67,12 @@ mod line_commands;
 mod lsp_features;
 mod outline;
 mod picker;
+mod problems;
 mod project_search;
 mod recovery;
 mod settings_commands;
 mod signature_help;
+mod tasks;
 mod terminals;
 mod workspace_edits;
 
@@ -129,6 +132,7 @@ enum ToolPanel {
     Terminal,
     Run,
     Debug,
+    Problems,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,13 +148,14 @@ enum SearchMode {
 }
 
 impl ToolPanel {
-    const ALL: [Self; 3] = [Self::Terminal, Self::Run, Self::Debug];
+    const ALL: [Self; 4] = [Self::Terminal, Self::Run, Self::Debug, Self::Problems];
 
     fn label(self) -> &'static str {
         match self {
             Self::Terminal => "Terminal",
             Self::Run => "Run",
             Self::Debug => "Debug",
+            Self::Problems => "Problems",
         }
     }
 
@@ -159,6 +164,7 @@ impl ToolPanel {
             Self::Terminal => Icon::new(IconName::SquareTerminal),
             Self::Run => Icon::new(AppIcon::Play),
             Self::Debug => Icon::new(AppIcon::Bug),
+            Self::Problems => Icon::new(IconName::TriangleAlert),
         }
     }
 }
@@ -351,6 +357,10 @@ pub struct IdeShell {
     signature: signature_help::SignatureState,
     fs_sync: fs_sync::FsSync,
     recovery: recovery::RecoveryState,
+    debug_profile: Option<String>,
+    attach_profile: Option<settings::DebuggerConfig>,
+    tasks: tasks::TaskState,
+    problems: problems::ProblemsState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -424,6 +434,10 @@ impl IdeShell {
             signature: Default::default(),
             fs_sync: Default::default(),
             recovery: recovery::RecoveryState::new(Self::recovery_directory(cx)),
+            debug_profile: None,
+            attach_profile: None,
+            tasks: Default::default(),
+            problems: Default::default(),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
@@ -482,6 +496,7 @@ impl IdeShell {
                         this.status = status.clone();
                         cx.notify();
                     }
+                    DebuggerEvent::StateChanged => this.save_debug_state(cx),
                 },
             ),
             cx.observe_in(&shell.diff_view, window, |this, diff_view, window, cx| {
@@ -516,7 +531,9 @@ impl IdeShell {
                 },
             ),
             cx.subscribe(&shell.task_terminal, |this, _, event, cx| {
-                let TerminalEvent::Exited(lines) = event;
+                let TerminalEvent::Exited(lines) = event else {
+                    return;
+                };
                 let directory = this.command_directory.as_deref().unwrap_or(Path::new("."));
                 this.run_hits = ide_core::output::locations(lines, directory);
                 if !this.run_hits.is_empty() {
@@ -670,7 +687,9 @@ impl IdeShell {
                     if let Some(text) = folding::apply_edit(&source, &mut buffer.folds, &displayed)
                     {
                         buffer.document.set_text(text.into());
+                        this.shift_breakpoints_for_edit(ix, &source, cx);
                     }
+                    let buffer = &mut this.buffers[ix];
                     buffer.dirty = buffer.document.is_dirty();
                     this.sync_lsp_buffer(ix, cx);
                     if this.buffers[ix].dirty {
@@ -1072,7 +1091,7 @@ impl IdeShell {
         }
     }
 
-    fn start_debugger(&mut self, _: &StartDebugger, _: &mut Window, cx: &mut Context<Self>) {
+    fn start_debugger(&mut self, _: &StartDebugger, window: &mut Window, cx: &mut Context<Self>) {
         self.active_panel = ToolPanel::Debug;
         if self.debugger.read(cx).is_paused() {
             self.debug_result(|debugger, cx| debugger.resume(cx), cx);
@@ -1083,26 +1102,7 @@ impl IdeShell {
             cx.notify();
             return;
         }
-        let Some(settings) = self.load_settings(cx) else {
-            return;
-        };
-        let Some(config) = settings.debugger else {
-            self.status =
-                "Configure \"debugger\" in settings.json (adapter and program to debug)".into();
-            cx.notify();
-            return;
-        };
-        let Some(directory) = self.config_directory(config.working_directory.clone(), cx) else {
-            return;
-        };
-        let result = self
-            .debugger
-            .update(cx, |debugger, cx| debugger.start(config, directory, cx));
-        self.status = match result {
-            Ok(name) => format!("Debugging {name}"),
-            Err(error) => error,
-        };
-        cx.notify();
+        self.start_debugging(window, cx);
     }
 
     fn stop_command(&mut self, _: &StopCommand, _: &mut Window, cx: &mut Context<Self>) {
@@ -1926,6 +1926,9 @@ impl IdeShell {
         self.tree_rows = self.workspace.rows();
         self.tree_scroll = UniformListScrollHandle::new();
         self.tree_selection = None;
+        self.cancel_tasks("Workspace changed", cx);
+        self.problems = Default::default();
+        self.load_debug_state(cx);
         self.start_watching(cx);
         self.sync_git(cx);
         cx.notify();
@@ -3987,6 +3990,9 @@ impl IdeShell {
                                 ToolPanel::Debug => {
                                     this.show_debug_panel(&ShowDebugPanel, window, cx)
                                 }
+                                ToolPanel::Problems => {
+                                    this.show_problems(&ShowProblems, window, cx)
+                                }
                             }))
                             .child(panel.icon().size(px(14.)))
                             .child(panel.label())
@@ -4014,9 +4020,18 @@ impl IdeShell {
                 ToolPanel::Run => div()
                     .flex_1()
                     .min_h_0()
-                    .bg(theme::background())
-                    .child(self.task_terminal.clone())
+                    .flex()
+                    .flex_col()
+                    .child(self.render_task_tabs(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .bg(theme::background())
+                            .child(self.selected_task_view()),
+                    )
                     .into_any_element(),
+                ToolPanel::Problems => self.render_problems(cx).into_any_element(),
                 ToolPanel::Debug => div()
                     .flex_1()
                     .min_h_0()
@@ -4434,6 +4449,18 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::reopen_with_encoding))
             .on_action(cx.listener(Self::save_with_encoding))
             .on_action(cx.listener(Self::change_line_ending))
+            .on_action(cx.listener(Self::select_debug_profile))
+            .on_action(cx.listener(Self::edit_breakpoint))
+            .on_action(cx.listener(Self::toggle_breakpoint_enabled))
+            .on_action(cx.listener(Self::remove_all_breakpoints))
+            .on_action(cx.listener(Self::add_watch))
+            .on_action(cx.listener(Self::run_task_picker))
+            .on_action(cx.listener(Self::run_build_task))
+            .on_action(cx.listener(Self::cancel_task))
+            .on_action(cx.listener(Self::rerun_last_task))
+            .on_action(cx.listener(Self::show_problems))
+            .on_action(cx.listener(Self::next_problem))
+            .on_action(cx.listener(Self::previous_problem))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))

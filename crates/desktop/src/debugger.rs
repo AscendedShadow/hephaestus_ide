@@ -27,6 +27,10 @@ use crate::{
     theme, ui,
 };
 
+mod features;
+
+pub use features::{BreakpointOptions, PersistedState, state_path};
+
 #[cfg(test)]
 #[path = "debugger_tests.rs"]
 mod tests;
@@ -38,7 +42,12 @@ const ROW_HEIGHT: f32 = 22.;
 const ROW_GROUP: &str = "debug-row";
 
 pub enum DebuggerEvent {
-    Reveal { path: PathBuf, line: usize },
+    /// Breakpoints, exception filters or watches changed (persist them).
+    StateChanged,
+    Reveal {
+        path: PathBuf,
+        line: usize,
+    },
     Status(String),
 }
 
@@ -187,6 +196,15 @@ fn default_adapter() -> (String, Vec<String>) {
 }
 
 pub fn plan(config: &DebuggerConfig) -> Result<Plan, String> {
+    // Attaching does not need a program: plan the adapter, then drop the placeholder.
+    if config.request == crate::settings::DebugRequest::Attach && config.program.trim().is_empty() {
+        let mut with_program = config.clone();
+        with_program.program = "attach".into();
+        let mut plan = plan(&with_program)?;
+        plan.program.clear();
+        plan.args.clear();
+        return Ok(plan);
+    }
     let missing =
         || "Set \"program\" in the debugger settings to the executable to debug".to_string();
     let (adapter, adapter_args, program, args) = if !config.adapter.trim().is_empty() {
@@ -262,6 +280,37 @@ fn same_file(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Merge adapter-specific `arguments` from the profile into a request.
+fn merge_arguments(mut arguments: Value, config: &DebuggerConfig) -> Value {
+    if let (Some(Value::Object(extra)), Value::Object(target)) = (&config.arguments, &mut arguments)
+    {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    arguments
+}
+
+pub fn attach_arguments(plan: &Plan, config: &DebuggerConfig, directory: Option<&Path>) -> Value {
+    let mut arguments = json!({
+        "name": if config.name.is_empty() { "Attach" } else { config.name.as_str() },
+        "type": plan.adapter_id,
+        "request": "attach",
+    });
+    if let Some(pid) = config.process_id {
+        // Adapters disagree on the key: lldb-dap/gdb use `pid`, others `processId`.
+        arguments["pid"] = json!(pid);
+        arguments["processId"] = json!(pid);
+    }
+    if !plan.program.trim().is_empty() {
+        arguments["program"] = json!(plan.program);
+    }
+    if let Some(directory) = directory {
+        arguments["cwd"] = json!(plain_path(directory));
+    }
+    merge_arguments(arguments, config)
+}
+
 pub fn launch_arguments(plan: &Plan, config: &DebuggerConfig, directory: Option<&Path>) -> Value {
     let program = match directory {
         Some(directory) if Path::new(&plan.program).is_relative() => {
@@ -296,7 +345,7 @@ pub fn launch_arguments(plan: &Plan, config: &DebuggerConfig, directory: Option<
     if plan.gdb() && config.stop_on_entry {
         arguments["stopAtBeginningOfMainSubprogram"] = json!(true);
     }
-    arguments
+    merge_arguments(arguments, config)
 }
 
 pub fn hex_rows(start: Option<u64>, offset: i64, bytes: &[u8]) -> Vec<(String, String, String)> {
@@ -356,6 +405,16 @@ struct Session {
 
 pub struct Debugger {
     breakpoints: HashMap<PathBuf, BTreeSet<usize>>,
+    options: HashMap<(PathBuf, usize), BreakpointOptions>,
+    capabilities: Value,
+    exception_filters: Vec<features::ExceptionFilter>,
+    exception_choices: HashMap<String, bool>,
+    watches: Vec<features::Watch>,
+    watch_generation: u64,
+    watch_input: Entity<InputState>,
+    /// Terminate the debuggee on stop (launch sessions, or attach with
+    /// `terminate_on_stop`).
+    terminate_on_stop: bool,
     rejected: HashSet<(PathBuf, usize)>,
     session: Option<Session>,
     last_launch: Option<(DebuggerConfig, Option<PathBuf>)>,
@@ -393,7 +452,19 @@ impl Debugger {
                 .placeholder("Address or expression, e.g. &buffer")
                 .multi_line(false)
         });
+        let watch_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Add watch expression…")
+                .multi_line(false)
+        });
         let subscriptions = vec![
+            cx.subscribe_in(&watch_input, window, |this, input, event, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    let expression = input.read(cx).text().to_string();
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                    this.add_watch(expression.trim().to_string(), cx);
+                }
+            }),
             cx.subscribe_in(&console_input, window, |this, input, event, window, cx| {
                 if let InputEvent::PressEnter { .. } = event {
                     let expression = input.read(cx).text().to_string();
@@ -410,6 +481,14 @@ impl Debugger {
         ];
         Self {
             breakpoints: HashMap::new(),
+            options: HashMap::new(),
+            capabilities: Value::Null,
+            exception_filters: Vec::new(),
+            exception_choices: HashMap::new(),
+            watches: Vec::new(),
+            watch_generation: 0,
+            watch_input,
+            terminate_on_stop: true,
             rejected: HashSet::new(),
             session: None,
             last_launch: None,
@@ -472,7 +551,9 @@ impl Debugger {
         let enabled = lines.insert(line);
         if !enabled {
             lines.remove(&line);
+            self.options.remove(&(path.clone(), line));
         }
+        cx.emit(DebuggerEvent::StateChanged);
         if lines.is_empty() {
             self.breakpoints.remove(&path);
         }
@@ -526,12 +607,9 @@ impl Debugger {
         let Some(session) = self.session.as_ref().filter(|session| session.configured) else {
             return;
         };
-        let lines: Vec<usize> = self
-            .breakpoints
-            .get(path)
-            .map(|lines| lines.iter().copied().collect())
-            .unwrap_or_default();
-        let request = session.client.set_breakpoints(&plain_path(path), &lines);
+        let client = session.client.clone();
+        let (lines, breakpoints) = self.source_breakpoints(path);
+        let request = client.set_breakpoints(&plain_path(path), &breakpoints);
         let path = path.to_path_buf();
         cx.spawn(async move |this, cx| {
             let result = request.await;
@@ -550,6 +628,31 @@ impl Debugger {
         match result {
             Ok(breakpoints) => {
                 for (line, breakpoint) in lines.into_iter().zip(breakpoints) {
+                    // The adapter may move a breakpoint to the nearest valid line.
+                    let actual = breakpoint
+                        .line
+                        .and_then(|line| usize::try_from(line).ok())
+                        .filter(|actual| *actual != line && *actual > 0)
+                        .filter(|actual| {
+                            !self
+                                .breakpoints
+                                .get(&path)
+                                .is_some_and(|lines| lines.contains(actual))
+                        });
+                    let line = match actual {
+                        Some(actual) => {
+                            if let Some(lines) = self.breakpoints.get_mut(&path) {
+                                lines.remove(&line);
+                                lines.insert(actual);
+                            }
+                            if let Some(options) = self.options.remove(&(path.clone(), line)) {
+                                self.options.insert((path.clone(), actual), options);
+                            }
+                            cx.emit(DebuggerEvent::StateChanged);
+                            actual
+                        }
+                        None => line,
+                    };
                     if breakpoint.verified {
                         self.rejected.remove(&(path.clone(), line));
                     } else {
@@ -608,10 +711,20 @@ impl Debugger {
         });
         let handshake = client.initialize(&plan.adapter_id);
         let launch_client = client.clone();
-        let arguments = launch_arguments(&plan, &config, directory.as_deref());
+        let attach = config.request == crate::settings::DebugRequest::Attach;
+        self.terminate_on_stop = !attach || config.terminate_on_stop;
+        let arguments = if attach {
+            attach_arguments(&plan, &config, directory.as_deref())
+        } else {
+            launch_arguments(&plan, &config, directory.as_deref())
+        };
+        let command = if attach { "attach" } else { "launch" };
         cx.spawn(async move |this, cx| {
             let result = match handshake.await {
-                Ok(_) => launch_client.request("launch", arguments).await,
+                Ok(capabilities) => {
+                    let _ = this.update(cx, |this, _| this.adopt_capabilities(capabilities));
+                    launch_client.request(command, arguments).await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
@@ -649,8 +762,9 @@ impl Debugger {
 
     fn shutdown(&mut self) {
         if let Some(session) = self.session.take() {
-            drop(session.client.disconnect());
+            drop(session.client.disconnect_with(self.terminate_on_stop));
         }
+        self.mark_watches_stale();
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
@@ -695,6 +809,25 @@ impl Debugger {
             Event::Continued => {
                 self.state = State::Running;
                 self.clear_pause();
+                self.mark_watches_stale();
+            }
+            Event::Breakpoint { reason, breakpoint } => {
+                if let (Some(path), Some(line)) = (
+                    breakpoint
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.path.clone()),
+                    breakpoint.line.and_then(|line| usize::try_from(line).ok()),
+                ) {
+                    let path = same_file(&path);
+                    if reason != "removed" {
+                        if breakpoint.verified {
+                            self.rejected.remove(&(path, line));
+                        } else {
+                            self.rejected.insert((path, line));
+                        }
+                    }
+                }
             }
             Event::Output { category, output } => {
                 if category != "telemetry" {
@@ -745,16 +878,18 @@ impl Debugger {
         };
         session.configured = true;
         let client = session.client.clone();
-        let files: Vec<(PathBuf, Vec<usize>)> = self
-            .breakpoints
-            .iter()
-            .map(|(path, lines)| (path.clone(), lines.iter().copied().collect()))
-            .collect();
-        let requests: Vec<_> = files
-            .iter()
-            .map(|(path, lines)| client.set_breakpoints(&plain_path(path), lines))
-            .collect();
-        let exceptions = client.request("setExceptionBreakpoints", json!({"filters": []}));
+        let paths: Vec<PathBuf> = self.breakpoints.keys().cloned().collect();
+        let mut files: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+        let mut requests = Vec::new();
+        for path in paths {
+            let (lines, breakpoints) = self.source_breakpoints(&path);
+            requests.push(client.set_breakpoints(&plain_path(&path), &breakpoints));
+            files.push((path, lines));
+        }
+        let exceptions = client.request(
+            "setExceptionBreakpoints",
+            json!({"filters": self.enabled_filters()}),
+        );
         cx.spawn(async move |this, cx| {
             let mut results = Vec::new();
             for request in requests {
@@ -837,6 +972,7 @@ impl Debugger {
             return;
         };
         self.frame = ix;
+        self.refresh_watches(cx);
         self.scopes.clear();
         self.children.clear();
         self.expanded.clear();
@@ -1461,7 +1597,7 @@ impl Debugger {
                                 .icon(IconName::Delete)
                                 .tooltip("Remove all breakpoints")
                                 .on_click(
-                                    cx.listener(|this, _, _, cx| this.remove_breakpoints(None, cx)),
+                                    cx.listener(|this, _, _, cx| this.remove_all_breakpoints(cx)),
                                 ),
                         )
                     }),
@@ -1479,15 +1615,34 @@ impl Debugger {
                 let rejected = self.is_rejected(path, line);
                 let reveal = path.clone();
                 let remove = path.clone();
+                let toggle = path.clone();
+                let options = self.options_at(path, line);
+                let summary = options.summary();
                 row(("debug-breakpoint", ix), false)
-                    .child(breakpoint_dot(rejected))
+                    .child(
+                        gpui_component::checkbox::Checkbox::new(("debug-breakpoint-enabled", ix))
+                            .checked(options.enabled)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_breakpoint_enabled(toggle.clone(), line, cx);
+                            })),
+                    )
+                    .child(breakpoint_dot(rejected || !options.enabled))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(theme::text())
-                            .child(file_name(path)),
+                            .text_color(if options.enabled {
+                                theme::text()
+                            } else {
+                                theme::subtle()
+                            })
+                            .child(if summary.is_empty() {
+                                file_name(path)
+                            } else {
+                                format!("{} — {summary}", file_name(path))
+                            }),
                     )
                     .child(
                         div()
@@ -1984,7 +2139,9 @@ impl Render for Debugger {
                                         .bg(theme::panel())
                                         .overflow_y_scrollbar()
                                         .child(self.render_call_stack(cx))
-                                        .child(self.render_breakpoints(cx)),
+                                        .child(self.render_watches(cx))
+                                        .child(self.render_breakpoints(cx))
+                                        .child(self.render_exception_filters(cx)),
                                 ),
                         )
                         .child(resizable_panel().child(self.render_variables(cx)))

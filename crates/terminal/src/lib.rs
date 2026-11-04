@@ -86,6 +86,8 @@ pub enum Event {
     Wakeup,
     Exited,
     Copy(String),
+    /// Raw process output (piped sessions only), in arrival order.
+    Output(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,18 +104,24 @@ pub struct GridPoint {
     pub right_half: bool,
 }
 
+enum Message {
+    Pty(PtyMessage),
+    Output(Vec<u8>),
+    Exit(Option<i32>),
+}
+
 #[derive(Clone)]
-struct Listener(async_channel::Sender<PtyMessage>);
+struct Listener(async_channel::Sender<Message>);
 
 impl EventListener for Listener {
     fn send_event(&self, event: PtyMessage) {
-        let _ = self.0.try_send(event);
+        let _ = self.0.try_send(Message::Pty(event));
     }
 }
 
-pub struct PtyEvent(PtyMessage);
+pub struct PtyEvent(Message);
 
-pub struct Events(async_channel::Receiver<PtyMessage>);
+pub struct Events(async_channel::Receiver<Message>);
 
 impl Events {
     pub async fn recv(&self) -> Option<PtyEvent> {
@@ -128,6 +136,8 @@ impl Events {
 pub struct Terminal {
     term: Arc<FairMutex<Term<Listener>>>,
     notifier: Option<Notifier>,
+    /// The process of a piped (non-PTY) session.
+    child: Option<Arc<std::sync::Mutex<std::process::Child>>>,
     size: GridSize,
     palette: Palette,
     exited: bool,
@@ -173,6 +183,7 @@ impl Terminal {
             Self {
                 term,
                 notifier: Some(notifier),
+                child: None,
                 size,
                 palette: options.palette,
                 exited: false,
@@ -182,8 +193,166 @@ impl Terminal {
         ))
     }
 
+    /// Run a program with piped output (no PTY): output is rendered in the terminal and
+    /// also delivered as [`Event::Output`], so callers can capture all of it
+    /// independently of the scrollback size. The program runs in its own process group
+    /// so [`Terminal::terminate`] can stop the whole process tree.
+    pub fn spawn_piped(options: Options, size: GridSize) -> io::Result<(Self, Events)> {
+        use std::{io::Read as _, process::Stdio};
+
+        let size = size.clamped();
+        let (sender, receiver) = async_channel::unbounded();
+        let listener = Listener(sender.clone());
+        let config = term::Config {
+            scrolling_history: SCROLLBACK_LINES,
+            ..Default::default()
+        };
+        let term = Arc::new(FairMutex::new(Term::new(config, &size, listener)));
+        let (program, args) = options
+            .shell
+            .ok_or_else(|| io::Error::other("A program is required"))?;
+        let mut command = std::process::Command::new(&program);
+        command
+            .args(&args)
+            .envs(&options.env)
+            .env("CLICOLOR_FORCE", "1")
+            .env("CARGO_TERM_COLOR", "always")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(directory) = &options.working_directory {
+            command.current_dir(directory);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn()?;
+        let streams: Vec<Box<dyn io::Read + Send>> = [
+            child
+                .stdout
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let child = Arc::new(std::sync::Mutex::new(child));
+        let (bytes_sender, bytes_receiver) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        let readers = streams.len();
+        for mut stream in streams {
+            let bytes_sender = bytes_sender.clone();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if bytes_sender.send(Some(buffer[..read].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = bytes_sender.send(None);
+            });
+        }
+        drop(bytes_sender);
+        let feed_term = term.clone();
+        let feed_child = child.clone();
+        std::thread::spawn(move || {
+            use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+            let mut processor = Processor::<StdSyncHandler>::new();
+            let mut open = readers;
+            while open > 0 {
+                match bytes_receiver.recv() {
+                    Ok(Some(bytes)) => {
+                        // Pipes deliver bare LF; render it as CR LF like a terminal would.
+                        let mut rendered = Vec::with_capacity(bytes.len() + 16);
+                        for byte in &bytes {
+                            if *byte == b'\n' {
+                                rendered.push(b'\r');
+                            }
+                            rendered.push(*byte);
+                        }
+                        processor.advance(&mut *feed_term.lock(), &rendered);
+                        let _ = sender.try_send(Message::Output(bytes));
+                        let _ = sender.try_send(Message::Pty(PtyMessage::Wakeup));
+                    }
+                    Ok(None) => open -= 1,
+                    Err(_) => break,
+                }
+            }
+            // Poll instead of blocking in `wait` so `terminate` never waits on the lock.
+            let code = loop {
+                let status = match feed_child.lock() {
+                    Ok(mut child) => child.try_wait(),
+                    Err(_) => break None,
+                };
+                match status {
+                    Ok(Some(status)) => break status.code(),
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(_) => break None,
+                }
+            };
+            let _ = sender.try_send(Message::Exit(code));
+        });
+        Ok((
+            Self {
+                term,
+                notifier: None,
+                child: Some(child),
+                size,
+                palette: options.palette,
+                exited: false,
+                exit_code: None,
+            },
+            Events(receiver),
+        ))
+    }
+
+    /// Stop a piped session's process tree (no-op for PTY sessions, which end when the
+    /// terminal is dropped).
+    pub fn terminate(&self) {
+        let Some(child) = &self.child else { return };
+        let Ok(mut child) = child.lock() else { return };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let pid = child.id();
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-s", "TERM", "--", &format!("-{pid}")])
+            .status();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .status();
+        let _ = child.kill();
+    }
+
     pub fn handle(&mut self, event: PtyEvent) -> Option<Event> {
-        match event.0 {
+        let message = match event.0 {
+            Message::Pty(message) => message,
+            Message::Output(bytes) => return Some(Event::Output(bytes)),
+            Message::Exit(code) => {
+                self.exit_code = code;
+                self.exited = true;
+                return Some(Event::Exited);
+            }
+        };
+        match message {
             PtyMessage::Wakeup => Some(Event::Wakeup),
             PtyMessage::ChildExit(status) => {
                 self.exit_code = status.code();
@@ -229,6 +398,7 @@ impl Terminal {
         Self {
             term: Arc::new(FairMutex::new(term)),
             notifier: None,
+            child: None,
             size,
             palette: Palette::default(),
             exited,
@@ -346,6 +516,7 @@ impl Drop for Terminal {
         if let Some(notifier) = &self.notifier {
             let _ = notifier.0.send(Msg::Shutdown);
         }
+        self.terminate();
     }
 }
 
@@ -393,5 +564,74 @@ mod tests {
             "{:#?}",
             snapshot.lines()
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod piped_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    #[test]
+    fn piped_sessions_capture_all_output_and_the_exit_code() {
+        let (mut terminal, events) = Terminal::spawn_piped(
+            Options {
+                shell: Some((
+                    "sh".into(),
+                    vec![
+                        "-c".into(),
+                        "for i in $(seq 1 3000); do echo line$i; done; echo oops >&2; exit 3"
+                            .into(),
+                    ],
+                )),
+                ..Default::default()
+            },
+            GridSize::default(),
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !terminal.exited() && Instant::now() < deadline {
+            match events.try_recv() {
+                Some(event) => {
+                    if let Some(Event::Output(bytes)) = terminal.handle(event) {
+                        output.extend(bytes);
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.starts_with("line1\n"), "{}", &text[..20]);
+        assert!(
+            text.contains("line3000\n"),
+            "complete beyond the visible grid"
+        );
+        assert!(text.contains("oops"));
+        assert_eq!(terminal.exit_code(), Some(3));
+    }
+
+    #[test]
+    fn terminate_stops_the_process_tree() {
+        let (mut terminal, events) = Terminal::spawn_piped(
+            Options {
+                shell: Some(("sh".into(), vec!["-c".into(), "sleep 30 & sleep 30".into()])),
+                ..Default::default()
+            },
+            GridSize::default(),
+        )
+        .unwrap();
+        terminal.terminate();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !terminal.exited() && Instant::now() < deadline {
+            match events.try_recv() {
+                Some(event) => {
+                    terminal.handle(event);
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(terminal.exited(), "the process group was terminated");
     }
 }

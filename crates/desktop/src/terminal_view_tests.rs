@@ -28,6 +28,7 @@ fn set_terminal(
         view.session = Some(Session {
             terminal,
             options: Options::default(),
+            piped: false,
             _events: events,
         });
         window.focus(&view.focus_handle);

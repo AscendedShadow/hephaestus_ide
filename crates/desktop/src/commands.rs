@@ -107,7 +107,19 @@ actions!(
         RefreshExplorer,
         ReopenWithEncoding,
         SaveWithEncoding,
-        ChangeLineEnding
+        ChangeLineEnding,
+        SelectDebugProfile,
+        EditBreakpoint,
+        ToggleBreakpointEnabled,
+        RemoveAllBreakpoints,
+        AddWatch,
+        RunTask,
+        RunBuildTask,
+        CancelTask,
+        RerunLastTask,
+        ShowProblems,
+        NextProblem,
+        PreviousProblem
     ]
 );
 
@@ -236,6 +248,18 @@ commands! {
     ReopenWithEncoding => ReopenWithEncoding,
     SaveWithEncoding => SaveWithEncoding,
     ChangeLineEnding => ChangeLineEnding,
+    SelectDebugProfile => SelectDebugProfile,
+    EditBreakpoint => EditBreakpoint,
+    ToggleBreakpointEnabled => ToggleBreakpointEnabled,
+    RemoveAllBreakpoints => RemoveAllBreakpoints,
+    AddWatch => AddWatch,
+    RunTask => RunTask,
+    RunBuildTask => RunBuildTask,
+    CancelTask => CancelTask,
+    RerunLastTask => RerunLastTask,
+    ShowProblems => ShowProblems,
+    NextProblem => NextProblem,
+    PreviousProblem => PreviousProblem,
 }
 
 impl Command {
@@ -355,6 +379,8 @@ impl Command {
             Self::NextTabStop => &["tab"],
             Self::PreviousTabStop => &["shift-tab"],
             Self::NewTerminal => &["ctrl-shift-`"],
+            Self::NextProblem => &["f8"],
+            Self::PreviousProblem => &["shift-f8"],
             #[allow(unreachable_patterns)]
             _ => &[],
         };

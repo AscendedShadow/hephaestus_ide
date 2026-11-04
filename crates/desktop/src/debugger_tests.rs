@@ -153,3 +153,146 @@ fn pointer_values_offer_a_memory_reference() {
     );
     assert_eq!(pointer_reference(&variable("42", None)), None);
 }
+
+mod state {
+    use std::path::{Path, PathBuf};
+
+    use gpui::TestAppContext;
+    use serde_json::json;
+
+    use super::super::*;
+
+    fn debugger(cx: &mut TestAppContext) -> (gpui::Entity<Debugger>, &mut gpui::VisualTestContext) {
+        cx.update(gpui_component::init);
+        let mut debugger = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let entity = cx.new(|cx| Debugger::new(window, cx));
+            debugger = Some(entity.clone());
+            gpui_component::Root::new(entity, window, cx)
+        });
+        (debugger.unwrap(), cx)
+    }
+
+    #[gpui::test]
+    fn breakpoint_options_respect_adapter_capabilities_and_follow_edits(cx: &mut TestAppContext) {
+        let (debugger, cx) = debugger(cx);
+        let path = PathBuf::from("/w/src/main.rs");
+        debugger.update(cx, |debugger, cx| {
+            debugger.toggle_breakpoint(path.clone(), 3, cx);
+            debugger.set_breakpoint_options(
+                path.clone(),
+                7,
+                BreakpointOptions {
+                    enabled: true,
+                    condition: Some("i > 2".into()),
+                    hit_condition: Some("4".into()),
+                    log_message: Some("i = {i}".into()),
+                },
+                cx,
+            );
+            debugger.toggle_breakpoint(path.clone(), 10, cx);
+            assert_eq!(
+                debugger.toggle_breakpoint_enabled(path.clone(), 10, cx),
+                Some(false)
+            );
+            debugger.adopt_capabilities(json!({
+                "supportsConditionalBreakpoints": true,
+                "supportsHitConditionalBreakpoints": true,
+                "exceptionBreakpointFilters": [
+                    {"filter": "rust_panic", "label": "Rust panics", "default": true},
+                    {"filter": "cpp_throw", "label": "C++ throw"}
+                ]
+            }));
+            let (lines, sent) = debugger.source_breakpoints(&path);
+            assert_eq!(lines, [3, 7], "disabled breakpoints are not sent");
+            assert_eq!(sent[1].condition.as_deref(), Some("i > 2"));
+            assert_eq!(sent[1].hit_condition.as_deref(), Some("4"));
+            assert_eq!(
+                sent[1].log_message, None,
+                "log points are unsupported by this adapter"
+            );
+            assert_eq!(debugger.enabled_filters(), ["rust_panic"]);
+
+            // Two lines inserted above line 7, then line 4 deleted.
+            debugger.shift_breakpoints(&path, 5, 0, 2, cx);
+            assert_eq!(
+                debugger
+                    .lines(&path)
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [3, 9, 12]
+            );
+            assert_eq!(
+                debugger.options_at(&path, 9).condition.as_deref(),
+                Some("i > 2")
+            );
+            debugger.shift_breakpoints(&path, 3, 1, 0, cx);
+            assert_eq!(
+                debugger
+                    .lines(&path)
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [3, 8, 11]
+            );
+            assert!(!debugger.options_at(&path, 11).enabled);
+        });
+    }
+
+    #[gpui::test]
+    fn state_persists_with_relative_paths_and_watches_keep_order(cx: &mut TestAppContext) {
+        let (debugger, cx) = debugger(cx);
+        let root = Path::new("/w");
+        debugger.update(cx, |debugger, cx| {
+            debugger.toggle_breakpoint(root.join("a.rs"), 2, cx);
+            debugger.adopt_capabilities(
+                json!({"exceptionBreakpointFilters": [{"filter": "all", "label": "All"}]}),
+            );
+            debugger.set_exception_filter("all", true, cx);
+            for expression in ["first", "second", "third"] {
+                debugger.add_watch(expression.into(), cx);
+            }
+            debugger.move_watch(2, true, cx);
+            debugger.remove_watch(0, cx);
+            let state = debugger.export_state(root, Some("Attach".into()));
+            assert_eq!(state.breakpoints[0].path, PathBuf::from("a.rs"));
+            assert_eq!(state.watches, ["third", "second"]);
+            assert_eq!(state.exception_filters.get("all"), Some(&true));
+
+            let other = Path::new("/elsewhere");
+            debugger.import_state(other, &state, cx);
+            assert!(debugger.lines(&other.join("a.rs")).is_some());
+            assert!(debugger.lines(&root.join("a.rs")).is_none());
+            assert!(
+                debugger
+                    .watches()
+                    .iter()
+                    .all(|watch| matches!(watch.value, features::WatchValue::Stale(None)))
+            );
+            assert!(debugger.exception_filters()[0].enabled);
+        });
+    }
+
+    #[test]
+    fn attach_requests_carry_the_process_and_adapter_arguments() {
+        let config = DebuggerConfig {
+            name: "Attach".into(),
+            request: crate::settings::DebugRequest::Attach,
+            adapter: "lldb-dap".into(),
+            process_id: Some(4242),
+            arguments: Some(json!({"waitFor": true})),
+            ..Default::default()
+        };
+        let plan = plan(&config).unwrap();
+        assert_eq!(plan.program, "");
+        let arguments = attach_arguments(&plan, &config, Some(Path::new("/w")));
+        assert_eq!(arguments["request"], json!("attach"));
+        assert_eq!(arguments["pid"], json!(4242));
+        assert_eq!(arguments["processId"], json!(4242));
+        assert_eq!(arguments["waitFor"], json!(true));
+        assert!(arguments.get("program").is_none());
+    }
+}

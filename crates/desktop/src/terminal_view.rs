@@ -25,6 +25,10 @@ pub const KEY_CONTEXT: &str = "Terminal";
 
 pub enum TerminalEvent {
     Exited(Vec<String>),
+    /// Raw output of a piped run, in order (complete, independent of scrollback).
+    Output(Vec<u8>),
+    /// A piped run finished with this exit code (`None` if killed by a signal).
+    Finished(Option<i32>),
 }
 
 const FONT_SIZE: f32 = 13.;
@@ -45,6 +49,7 @@ impl EventEmitter<TerminalEvent> for TerminalView {}
 struct Session {
     terminal: Terminal,
     options: Options,
+    piped: bool,
     _events: Task<()>,
 }
 
@@ -138,18 +143,45 @@ impl TerminalView {
     }
 
     pub fn terminate(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.terminal.terminate();
+        }
         self.session = None;
         cx.notify();
     }
 
+    /// Run a program with piped output (tasks, tests): complete output is reported
+    /// through [`TerminalEvent::Output`] and the exit code through
+    /// [`TerminalEvent::Finished`].
+    pub fn run_piped(&mut self, options: Options, cx: &mut Context<Self>) -> Result<(), String> {
+        if self.is_running() {
+            return Err("Stop the current process before starting another".into());
+        }
+        self.spawn_with(options, true, cx)
+    }
+
     fn spawn(&mut self, options: Options, cx: &mut Context<Self>) -> Result<(), String> {
+        self.spawn_with(options, false, cx)
+    }
+
+    fn spawn_with(
+        &mut self,
+        options: Options,
+        piped: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         self.session = None;
         let size = self.layout.map(|layout| layout.grid).unwrap_or_default();
         let spawn_options = Options {
             palette: theme::terminal_palette(),
             ..options.clone()
         };
-        let result = match Terminal::spawn(spawn_options, size) {
+        let spawned = if piped {
+            Terminal::spawn_piped(spawn_options, size)
+        } else {
+            Terminal::spawn(spawn_options, size)
+        };
+        let result = match spawned {
             Ok((terminal, events)) => {
                 let events = cx.spawn(async move |this, cx| {
                     while let Some(event) = events.recv().await {
@@ -166,6 +198,7 @@ impl TerminalView {
                 self.session = Some(Session {
                     terminal,
                     options,
+                    piped,
                     _events: events,
                 });
                 self.error = None;
@@ -205,8 +238,14 @@ impl TerminalView {
                                 .to_string()
                         })
                         .collect();
+                    let code = session.terminal.exit_code();
+                    let piped = session.piped;
                     cx.emit(TerminalEvent::Exited(lines));
+                    if piped {
+                        cx.emit(TerminalEvent::Finished(code));
+                    }
                 }
+                Some(Event::Output(bytes)) => cx.emit(TerminalEvent::Output(bytes)),
                 _ => {}
             }
         }

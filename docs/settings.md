@@ -150,3 +150,71 @@ folder's context menu starts in that folder. Sessions can be renamed, switched (
 Terminal**) and closed; closing a session ends only its process. Switching workspaces
 leaves interactive terminals running in their folders. A profile that fails to start names
 the profile and the executable.
+
+## Tasks
+
+```json
+{
+  "tasks": [
+    { "id": "gen", "program": "./scripts/codegen.sh" },
+    { "id": "build", "label": "Build", "group": "build", "default": true,
+      "program": "cargo", "args": ["build"], "depends_on": ["gen"] },
+    { "id": "check", "program": "cargo", "args": ["clippy"], "depends_on": ["build", "lint"],
+      "depends_order": "parallel" },
+    { "id": "lint", "program": "npm", "args": ["run", "lint"], "working_directory": "${workspaceFolder}/web" },
+    { "id": "serve", "program": "npm", "args": ["run", "dev"], "background": true,
+      "ready_pattern": "ready in \\d+ ms" }
+  ]
+}
+```
+
+**Run Task…** picks a task, **Run Build Task** runs the default `build` task, and **Rerun
+Last Task** / **Cancel Task** control the current pipeline. Dependencies run first: in
+list order with `"depends_order": "sequence"` (default) or together with `"parallel"`; a
+task needed twice runs once. Unknown ids and cycles are reported before anything starts.
+A failing or cancelled task stops everything that depends on it. Background tasks count
+as done when `ready_pattern` (a regular expression) matches their output, and keep
+running. Each run gets a tab in the Run panel with its state. Cancelling, rerunning or
+switching workspaces stops the running process trees.
+
+Variables in `program`, `args`, `working_directory` and `env` values: `${workspaceFolder}`,
+`${workspaceFolderBasename}`, `${file}`, `${fileBasename}`, `${fileBasenameNoExtension}`,
+`${fileDirname}`, `${relativeFile}`, `${cwd}` and `${env:NAME}`.
+
+Task output is captured completely (not limited by terminal scrollback) and parsed while
+the task runs for rustc/cargo, GCC/Clang, Go, TypeScript and MSVC diagnostics (ANSI
+colors and Windows paths are handled). The **Problems** panel shows these together with
+language-server diagnostics (including unopened files when the server reports them),
+grouped by file and filterable by severity, source and active file; **Next/Previous
+Problem** (`F8`/`Shift+F8`) step through them.
+
+## Debug profiles
+
+```json
+{
+  "debug_profiles": [
+    { "name": "App", "program": "target/debug/app", "args": ["--verbose"], "pre_launch_task": "build" },
+    { "name": "Attach", "request": "attach", "adapter": "lldb-dap" },
+    { "name": "Remote", "request": "attach", "adapter": "node-debug-adapter",
+      "arguments": { "address": "localhost", "port": 9229 }, "terminate_on_stop": false }
+  ]
+}
+```
+
+**Select Debug Profile…** chooses the profile **Start Debugging** uses; the choice is
+remembered per workspace. A legacy `"debugger"` entry is used as a profile when no
+`debug_profiles` exist. `attach` profiles without `process_id` show a process picker;
+`arguments` are merged into the launch/attach request for adapter-specific targets.
+Stopping an attach session detaches and leaves the process running unless
+`terminate_on_stop` is set; launch sessions terminate the debuggee. A `pre_launch_task`
+must succeed before the debugger starts. Switching profiles stops the running session.
+
+Breakpoints, their options, exception filters and watch expressions are saved per
+workspace (outside the project, with workspace-relative paths) and restored when the
+folder is opened. **Edit Breakpoint…** sets a condition, hit count or log message (a
+logpoint); **Toggle Breakpoint Enabled** keeps a breakpoint without stopping at it.
+Options the adapter does not support are reported in the debug console instead of being
+sent. Breakpoints follow line insertions/deletions while editing and adapter
+adjustments. Watches (**Add Watch**, or the Watch section of the Debug panel) are
+evaluated in the selected frame on every stop, show type, value or error, expand like
+variables, and are marked stale while the program runs.

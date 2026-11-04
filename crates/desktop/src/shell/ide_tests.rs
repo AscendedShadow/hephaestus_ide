@@ -859,3 +859,145 @@ fn unsaved_buffers_are_recovered_after_a_crash(cx: &mut TestAppContext) {
             .all(|entry| entry.path.as_deref() != Some(root.join("a.rs").as_path()))
     );
 }
+
+#[cfg(unix)]
+#[gpui::test]
+fn task_pipelines_run_dependencies_report_problems_and_gate_launches(cx: &mut TestAppContext) {
+    use super::mock_lsp::wait_until;
+    use super::tasks::RunState;
+    let (shell, cx) = setup(cx);
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    write(&root.join("src/lib.rs"), "fn lib() {}\n");
+    write(
+        &root.join(".hephaestus/settings.json"),
+        r#"{
+          "tasks": [
+            {"id": "gen", "program": "sh", "args": ["-c", "echo generated > gen.txt"]},
+            {"id": "build", "group": "build", "default": true, "depends_on": ["gen"], "program": "sh",
+             "args": ["-c", "printf 'error[E0001]: oops in ${workspaceFolderBasename}\n --> src/lib.rs:1:4\n'"]},
+            {"id": "fail", "program": "sh", "args": ["-c", "echo 'src/lib.rs:1:1: warning: careful'; exit 2"]},
+            {"id": "chain", "depends_on": ["fail"], "program": "sh", "args": ["-c", "touch chain.txt"]},
+            {"id": "serve", "background": true, "ready_pattern": "listen(ing)?", "program": "sh",
+             "args": ["-c", "echo starting; echo listening; sleep 30"]},
+            {"id": "after", "depends_on": ["serve"], "program": "sh", "args": ["-c", "echo done"]},
+            {"id": "loop", "depends_on": ["loop"], "program": "true"}
+          ],
+          "debug_profiles": [{"name": "App", "program": "/bin/true", "pre_launch_task": "fail"}]
+        }"#,
+    );
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    let states =
+        |shell: &Entity<IdeShell>, cx: &mut VisualTestContext| -> Vec<(String, RunState)> {
+            cx.read(|cx| {
+                shell
+                    .read(cx)
+                    .tasks
+                    .runs
+                    .iter()
+                    .map(|run| (run.task.clone(), run.state.clone()))
+                    .collect()
+            })
+        };
+
+    cx.dispatch_action(RunBuildTask);
+    wait_until(cx, |cx| {
+        states(&shell, cx)
+            .iter()
+            .any(|(id, state)| id == "build" && *state == RunState::Succeeded)
+    });
+    assert!(root.join("gen.txt").exists(), "the dependency ran first");
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        let problem = &shell.problems.build[0];
+        assert_eq!(problem.path, root.join("src/lib.rs"));
+        assert_eq!((problem.line, problem.column), (1, 4));
+        assert!(
+            problem.message.contains("oops in"),
+            "variables expanded: {}",
+            problem.message
+        );
+        assert!(shell.tasks.pipeline.is_none());
+    });
+
+    // The Problems view filters by severity and navigates to the location.
+    shell.update(cx, |shell, _| shell.problems.show[0] = false);
+    cx.read(|cx| assert!(shell.read(cx).problem_entries().is_empty()));
+    shell.update(cx, |shell, _| shell.problems.show[0] = true);
+    cx.dispatch_action(NextProblem);
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert_eq!(
+            shell.document().path(),
+            Some(root.join("src/lib.rs").as_path())
+        );
+        assert_eq!(shell.editor().read(cx).cursor_position().character, 3);
+    });
+
+    shell.update(cx, |shell, cx| {
+        shell.run_task_then("chain".into(), None, cx)
+    });
+    wait_until(cx, |cx| {
+        states(&shell, cx)
+            .iter()
+            .any(|(id, state)| id == "fail" && *state == RunState::Failed(Some(2)))
+    });
+    assert!(
+        !root.join("chain.txt").exists(),
+        "a failed prerequisite stops the dependent task"
+    );
+    cx.read(|cx| {
+        let shell = shell.read(cx);
+        assert!(
+            shell.status.contains("\"chain\" was not started"),
+            "{}",
+            shell.status
+        );
+        assert!(
+            shell
+                .problems
+                .build
+                .iter()
+                .any(|problem| problem.source == "task:fail")
+        );
+    });
+
+    shell.update(cx, |shell, cx| {
+        shell.run_task_then("after".into(), None, cx)
+    });
+    wait_until(cx, |cx| {
+        states(&shell, cx)
+            .iter()
+            .any(|(id, state)| id == "after" && *state == RunState::Succeeded)
+    });
+    assert!(
+        states(&shell, cx)
+            .iter()
+            .any(|(id, state)| id == "serve" && *state == RunState::Ready)
+    );
+    cx.dispatch_action(CancelTask);
+    assert!(
+        states(&shell, cx)
+            .iter()
+            .any(|(id, state)| id == "serve" && *state == RunState::Cancelled)
+    );
+
+    shell.update(cx, |shell, cx| shell.run_task_then("loop".into(), None, cx));
+    cx.read(|cx| assert_eq!(shell.read(cx).status, "Task dependency cycle: loop → loop"));
+
+    // A debug profile whose pre-launch task fails is not launched.
+    cx.dispatch_action(StartDebugger);
+    wait_until(cx, |cx| {
+        cx.read(|cx| {
+            shell
+                .read(cx)
+                .status
+                .contains("pending launch were not started")
+        })
+    });
+    cx.read(|cx| assert!(!shell.read(cx).debugger.read(cx).is_active()));
+}

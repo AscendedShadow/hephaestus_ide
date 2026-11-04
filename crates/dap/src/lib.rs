@@ -51,6 +51,11 @@ pub enum Event {
     },
     Exited(i64),
     Terminated,
+    /// A breakpoint changed (verification or location), e.g. after a module loaded.
+    Breakpoint {
+        reason: String,
+        breakpoint: Breakpoint,
+    },
     Closed(String),
 }
 
@@ -240,9 +245,8 @@ impl Client {
     pub fn set_breakpoints(
         &self,
         path: &Path,
-        lines: &[usize],
+        breakpoints: &[SourceBreakpoint],
     ) -> impl Future<Output = Result<Vec<Breakpoint>, Error>> + use<> {
-        let breakpoints: Vec<Value> = lines.iter().map(|line| json!({"line": line})).collect();
         self.fetch(
             "setBreakpoints",
             json!({
@@ -321,9 +325,18 @@ impl Client {
     }
 
     pub fn disconnect(&self) -> impl Future<Output = Result<Value, Error>> + use<> {
+        self.disconnect_with(true)
+    }
+
+    /// Disconnect, terminating the debuggee only when asked (attach sessions keep the
+    /// process running by default).
+    pub fn disconnect_with(
+        &self,
+        terminate: bool,
+    ) -> impl Future<Output = Result<Value, Error>> + use<> {
         self.request(
             "disconnect",
-            json!({"restart": false, "terminateDebuggee": true}),
+            json!({"restart": false, "terminateDebuggee": terminate}),
         )
     }
 
@@ -480,6 +493,10 @@ fn event(message: &Value) -> Option<Event> {
         },
         "exited" => Event::Exited(body.get("exitCode").and_then(Value::as_i64).unwrap_or(0)),
         "terminated" => Event::Terminated,
+        "breakpoint" => Event::Breakpoint {
+            reason: text("reason").unwrap_or_default(),
+            breakpoint: serde_json::from_value(body.get("breakpoint")?.clone()).ok()?,
+        },
         _ => return None,
     })
 }

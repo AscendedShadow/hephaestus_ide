@@ -28,13 +28,19 @@ pub struct Settings {
     pub theme: Themes,
     pub show_sidebar: bool,
     pub commands: Vec<RunConfig>,
+    /// Legacy single debugger configuration (used as a profile when no
+    /// `debug_profiles` are configured).
     pub debugger: Option<DebuggerConfig>,
+    /// Named debug configurations (launch or attach).
+    pub debug_profiles: Vec<DebuggerConfig>,
     pub language_servers: Vec<LanguageServer>,
     /// File associations: glob pattern (matched against the file name, or the
     /// workspace-relative path when it contains `/`) to language mode id or name.
     pub file_associations: BTreeMap<String, String>,
     /// Editor preferences (see `preferences`), with per-language overrides.
     pub editor: crate::preferences::EditorSettings,
+    /// Tasks with dependencies (see docs/settings.md).
+    pub tasks: Vec<TaskConfig>,
     /// Named shell profiles for the integrated terminal.
     pub terminal_profiles: Vec<TerminalProfile>,
     /// Profile used by New Terminal (defaults to the system shell).
@@ -51,6 +57,50 @@ pub struct RunConfig {
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
     pub env: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependsOrder {
+    #[default]
+    Sequence,
+    Parallel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskGroup {
+    Build,
+    Test,
+    Run,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskConfig {
+    /// Stable identifier used by `depends_on` and `pre_launch_task`.
+    pub id: String,
+    pub label: Option<String>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub working_directory: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub depends_on: Vec<String>,
+    pub depends_order: DependsOrder,
+    pub group: Option<TaskGroup>,
+    /// The default task of its group (e.g. Run Build Task).
+    pub default: bool,
+    /// A long-running task (watcher, server) that counts as done once
+    /// `ready_pattern` matches its output.
+    pub background: bool,
+    /// Regular expression marking a background task as ready.
+    pub ready_pattern: Option<String>,
+}
+
+impl TaskConfig {
+    pub fn name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// Where a terminal profile starts.
@@ -81,6 +131,8 @@ pub struct TerminalProfile {
 #[serde(default, deny_unknown_fields)]
 pub struct DebuggerConfig {
     pub name: String,
+    /// `launch` (default) starts `program`; `attach` connects to a running process.
+    pub request: DebugRequest,
     pub adapter: String,
     pub adapter_args: Vec<String>,
     pub program: String,
@@ -88,6 +140,23 @@ pub struct DebuggerConfig {
     pub working_directory: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub stop_on_entry: bool,
+    /// Process to attach to; when omitted for `attach`, a process picker is shown.
+    pub process_id: Option<u32>,
+    /// Extra adapter-specific arguments merged into the launch/attach request
+    /// (e.g. `{"host": "localhost", "port": 9229}` for remote attach targets).
+    pub arguments: Option<serde_json::Value>,
+    /// For `attach`: terminate the process when the session stops (default: detach).
+    pub terminate_on_stop: bool,
+    /// A task id (see `tasks`) that must succeed before launching.
+    pub pre_launch_task: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugRequest {
+    #[default]
+    Launch,
+    Attach,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -158,13 +227,32 @@ impl Settings {
             show_sidebar: false,
             commands: Vec::new(),
             debugger: None,
+            debug_profiles: Vec::new(),
             language_servers: default_language_servers(),
             file_associations: BTreeMap::new(),
             editor: Default::default(),
             auto_save: Default::default(),
             terminal_profiles: Vec::new(),
             default_terminal_profile: None,
+            tasks: Vec::new(),
         }
+    }
+
+    /// Debug profiles, migrating the legacy `debugger` entry when no profiles exist.
+    pub fn debug_profiles(&self) -> Vec<DebuggerConfig> {
+        if !self.debug_profiles.is_empty() {
+            return self.debug_profiles.clone();
+        }
+        self.debugger
+            .iter()
+            .cloned()
+            .map(|mut config| {
+                if config.name.is_empty() {
+                    config.name = "Default".into();
+                }
+                config
+            })
+            .collect()
     }
 
     pub fn servers(&self) -> Vec<LanguageServer> {

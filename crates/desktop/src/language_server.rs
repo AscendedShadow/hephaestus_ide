@@ -216,9 +216,8 @@ impl Servers {
     fn handle(&mut self, name: &str, event: lsp::Event, cx: &mut Context<Self>) {
         match event {
             lsp::Event::Diagnostics { path, diagnostics } => {
-                if self.documents.contains_key(&path) {
-                    cx.emit(ServerEvent::Diagnostics { path, diagnostics });
-                }
+                // Workspace-wide diagnostics are kept for unopened files too.
+                cx.emit(ServerEvent::Diagnostics { path, diagnostics });
             }
             lsp::Event::Request { id, method, params } => {
                 if method == "workspace/applyEdit" {

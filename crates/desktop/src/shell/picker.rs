@@ -20,6 +20,9 @@ pub(super) enum PickerAction {
     SaveWithEncoding(ide_core::document::Encoding),
     SetLineEnding(ide_core::document::LineEnding),
     OpenWithEncoding(PathBuf, ide_core::document::Encoding),
+    RunTask(String),
+    AttachProcess(u32),
+    DebugProfile(String),
     Nothing,
 }
 
@@ -132,6 +135,9 @@ impl IdeShell {
             PickerAction::OpenWithEncoding(path, encoding) => {
                 self.open_with_encoding(path, encoding, window, cx)
             }
+            PickerAction::RunTask(id) => self.run_task_then(id, None, cx),
+            PickerAction::AttachProcess(pid) => self.attach_to(pid, window, cx),
+            PickerAction::DebugProfile(name) => self.choose_debug_profile(name, cx),
             PickerAction::Nothing => {}
         }
     }

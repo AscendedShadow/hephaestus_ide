@@ -164,7 +164,24 @@ fn a_session_stops_at_a_breakpoint_and_reads_variables_and_memory() {
     assert_eq!(refused["request_seq"], json!(900));
     assert_eq!(refused["success"], json!(false));
 
-    let breakpoints = block_on(client.set_breakpoints(Path::new("/src/main.c"), &[3, 9])).unwrap();
+    let requested = [
+        SourceBreakpoint {
+            line: 3,
+            ..Default::default()
+        },
+        SourceBreakpoint {
+            line: 9,
+            condition: Some("i > 2".into()),
+            hit_condition: Some("3".into()),
+            log_message: None,
+        },
+    ];
+    assert_eq!(
+        serde_json::to_value(&requested[1]).unwrap(),
+        json!({"line": 9, "condition": "i > 2", "hitCondition": "3"})
+    );
+    let breakpoints =
+        block_on(client.set_breakpoints(Path::new("/src/main.c"), &requested)).unwrap();
     assert_eq!(
         breakpoints
             .iter()
