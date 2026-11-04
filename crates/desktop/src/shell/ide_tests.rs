@@ -1123,3 +1123,109 @@ fn git_branches_history_blame_and_hunks(cx: &mut TestAppContext) {
         )
     });
 }
+
+#[gpui::test]
+fn test_explorer_discovers_runs_and_reruns_cargo_tests(cx: &mut TestAppContext) {
+    use super::mock_lsp::wait_until;
+    use ide_core::testing::TestState;
+    if std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let (shell, cx) = setup(cx);
+    cx.executor().allow_parking();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        &root.join("src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn passes() {}\n\n    #[test]\n    fn fails() {\n        assert_eq!(1, 2, \"boom\");\n    }\n\n    #[test]\n    #[ignore]\n    fn slow() {}\n}\n",
+    );
+    write(&root.join("tests/it.rs"), "#[test]\nfn passes() {}\n");
+    shell.update(cx, |shell, cx| {
+        shell.set_workspace(Workspace::open(&root).unwrap(), cx)
+    });
+    cx.dispatch_action(ShowTesting);
+    let deadline = std::time::Duration::from_secs(120);
+    let start = std::time::Instant::now();
+    while cx.read(|cx| shell.read(cx).testing.discovering) {
+        assert!(start.elapsed() < deadline, "discovery timed out");
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let ids: Vec<String> = cx.read(|cx| {
+        let testing = &shell.read(cx).testing;
+        assert_eq!(testing.error, None);
+        testing
+            .entries
+            .iter()
+            .map(|entry| format!("{}::{}", entry.id.target.label(), entry.id.path))
+            .collect()
+    });
+    assert_eq!(
+        ids,
+        [
+            "demo (lib)::tests::fails",
+            "demo (lib)::tests::passes",
+            "demo (lib)::tests::slow",
+            "demo (test it)::passes"
+        ],
+        "same-named tests in different targets are distinct"
+    );
+    cx.read(|cx| {
+        let entry = &shell.read(cx).testing.entries[0];
+        assert_eq!(entry.location, Some((root.join("src/lib.rs"), 7)));
+    });
+
+    cx.dispatch_action(RunAllTests);
+    let states = |shell: &Entity<IdeShell>, cx: &mut VisualTestContext| -> Vec<TestState> {
+        cx.read(|cx| {
+            shell
+                .read(cx)
+                .testing
+                .entries
+                .iter()
+                .map(|entry| entry.result.state.clone())
+                .collect()
+        })
+    };
+    wait_until(cx, |cx| {
+        states(&shell, cx)
+            .iter()
+            .all(|state| !matches!(state, TestState::Queued | TestState::Running))
+    });
+    assert_eq!(
+        states(&shell, cx),
+        [
+            TestState::Failed,
+            TestState::Passed,
+            TestState::Skipped,
+            TestState::Passed
+        ]
+    );
+    cx.read(|cx| {
+        let failed = &shell.read(cx).testing.entries[0].result;
+        assert!(failed.output.contains("boom"), "{}", failed.output);
+        assert_eq!(failed.failure, Some((root.join("src/lib.rs"), 8, 9)));
+    });
+
+    // Rerun failed runs only the failing test, by exact identity, with a duration.
+    cx.dispatch_action(RerunFailedTests);
+    cx.read(|cx| {
+        assert_eq!(
+            shell.read(cx).testing.entries[1].result.state,
+            TestState::Passed
+        )
+    });
+    wait_until(cx, |cx| {
+        states(&shell, cx)[0] == TestState::Failed
+            && cx.read(|cx| shell.read(cx).testing.run.is_none())
+    });
+    cx.read(|cx| assert!(shell.read(cx).testing.entries[0].result.duration.is_some()));
+}

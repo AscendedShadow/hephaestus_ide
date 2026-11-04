@@ -13,6 +13,7 @@ pub mod recovery;
 pub mod search;
 pub mod snippet;
 pub mod tasks;
+pub mod testing;
 pub mod text_edit;
 pub mod vim;
 pub mod workspace;

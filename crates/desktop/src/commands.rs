@@ -126,7 +126,12 @@ actions!(
         BlameLine,
         BlameFile,
         StageHunk,
-        UnstageHunk
+        UnstageHunk,
+        ShowTesting,
+        RefreshTests,
+        RunAllTests,
+        RerunFailedTests,
+        CancelTests
     ]
 );
 
@@ -275,6 +280,11 @@ commands! {
     BlameFile => BlameFile,
     StageHunk => StageHunk,
     UnstageHunk => UnstageHunk,
+    ShowTesting => ShowTesting,
+    RefreshTests => RefreshTests,
+    RunAllTests => RunAllTests,
+    RerunFailedTests => RerunFailedTests,
+    CancelTests => CancelTests,
 }
 
 impl Command {

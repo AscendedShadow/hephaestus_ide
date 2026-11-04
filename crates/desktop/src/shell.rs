@@ -75,6 +75,7 @@ mod settings_commands;
 mod signature_help;
 mod tasks;
 mod terminals;
+mod testing;
 mod workspace_edits;
 
 #[cfg(test)]
@@ -125,6 +126,7 @@ enum SidebarPanel {
     Git,
     Search,
     Outline,
+    Testing,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -363,6 +365,7 @@ pub struct IdeShell {
     tasks: tasks::TaskState,
     problems: problems::ProblemsState,
     git_state: git_features::GitState,
+    testing: testing::TestingState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -441,6 +444,7 @@ impl IdeShell {
             tasks: Default::default(),
             problems: Default::default(),
             git_state: Default::default(),
+            testing: Default::default(),
             _subscriptions: Vec::new(),
         };
         let search_subscription = Self::search_panel_subscription(&shell.search_panel, window, cx);
@@ -1620,6 +1624,17 @@ impl IdeShell {
                         }
                         this.refresh_parent(saved_path.as_deref(), cx);
                         this.write_recovery_snapshots(cx);
+                        let test_source = saved_path.as_deref().is_some_and(|path| {
+                            path.extension().is_some_and(|extension| extension == "rs")
+                                || path.file_name().is_some_and(|name| name == "Cargo.toml")
+                        });
+                        if test_source
+                            && this.show_sidebar
+                            && this.active_sidebar == SidebarPanel::Testing
+                            && this.testing.run.is_none()
+                        {
+                            this.discover_tests(cx);
+                        }
                         this.refresh_git(cx);
                         if saved_path
                             .as_deref()
@@ -1931,6 +1946,8 @@ impl IdeShell {
         self.tree_scroll = UniformListScrollHandle::new();
         self.tree_selection = None;
         self.cancel_tasks("Workspace changed", cx);
+        self.cancel_test_run(cx);
+        self.testing = Default::default();
         self.problems = Default::default();
         self.load_debug_state(cx);
         self.start_watching(cx);
@@ -3176,6 +3193,7 @@ impl IdeShell {
                 SidebarPanel::Git => self.git.clone().into_any_element(),
                 SidebarPanel::Search => self.search_panel.clone().into_any_element(),
                 SidebarPanel::Outline => self.render_outline(cx).into_any_element(),
+                SidebarPanel::Testing => self.render_testing(cx).into_any_element(),
             })
     }
 
@@ -4477,6 +4495,11 @@ impl Render for IdeShell {
             .on_action(cx.listener(Self::blame_file))
             .on_action(cx.listener(Self::stage_hunk))
             .on_action(cx.listener(Self::unstage_hunk))
+            .on_action(cx.listener(Self::show_testing))
+            .on_action(cx.listener(Self::refresh_tests))
+            .on_action(cx.listener(Self::run_all_tests))
+            .on_action(cx.listener(Self::rerun_failed_tests))
+            .on_action(cx.listener(Self::cancel_tests))
             .on_action(cx.listener(Self::change_language_mode))
             .on_action(cx.listener(Self::find_in_file))
             .on_action(cx.listener(Self::run_command))
